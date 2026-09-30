@@ -10,6 +10,9 @@ struct Bus {
     fired: Vec<(String, bool)>,
     messages: Vec<String>,
     vehicle: bool,
+    instance: u64,
+    map: Option<u64>,
+    renderer: bool,
 }
 
 impl PluginIo for Bus {
@@ -41,6 +44,12 @@ impl PluginIo for Bus {
     fn vehicle_name(&self) -> Option<String> {
         Some("MAN SD202".into())
     }
+    fn vehicle_identity(&mut self) -> Option<String> {
+        self.vehicle.then(||format!("{:?}:{}",self.map,self.instance))
+    }
+    fn map_identity(&mut self) -> Option<String> {self.map.map(|id|id.to_string())}
+    fn map_name(&self) -> Option<String> {self.map.map(|_|"Same map".into())}
+    fn renderer_available(&self) -> bool {self.renderer}
     fn message(&mut self, text: &str, _: f32) {
         self.messages.push(text.into());
     }
@@ -103,6 +112,37 @@ fn events_vars_timers_and_data() {
     let mut plugins = Plugins::load(&[d.clone()], &HostConfig::default());
     plugins.finalize();
     assert!(std::fs::read_to_string(d.join("Speedo/data.save.lua")).unwrap().contains("runs = 2"));
+}
+
+#[test]
+fn lifetime_events_detect_same_name_replacements_and_precede_frame() {
+    let d=dir("lifecycle");
+    std::fs::write(d.join("events.lua"),r#"
+        function on_map(name) omsi.message("map:"..tostring(name)) end
+        function on_renderer(available) omsi.message("renderer:"..tostring(available)) end
+        function on_vehicle(name) omsi.message("vehicle:"..tostring(name)) end
+        function on_frame() omsi.message("frame") end
+    "#).unwrap();
+    let mut plugins=Plugins::load(&[d],&HostConfig::default());
+    let mut bus=Bus{vehicle:true,instance:1,map:Some(1),renderer:true,..Default::default()};
+    plugins.frame(&mut bus);
+    assert_eq!(bus.messages,["map:Same map","renderer:true","vehicle:MAN SD202","frame"]);
+    bus.messages.clear();
+    plugins.frame(&mut bus);
+    assert_eq!(bus.messages,["frame"],"an unchanged lifetime must not emit again");
+    bus.messages.clear();bus.instance=2;
+    plugins.frame(&mut bus);
+    assert_eq!(bus.messages,["vehicle:MAN SD202","frame"],"same model, different vehicle lifetime");
+    bus.messages.clear();bus.map=Some(2);
+    plugins.frame(&mut bus);
+    assert_eq!(bus.messages,["map:Same map","vehicle:MAN SD202","frame"],"same name, different map session");
+    bus.messages.clear();bus.map=None;bus.vehicle=false;bus.renderer=false;
+    plugins.frame(&mut bus);
+    assert_eq!(bus.messages,["map:nil","renderer:false","vehicle:nil","frame"]);
+    bus.messages.clear();
+    plugins.frame(&mut bus);
+    assert_eq!(bus.messages,["frame"]);
+    plugins.finalize();
 }
 
 #[test]

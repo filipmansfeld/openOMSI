@@ -2142,6 +2142,13 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // Tile masks/light maps clamp independently of repeating ground textures.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         // coronas: camera group + a corona texture group
@@ -5047,6 +5054,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 10,
                     resource: wgpu::BindingResource::TextureView(&orm_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::Sampler(&self.clamp_sampler),
                 },
             ],
         })

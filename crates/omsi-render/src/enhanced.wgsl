@@ -322,7 +322,7 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
     if (material.params.z > 0.5) {
         // (an LED panel with the mip path switched off - `Lighting::led_mips` - takes its
         // `\S:n` mask at full resolution: its dots stay dots when the panel is small)
-        var tm = textureSample(t_trans, s_diffuse, buv);
+        var tm = sample_transmap(buv);
         if (material.emissive.w < -1.5 && enh.led.y < 0.5) {
             tm = textureSampleLevel(t_trans, s_diffuse, buv, 0.0);
         }
@@ -737,7 +737,7 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
         let night = select(camera.sun_color.w, 1.0, switched);
         // (a switched one is the display's own state: not dimmed with the instance's night
         // lighting, which is 0 by day and left the Procity's pressure screen black)
-        let nm = textureSample(t_night, s_diffuse, nuv).rgb * night * select(clamp(in.params2.y, 0.0, 1.0), 1.0, switched);
+        let nm = sample_nightmap(nuv).rgb * night * select(clamp(in.params2.y, 0.0, 1.0), 1.0, switched);
         if (terrain) {
             // the tile's light map: the lamps' light on the ground
             rgb = rgb + sf.albedo / PI * nm * enh.lights.y * 3.0 * pre;

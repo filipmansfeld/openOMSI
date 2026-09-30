@@ -1,6 +1,6 @@
 //! Particle systems: `[smoke]` and `[particle_emitter]` of vehicles and scenery objects, as
 //! OMSI runs them (TRauch / TRauchInst: the original emits, the original sets a particle
-//! off, the original moves it). An emitter keeps at most 100 particles. A particle leaves along
+//! off, the original moves it). An emitter defaults to at most 100 particles. A particle leaves along
 //! the emitter's direction at its speed plus a random spread; every frame its velocity is
 //! multiplied by the brake factor (per frame, not per second: taken at OMSI's default 30 fps
 //! here) and gravity pulls it down (a negative factor makes it rise); it grows from its start
@@ -10,8 +10,12 @@
 use glam::{DVec3, Mat4, Vec3};
 use omsi_model::{ParticleSystemDef, PsRange, PsValue};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64,Ordering};
 
-/// Particles an emitter keeps at most (OMSI's 100).
+static NEXT_API_ID: AtomicU64 = AtomicU64::new(1);
+fn next_api_id()->u64 { NEXT_API_ID.fetch_add(1,Ordering::Relaxed) }
+
+/// Default maximum particles per emitter (OMSI's 100).
 pub const MAX_PER_EMITTER: usize = 100;
 /// The frame rate a brake factor is written for.
 const FRAME_RATE: f32 = 30.0;
@@ -29,6 +33,8 @@ fn eye() -> Option<DVec3> {
 
 #[derive(Debug, Clone)]
 pub struct Particle {
+    /// Lifetime identity; expired particles never alias newly emitted particles.
+    pub api_id: u64,
     pub pos: DVec3,
     pub vel: Vec3,
     pub age: f32,
@@ -58,6 +64,8 @@ impl Particle {
 pub struct Emitter {
     pub def: ParticleSystemDef,
     pub particles: Vec<Particle>,
+    /// Native runtime cap, initially the authored engine default.
+    pub max_particles: usize,
     /// Particles owed from fractions of frames.
     carry: f32,
     /// The burst of a free emitter has gone off.
@@ -68,8 +76,9 @@ pub struct Emitter {
 }
 
 /// The particle systems of one vehicle part or scenery object.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ParticleSet {
+    pub api_id: u64,
     pub emitters: Vec<Emitter>,
     rng: u64,
 }
@@ -81,12 +90,17 @@ fn eval(v: &PsValue, value: &dyn Fn(&str) -> f32) -> f32 {
     }
 }
 
+impl Default for ParticleSet {
+    fn default()->Self {Self::new(Vec::new(),1)}
+}
+
 impl ParticleSet {
     pub fn new(defs: Vec<ParticleSystemDef>, seed: u64) -> ParticleSet {
         ParticleSet {
+            api_id:next_api_id(),
             emitters: defs
                 .into_iter()
-                .map(|def| Emitter { def, particles: Vec::new(), carry: 0.0, burst_done: false, ended: Vec::new() })
+                .map(|def| Emitter { def, particles: Vec::new(), max_particles:MAX_PER_EMITTER,carry: 0.0, burst_done: false, ended: Vec::new() })
                 .collect(),
             rng: seed | 1,
         }
@@ -141,6 +155,7 @@ impl ParticleSet {
                 e.ended = ended;
             }
             let def = self.emitters[i].def.clone();
+            let available=self.emitters[i].max_particles.saturating_sub(self.emitters[i].particles.len());
             let own = origin + rot.transform_vector3(Vec3::from(def.pos)).as_dvec3();
             if let Some(eye) = eye {
                 if (own - eye).length() > def.calc_dist.max(50.0) as f64 {
@@ -179,17 +194,19 @@ impl ParticleSet {
                 e.carry -= n as f32;
             }
             let mut spawn: Vec<(DVec3, Vec3)> = Vec::new();
-            for _ in 0..n {
-                spawn.extend(sources.iter().copied());
+            for _ in 0..n.min(available) {
+                spawn.extend(sources.iter().copied().take(available.saturating_sub(spawn.len())));
+                if spawn.len()>=available {break;}
             }
             if let Some(b) = &def.burst {
                 for s in &burst_sources {
                     let count = self.draw(b, value).round().max(0.0) as usize;
-                    spawn.extend(std::iter::repeat(*s).take(count));
+                    spawn.extend(std::iter::repeat(*s).take(count.min(available.saturating_sub(spawn.len()))));
+                    if spawn.len()>=available {break;}
                 }
             }
             for (at, d) in spawn {
-                if self.emitters[i].particles.len() >= MAX_PER_EMITTER {
+                if self.emitters[i].particles.len() >= self.emitters[i].max_particles {
                     break;
                 }
                 let p = self.new_particle(&def, at, d.normalize_or_zero(), value);
@@ -213,6 +230,7 @@ impl ParticleSet {
             self.draw(&def.rgb[2], value).clamp(0.0, 1.0),
         ];
         Particle {
+            api_id:next_api_id(),
             pos: at,
             vel,
             age: 0.0,

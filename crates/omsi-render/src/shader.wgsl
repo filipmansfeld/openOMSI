@@ -315,6 +315,24 @@ struct MaterialParams {
 @group(1) @binding(8) var t_bump: texture_2d<f32>;
 @group(1) @binding(9) var t_pbr_normal: texture_2d<f32>;
 @group(1) @binding(10) var t_pbr_orm: texture_2d<f32>;
+@group(1) @binding(11) var s_tile: sampler;
+
+// Paint/cut masks and night light maps cover one tile. Wrapping at its edge blends in
+// the opposite edge of the SAME tile, opening grass seams even when adjacent masks
+// agree. The diffuse/detail textures still repeat through s_diffuse.
+fn sample_transmap(uv: vec2<f32>) -> vec4<f32> {
+    if (material.extra.x > 0.5) {
+        return textureSample(t_trans, s_tile, uv);
+    }
+    return textureSample(t_trans, s_diffuse, uv);
+}
+
+fn sample_nightmap(uv: vec2<f32>) -> vec4<f32> {
+    if (material.extra.x > 0.5) {
+        return textureSample(t_night, s_tile, uv);
+    }
+    return textureSample(t_night, s_diffuse, uv);
+}
 
 // The reflection mask of a [matl_envmap] material: the alpha of its [matl_envmap_mask]
 // texture when it has one, else the diffuse texture's alpha - which reads 1 for a texture
@@ -558,7 +576,7 @@ fn fs_shadow_test(in: VsOut) {
     var a = select(diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv).a, 1.0, material.params.x > 1.5 && material.params.z < 0.5);
     if (material.params.z > 0.5) {
         // (the transmap stays where it is: [texcoordtransX/Y] only moves the diffuse stage)
-        let tm = textureSample(t_trans, s_diffuse, in.uv - in.params.zw);
+        let tm = sample_transmap(in.uv - in.params.zw);
         a = select(1.0, tm.a, material.params.w > 0.5);
     }
     if (a < 0.5) {
@@ -591,7 +609,7 @@ fn fs_transmap_depth(in: VsOut) {
     if (material.params.z < 0.5) {
         discard;
     }
-    let tm = textureSample(t_trans, s_diffuse, in.uv - in.params.zw);
+    let tm = sample_transmap(in.uv - in.params.zw);
     let a = select(1.0, tm.a, material.params.w > 0.5) * in.params.x;
     // Only what the colour pass will cover completely may hide what lies behind it: a
     // texel that is merely more opaque than not (the dimmer and anti-aliased dots of a
@@ -1350,7 +1368,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // is opaque, as D3D samples it: the WH UK AI cars' paint layer has a black 24-bit
         // `transmap_null.tga`, read as luminance the paint was invisible);
         // for terrain the map is the per-tile surface mask in tile space
-        let tm = textureSample(t_trans, s_diffuse, buv);
+        let tm = sample_transmap(buv);
         tex.a = select(1.0, tm.a, material.params.w > 0.5);
         if (material.extra.x > 0.5 && material.params.x > 1.5) {
             // A painted ground layer. The brush mask is coarse (0.6-3 m per texel) and
@@ -1467,7 +1485,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // [matl_nightmap]: self-illumination that fades in with the night
         // terrain: the tile light map in tile space (north at the top row)
         let nuv = select(buv, vec2<f32>(in.uv.x, 1.0 - in.uv.y), material.extra.x > 0.5);
-        let nm = textureSample(t_night, s_diffuse, nuv);
+        let nm = sample_nightmap(nuv);
         // a [matl_item] night map is switched by its variable (warning lamps, displays):
         // it glows whenever that is on, by day as well; the others fade in with the night
         let night = select(camera.sun_color.w, 1.0, material.extra.w > 1.5);

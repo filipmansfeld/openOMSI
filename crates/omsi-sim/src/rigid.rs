@@ -380,6 +380,10 @@ pub struct CoupledPart {
 
 #[derive(Debug, Clone)]
 pub struct RigidBody {
+    /// External loads consumed by the next positive-duration physics step. Forces
+    /// are world-frame newtons; torques are body-frame newton-metres.
+    pub external_force_world: Vec3,
+    pub external_torque_body: Vec3,
     pub mass: f32,
     /// Body-frame inertia (diagonal, kg m²).
     pub inertia: Vec3,
@@ -478,7 +482,7 @@ impl RigidBody {
         let inv_min_turn_radius = if def.inv_min_turn_radius > 0.0 { def.inv_min_turn_radius } else { max_steer_deg.to_radians().tan() / s };
         let springs: f32 = def.axles.iter().map(|a| 2.0 * if a.spring > 0.0 { a.spring } else { 150.0 }).sum();
         let body_freq = (springs / (mass / 1000.0)).max(0.0).sqrt();
-        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true }
+        RigidBody { external_force_world: Vec3::ZERO, external_torque_body: Vec3::ZERO, mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true }
     }
 
     /// Place the body at rest with its wheels on the ground plane at `origin.z`: heading
@@ -609,6 +613,10 @@ impl RigidBody {
             }
         }
         self.wheel_impacts = impacts;
+        if dt > 0.0 {
+            self.external_force_world = Vec3::ZERO;
+            self.external_torque_body = Vec3::ZERO;
+        }
     }
 
     fn step_slice(&mut self, dt: f32, drive_torque: f32, brake: &[f32], steer: f32, probe: &dyn Fn(f64, f64, f64) -> GroundProbe) {
@@ -640,7 +648,7 @@ impl RigidBody {
         for _ in 0..substeps {
             let rot = self.orientation;
             let up = rot.mul_vec3(Vec3::Z);
-            let mut force = Vec3::new(0.0, 0.0, -9.81 * self.mass);
+            let mut force = Vec3::new(0.0, 0.0, -9.81 * self.mass) + self.external_force_world;
             // the air: ½ ρ cw A v² (cw 0.6, the front a bus's or a car's by the mass). Without it
             // a bus rolling downhill without its brakes ran on to any speed
             {
@@ -648,7 +656,7 @@ impl RigidBody {
                 let area = (self.mass / 2200.0).clamp(2.0, 8.5);
                 force -= v * v.length() * (0.5 * 1.2 * 0.6 * area);
             }
-            let mut torque = Vec3::ZERO; // body frame
+            let mut torque = self.external_torque_body; // body frame
             // Every driven wheel of the train takes its share of `M_Wheel`. A body without
             // driven wheels of its own (a pusher's front section) was pushed by nothing: the
             // count was clamped to one and the torque went to wheels that do not drive.

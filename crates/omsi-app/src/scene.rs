@@ -25,6 +25,13 @@ use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod bridge;
+mod placement;
+mod positions;
+#[cfg(test)]
+mod date_reset;
+pub(crate) use bridge::{bridge_release_script_texture, bridge_script_texture};
+
 /// A loaded scenery object type: model meshes + material descriptions.
 pub struct ObjectType {
     pub sco: SceneryObject,
@@ -175,7 +182,14 @@ impl ObjectType {
 }
 
 /// A placed scenery object with a running script / animations.
+fn next_scenery_api_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct ScriptedObject {
+    /// Native API handle for this loaded instance; never reused after tile unloading.
+    pub api_id: u64,
     pub ty: Arc<ObjectType>,
     pub pos: DVec3,
     pub xf: Mat4,
@@ -235,6 +249,10 @@ pub struct StopBoards {
 /// light `index` of the crossing `parent`.
 #[derive(Clone)]
 pub struct LightObject {
+    pub api_id: u64,
+    pub map_id: i64,
+    pub tile: (i32, i32),
+    pub type_path: PathBuf,
     pub parent: i64,
     pub index: usize,
     /// The map names no light for it (no string, or an empty one): a gate that is its own
@@ -655,6 +673,7 @@ pub struct PlacedObject {
 /// A scenery object the object editor can take hold of (see [`World::edit_objects`]).
 #[derive(Clone)]
 pub struct EditObject {
+    pub api_id: u64,
     pub tile: (i32, i32),
     pub pos: DVec3,
     pub xf: Mat4,
@@ -663,6 +682,11 @@ pub struct EditObject {
     pub instances: Vec<usize>,
     /// Its `.sco`, for the editor's display.
     pub sco: std::path::PathBuf,
+    pub(crate) ty: Arc<ObjectType>,
+    /// Native runtime relocation is scoped to this loaded instance. Preserve the
+    /// authored pose so unloading restores the map-wide position index.
+    pub(crate) native_origin: Option<Pose>,
+    pub(crate) terrain_mapped: bool,
 }
 
 /// What the object editor did to one object: moved by `moved` (m), turned by `turned`
@@ -742,10 +766,10 @@ struct Placing {
     objects: usize,
     /// Seconds per phase (OMSI_PROFILE).
     secs: [f64; 4],
-    /// The tile's ground materials for `[terrainmapping]` slots: the base layer (without
-    /// the roads' cut, which would punch holes into a traffic island) and every painted
-    /// layer (`true`), as the ground itself is drawn.
-    ground_mats: Vec<(MaterialId, bool)>,
+    /// `[terrainmapping]` uses the first [groundtex], without the roads' cut (which
+    /// would punch holes into a traffic island). Painted terrain layers belong to the
+    /// ground itself and must not be projected onto a spline verge or object.
+    terrain_mapping_mat: Option<MaterialId>,
 }
 
 impl PendingUpload {
@@ -1568,11 +1592,11 @@ fn bilinear_alpha(img: &Image, u: f32, v: f32) -> f32 {
 /// Split the material slots of an object mesh whose texture carries `[terrainmapping]`
 /// off into a mesh of their own. OMSI does not draw such a slot with its texture (the
 /// stock ones are a 1x1 placeholder, TH_Wald's Gras01.dds a single green pixel): the slot
-/// takes on the ground of the tile it stands on, so that the grass on top of a rock, a
+/// takes on the map's first ground texture, so that the grass on top of a rock, a
 /// traffic island or a roundabout runs on seamlessly from the meadow around it. The split
 /// mesh therefore gets the terrain's own uv (tile space, see `build_terrain_mesh`) for
 /// the object placed at `pos`/`xf` on the tile at `origin`, and is drawn with the tile's
-/// ground materials. Returns the mesh without those slots and the split-off one.
+/// uncut base material. Returns the mesh without those slots and the split-off one.
 #[cfg(test)]
 fn split_terrain_mapped(
     src: &MeshData,
@@ -1750,6 +1774,9 @@ pub struct World {
     upgrades_done: Arc<Mutex<Vec<(PathBuf, Arc<TextureData>)>>>,
     /// Roller-blind pictures (`[matl_freetex]`) uploaded as RGBA, to be compressed.
     freetex_upgrades: Arc<Mutex<Vec<PathBuf>>>,
+    /// Files refreshed by an external display/card producer; old background compression
+    /// results must not replace their newer pixels. Bounded by the bridge helper.
+    bridge_texture_paths: Mutex<hashbrown::HashSet<PathBuf>>,
     /// OMSI's `[texmemlimit]`: bytes the scenery and vehicle textures may take on the GPU
     /// (0 = no limit), and when the budget was last looked at.
     texture_limit: std::sync::atomic::AtomicU64,
@@ -1845,10 +1872,12 @@ pub struct World {
     /// Chrono folders active on the sim date, in order, and the merged AI lists / date.
     /// The chrono scenarios in force on the sim date (changed at midnight: `set_date`).
     pub chrono_dirs: parking_lot::RwLock<Vec<PathBuf>>,
-    pub ailists: omsi_map::AiLists,
+    ailists: RwLock<Arc<omsi_map::AiLists>>,
+    /// Date changes wait for source preparation before invalidating its caches.
+    preparation: RwLock<u64>,
     pub date: i32,
     /// Ticket pack (chrono folders may override the map's).
-    pub ticket_pack: String,
+    ticket_pack: RwLock<String>,
     /// Fonts for text and script textures, shared by all vehicles.
     pub fonts: Arc<Mutex<omsi_sim::texttex::FontLibrary>>,
     /// Scenery material variants switched by `NightlightA`: (instance, slot, material on, off).
@@ -2535,9 +2564,10 @@ impl World {
             parklist: Mutex::new(HashMap::new()),
             mirror_textures: Mutex::new(Vec::new()),
             chrono_dirs: parking_lot::RwLock::new(chrono_dirs),
-            ailists,
+            ailists: RwLock::new(Arc::new(ailists)),
+            preparation: RwLock::new(0),
             date,
-            ticket_pack,
+            ticket_pack: RwLock::new(ticket_pack),
             object_types: Mutex::new(HashMap::new()),
             spline_types: Mutex::new(HashMap::new()),
             textures: Arc::new(TextureCache::new()),
@@ -2552,6 +2582,7 @@ impl World {
             upgrades_pending: Default::default(),
             upgrades_done: Default::default(),
             freetex_upgrades: Default::default(),
+            bridge_texture_paths: Default::default(),
             texture_limit: Default::default(),
             budget_checked: Default::default(),
             lanes: Mutex::new(Vec::new()),
@@ -3131,6 +3162,9 @@ impl World {
     /// Returns the tiles a scenario that came or went changes (to be read again), and
     /// forgets the map index built with the old ones.
     pub fn set_date(&self, date: i32) -> Vec<(i32, i32)> {
+        let mut preparation = self.preparation.write();
+        *self.ailists.write() = Arc::new(self.ai_lists_on_date(date));
+        *self.ticket_pack.write() = self.ticket_pack_on_date(date);
         let new = omsi_map::active_chrono_dirs(&self.map_dir, date);
         let old = self.chrono_dirs.read().clone();
         if new == old {
@@ -3147,14 +3181,89 @@ impl World {
                 }
             }
         }
+        if !tiles.is_empty() {
+            *preparation = preparation.checked_add(1).expect("tile preparation generation exhausted");
+        }
+        // Index::objects relinquishes its tile attribution to object_positions.
+        // Read only changed source tiles on both sides of the transition, so moved,
+        // removed and newly introduced IDs lose their old positions while unchanged
+        // loaded tiles keep their final terrain/road-adjusted heights.
+        let mut changed_ids = hashbrown::HashSet::new();
+        let mut complete = true;
+        for tile in self.global.tiles.iter().filter(|tile|tiles.contains(&(tile.x,tile.y))) {
+            let path = omsi_cfg::resolve_path(&self.map_dir,&tile.file);
+            for dirs in [&old,&new] {
+                match crate::tiles::read_tile(&path,dirs) {
+                    Some(tile) => positions::collect_ids(&tile,&mut changed_ids),
+                    None => complete = false,
+                }
+            }
+        }
         *self.chrono_dirs.write() = new;
-        *self.index.lock() = None;
+        // A changed source wins over an old runtime relocation even if the new
+        // authored position happens to equal that live object's last position.
+        for (id,o) in self.edit_objects.lock().iter_mut() {
+            if !complete || tiles.contains(&o.tile) || changed_ids.contains(id) {
+                o.native_origin = None;
+            }
+        }
+        {
+            let mut index = self.index.lock();
+            let mut duplicates = self.object_dups.lock();
+            let mut cached = self.object_positions.lock();
+            positions::invalidate(&mut cached,&mut duplicates,&tiles,&changed_ids,complete);
+            *index = None;
+        }
         let keys: Vec<(i32, i32)> = tiles.into_iter().collect();
         self.forget_staged(&keys);
         keys
     }
 
     /// Drop the read tiles `keys` from the staging cache (they are read again when asked).
+    pub(crate) fn ai_lists_on_date(&self, date: i32) -> omsi_map::AiLists {
+        let dirs = omsi_map::active_chrono_dirs(&self.map_dir,date);
+        let mut lists = omsi_map::ailists::ailists_with_chrono(&self.map_dir,&dirs);
+        for group in &mut lists.groups {
+            for types in &mut group.typgroups {
+                types.entries.retain(|entry|omsi_map::typgroup_entry_valid(entry,date));
+            }
+        }
+        lists
+    }
+
+    pub(crate) fn ai_lists(&self) -> Arc<omsi_map::AiLists> { self.ailists.read().clone() }
+
+    pub(crate) fn ticket_pack(&self) -> String { self.ticket_pack.read().clone() }
+
+    /// Resolve the date's effective authored pack without changing the active
+    /// world. Clock transactions load and validate this before committing.
+    pub(crate) fn ticket_pack_on_date(&self, date: i32) -> String {
+        let mut path = self.global.ticket_pack.clone();
+        for dir in omsi_map::active_chrono_dirs(&self.map_dir,date) {
+            let cfg = omsi_cfg::resolve_path(&dir,"Chrono.cfg");
+            if let Ok(cfg) = omsi_cfg::CfgFile::read(&cfg) {
+                if let Some(pack) = omsi_map::ailists::parse_chrono_cfg(&cfg).ticket_pack { path = pack; }
+            }
+        }
+        path
+    }
+
+    /// The caller has retired AI users of the old graph. Every loaded tile must then
+    /// be reloaded so paths/controllers are freshly seeded from the new Chrono files.
+    pub(crate) fn reset_traffic_sources(&self) {
+        let mut preparation = self.preparation.write();
+        *preparation = preparation.checked_add(1).expect("tile preparation generation exhausted");
+        let mut lanes = self.lanes.lock();
+        lanes.clear();
+        self.lane_tiles.lock().clear();
+        self.parked_cars.lock().clear();
+        self.seeded.lock().clear();
+        self.traffic_lights.lock().clear();
+        self.controller_of_object.lock().clear();
+        self.staged.lock().clear();
+        *self.layout.lock() = None;
+    }
+
     pub fn forget_staged(&self, keys: &[(i32, i32)]) {
         let mut st = self.staged.lock();
         for k in keys {
@@ -3164,8 +3273,12 @@ impl World {
 
     /// Drop every read tile from the staging cache.
     pub fn forget_all_staged(&self) {
+        let mut preparation = self.preparation.write();
+        *preparation = preparation.checked_add(1).expect("tile preparation generation exhausted");
         self.staged.lock().clear();
     }
+
+    pub(crate) fn preparation_generation(&self) -> u64 { *self.preparation.read() }
 
     /// The map index, built on first use (every tile file read once, in parallel).
     /// How many passengers get off at stop object `id` (see `tiles::stop_exit_weight`; a
@@ -3236,6 +3349,19 @@ impl World {
     /// ([`TileLayout::sources_of`]), not by what else happens to be loaded, so a tile
     /// streamed in gets exactly the ground and the cut a whole-map load gives it.
     pub fn prepare_tiles(&self, tiles: &[(i32, i32, PathBuf)]) -> (Vec<Prepared>, LoadStats) {
+        let _preparation = self.preparation.read();
+        self.prepare_tiles_inner(tiles)
+    }
+
+    /// A queued worker may start after a date/season reset. Check its source
+    /// generation under the preparation gate before it can repopulate caches.
+    pub(crate) fn prepare_tiles_for_generation(&self, tiles: &[(i32, i32, PathBuf)], generation: u64) -> (Vec<Prepared>, LoadStats) {
+        let preparation = self.preparation.read();
+        if *preparation != generation { return Default::default(); }
+        self.prepare_tiles_inner(tiles)
+    }
+
+    fn prepare_tiles_inner(&self, tiles: &[(i32, i32, PathBuf)]) -> (Vec<Prepared>, LoadStats) {
         let profile = omsi_cfg::env::var_os("OMSI_PROFILE").is_some();
         let t0 = std::time::Instant::now();
         let index = self.index();
@@ -4413,6 +4539,7 @@ impl World {
                         &o.extra,
                     );
                     self.scripted.lock().push(ScriptedObject {
+                        api_id: next_scenery_api_id(),
                         ty: ot.clone(),
                         pos,
                         xf,
@@ -4621,6 +4748,7 @@ impl World {
             // (surface objects too - a petrol station is a drivable [surface] with a roof)
             if let Some(shape) = ot.camera_shape() {
                 state.blockers.push(crate::camera_arm::Blocker {
+                    object_key: o.key,
                     ty: Arc::downgrade(&ot),
                     pos,
                     xf,
@@ -5754,6 +5882,7 @@ impl World {
             self.poles.lock().retain(|k, _| !poles.contains(k));
             self.parked_objects.lock().retain(|_, p| p.tile != key);
             self.departed_objects.lock().retain(|_, (p, _, _)| p.tile != key);
+            self.forget_native_placements(key);
             self.edit_objects.lock().retain(|_, o| o.tile != key);
             freed = self.gpu.lock().release_tile(renderer, scene, tg) > 0;
         }
@@ -6026,8 +6155,7 @@ impl World {
                                 m
                             }
                         };
-                        pl.ground_mats.clear();
-                        pl.ground_mats.push((uncut, false));
+                        pl.terrain_mapping_mat = Some(uncut);
                         // The painted ground: every further [groundtex] the editor's brush put on this
                         // tile is the same tile mesh once more, blended in through its own mask - which
                         // is how OMSI's car parks get their asphalt, its side streets their cobbles and
@@ -6066,7 +6194,6 @@ impl World {
                             );
                             let m = gpu.material(renderer, scene, m);
                             tg.materials.push(m);
-                            pl.ground_mats.push((m, true));
                             let li = instance!(renderer.add_surface_instance(
                                 scene,
                                 id,
@@ -6125,7 +6252,7 @@ impl World {
                         let id = gpu.add_mesh(renderer, scene, mesh);
                         scene.meshes[id].source = Some("terrain-mapped spline cells".to_string());
                         tg.meshes.push(id);
-                        for &(mat, _) in &pl.ground_mats {
+                        if let Some(mat) = pl.terrain_mapping_mat {
                             let si = instance!(renderer.add_surface_instance(scene, id, p.origin, Mat4::from_translation(glam::Vec3::Z * OMSI_SURFACE_LIFT), vec![mat]));
                             if let Some(inst) = scene.instances.get_mut(si) {
                                 inst.render_phase = RenderPhase::Spline;
@@ -6219,9 +6346,9 @@ impl World {
                             / mesh.normals.len().max(1) as f32;
                         log::info!("upload spline {} origin={:?} ranges={:?} mats={:?} mean normal z={mean_nz:+.2} verts={} first positions {:?}", st.def.path.display(), p.origin, &mesh.ranges[..mesh.ranges.len().min(3)], mats, mesh.positions.len(), &mesh.positions[..mesh.positions.len().min(3)]);
                     }
-                    // [terrainmapping] slots take the ground of the tile: the spline's mesh
-                    // is in tile space already, so the ground's uv is its own position
-                    let terrain: Vec<usize> = if pl.ground_mats.is_empty() {
+                    // [terrainmapping] slots take only the first ground texture. The
+                    // spline mesh is already in tile space, which supplies the ground UVs.
+                    let terrain: Vec<usize> = if pl.terrain_mapping_mat.is_none() {
                         Vec::new()
                     } else {
                         sg.terrain.iter().copied().filter(|t| mesh.ranges.iter().any(|r| r.2 as usize == *t)).collect()
@@ -6233,7 +6360,7 @@ impl World {
                         let gid = gpu.add_mesh(renderer, scene, &ground);
                         scene.meshes[gid].source = Some(st.def.path.display().to_string());
                         tg.meshes.push(gid);
-                        for &(mat, _) in &pl.ground_mats {
+                        if let Some(mat) = pl.terrain_mapping_mat {
                             let terrain_instance = instance!(renderer.add_surface_instance(
                                 scene,
                                 gid,
@@ -6422,10 +6549,10 @@ impl World {
                     });
                     let mut mesh_list: Vec<(MeshId, Vec<MaterialId>)> =
                         own_meshes.unwrap_or_else(|| type_meshes.clone());
-                    // [terrainmapping] slots: drawn with the ground of this tile, from a mesh
+                    // [terrainmapping] slots: drawn with the uncut base ground, from a mesh
                     // of this placement's own (see split_terrain_mapped); (level, mesh, id)
                     let mut ground_meshes: Vec<(usize, usize, MeshId)> = Vec::new();
-                    if !pl.ground_mats.is_empty() {
+                    if pl.terrain_mapping_mat.is_some() {
                         let mut parts: Vec<(usize, usize)> =
                             terrain_slots.iter().map(|t| (t.0, t.1)).collect();
                         parts.dedup();
@@ -6740,18 +6867,16 @@ impl World {
                         } else {
                             continue;
                         };
-                        // the ground as the tile draws it: the base layer, then every painted
-                        // layer blended over it; on a surface object (a crossing) all of them
-                        // pulled towards the eye like the object itself
-                        for &(mat, layer) in &pl.ground_mats {
-                            let inst = if surface || layer {
+                        // Keep the first ground texture on the object even where the map
+                        // author painted asphalt or another layer on the terrain below it.
+                        if let Some(mat) = pl.terrain_mapping_mat {
+                            let inst = if surface {
                                 instance!(renderer.add_surface_instance(scene, ground_id, draw_pos, xf, vec![mat]))
                             } else {
                                 instance!(renderer.add_instance(scene, ground_id, draw_pos, xf, vec![mat]))
                             };
                             if let Some(x) = scene.instances.get_mut(inst) {
                                 x.decal = surface;
-                                x.ground_layer = layer && !surface;
                                 x.render_phase = render_phase;
                                 if surface {
                                     x.surface_bias = false;
@@ -6841,7 +6966,7 @@ impl World {
                     }
                     if editable {
                         let instances: Vec<usize> = all_instances.iter().chain(&lod_instances).copied().collect();
-                        let eo = EditObject { tile: key, pos, xf, key: collision_key, instances, sco: ot.sco.path.clone() };
+                        let eo = EditObject { api_id: next_scenery_api_id(), tile: key, pos, xf, key: collision_key, instances, sco: ot.sco.path.clone(), ty: ot.clone(), native_origin: None, terrain_mapped: !ground_meshes.is_empty() || warped.is_some() };
                         // an object edited before its tile went shows the edit again
                         if let Some(e) = self.object_edits.lock().get(&map_id).copied() {
                             show_edit(renderer, scene, &eo, e);
@@ -6878,6 +7003,10 @@ impl World {
                             omsi_cfg::resolve_path(&dir, rel)
                         });
                         pl.light_objects.push(LightObject {
+                            api_id: next_scenery_api_id(),
+                            map_id,
+                            tile: key,
+                            type_path: ot.sco.path.clone(),
                             parent,
                             index,
                             any_light,
@@ -6942,6 +7071,7 @@ impl World {
                             // than its script has meshes: "index out of bounds", #111)
                             all_instances.truncate(mesh_instances);
                             self.scripted.lock().push(ScriptedObject {
+                                api_id: next_scenery_api_id(),
                                 ty: ot.clone(),
                                 pos,
                                 xf,
@@ -7251,6 +7381,7 @@ impl World {
         let _ = self.parked_live.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| Some(n.saturating_sub(state.parked_count)));
         self.parked_objects.lock().retain(|_, p| p.tile != key);
             self.departed_objects.lock().retain(|_, (p, _, _)| p.tile != key);
+        self.forget_native_placements(key);
         self.edit_objects.lock().retain(|_, o| o.tile != key);
         {
             // the posts' instances go back to the pool with the tile
@@ -7702,6 +7833,9 @@ impl World {
         if !wanted.is_empty() {
             let mut pending = self.upgrades_pending.lock();
             for path in wanted {
+                if self.bridge_texture_paths.lock().contains(&path) {
+                    continue;
+                }
                 if !pending.insert(path.clone()) {
                     continue;
                 }
@@ -7746,6 +7880,9 @@ impl World {
                 break;
             };
             self.upgrades_pending.lock().remove(&path);
+            if self.bridge_texture_paths.lock().contains(&path) {
+                continue;
+            }
             // the texture is still up under that name (it may have gone meanwhile)
             let vid = self.vehicle_textures.lock().get(&path).map(|e| e.0);
             let id = match vid {
@@ -8958,7 +9095,8 @@ fn sync_materials(
     render: &mut VehicleRender,
 ) {
     for v in &mut render.variants {
-        if let Some(f) = &mut v.free {
+        let item_has_freetex = v.free.iter().any(|f| f.item_only);
+        for f in &mut v.free {
             let name = vehicle.str_var(&f.var);
             let name = name.trim().to_string();
             let key = name.to_ascii_lowercase();
@@ -8993,14 +9131,21 @@ fn sync_materials(
                         // texture from the mesh (with its addressing): a roller blind's idle
                         // "next" band then stays out of sight in its transparent border
                         // instead of covering the display as an untextured white plane.
-                        let tex = found.or(v.base_tex);
-                        let p = v.spec.build(renderer, scene, tex);
+                        let spec = match found {
+                            Some(tex) => v.spec.with_freetex(f.key, tex, f.diffuse, f.item_only),
+                            None => v.spec.clone(),
+                        };
+                        let p = spec.build(renderer, scene, v.base_tex);
                         f.cache.insert(key, p);
                         p
                     }
                 };
-                v.base = pair.0;
-                v.item = pair.1;
+                if !f.item_only {
+                    v.base = pair.0;
+                }
+                if f.item_only || !item_has_freetex {
+                    v.item = pair.1;
+                }
             }
         }
         if let Some(l) = &mut v.lights {
@@ -9174,6 +9319,9 @@ pub fn sync_vehicle_textures(
     }
     let mut rebound = Vec::new();
     for (i, st) in vehicle.host.script_textures.iter_mut().enumerate() {
+        if render.external_script_textures.contains(&i) {
+            continue;
+        }
         // (far away what the scripts redraw goes up every half second: `displays_far`)
         if !render.displays_far {
             if let Some(Some(tex)) = render.script_textures.get(i) {
@@ -9188,6 +9336,11 @@ pub fn sync_vehicle_textures(
                     if renderer.update_texture_mips(scene, *tex, &img) {
                         rebound.push(*tex);
                     }
+                } else if renderer.texture_levels(scene, *tex) != Some((st.width, st.height, 1)) {
+                    renderer.replace_texture(scene, *tex, &TextureData {
+                        gpu_mips: false, ..TextureData::from_image(img)
+                    });
+                    rebound.push(*tex);
                 } else {
                     renderer.update_texture(scene, *tex, &img);
                 }
@@ -9526,6 +9679,8 @@ pub struct VehicleRender {
     pub text_textures: Vec<Option<TextureId>>,
     /// GPU texture per `[scripttexture]` index.
     pub script_textures: Vec<Option<TextureId>>,
+    /// Slots currently supplied by an external client, for this vehicle lifetime only.
+    pub external_script_textures: hashbrown::HashSet<usize>,
     /// `script_textures` belong to the vehicle this part is coupled to (`[scriptshare]`):
     /// they are not this render's to give back.
     pub shared_script: bool,
@@ -9600,8 +9755,8 @@ pub struct VariantSlot {
     pub entries: Vec<(MaterialId, MaterialId)>,
     /// `[texchanges]` variable: its integer value picks the entry.
     pub tex_var: String,
-    /// `[matl_freetex]`: the texture is the file a string variable names.
-    pub free: Option<FreeTex>,
+    /// Free textures for the plain material and, independently, its switched item.
+    pub free: Vec<FreeTex>,
     /// How to build a material of this slot for a texture loaded later.
     pub spec: SlotSpec,
     /// The textures `base`/`item` and each entry were made with (made again per vehicle
@@ -9687,9 +9842,23 @@ impl MultiLight {
 
 /// `[matl_freetex]`: the slot shows the texture file named by a string variable - the
 /// SD200's destination roller reads the terminus pictures of the map's `.hof` this way.
+fn free_texture_defs(overrides: &[&MaterialDef]) -> Vec<(bool, String, String)> {
+    [false, true].into_iter().filter_map(|item| {
+        overrides.iter().filter(|o| o.item == item).find_map(|o| {
+            o.freetex.as_ref().map(|(key, var)| (item, key.clone(), var.clone()))
+        })
+    }).collect()
+}
+
 #[derive(Clone)]
 pub struct FreeTex {
     pub var: String,
+    /// The original named texture can be used by several stages (a display commonly
+    /// names the same black texture as its diffuse and its switched night map).
+    pub key: Option<TextureId>,
+    pub diffuse: bool,
+    /// A declaration inside `[matl_item]` must not change the unpowered material.
+    pub item_only: bool,
     /// Where the file name is looked up (the vehicle's texture folders).
     pub dirs: Vec<PathBuf>,
     pub textures: Arc<omsi_texture::TextureCache>,
@@ -9840,6 +10009,31 @@ impl Look {
 }
 
 impl SlotSpec {
+    fn with_freetex(&self, key: Option<TextureId>, tex: TextureId, diffuse: bool, item_only: bool) -> Self {
+        let mut spec = self.clone();
+        let replace = |look: &mut Look| {
+            // A per-vehicle text/script texture has already replaced the original
+            // diffuse and is not the file named by this free-texture declaration.
+            if (diffuse && look.diffuse.is_none()) || (key.is_some() && look.diffuse == key) {
+                look.diffuse = Some(tex);
+            }
+            if let Some(key) = key {
+                for stage in [&mut look.night, &mut look.lightmap] {
+                    if *stage == Some(key) { *stage = Some(tex); }
+                }
+                if let Some((id, _)) = &mut look.transmap {
+                    if *id == key { *id = tex; }
+                }
+                if let Some((id, _)) = &mut look.envmap {
+                    if *id == key { *id = tex; }
+                }
+            }
+        };
+        if !item_only { replace(&mut spec.base); }
+        if let Some(item) = &mut spec.item { replace(item); }
+        spec
+    }
+
     /// (plain material, `[matl_item]` material) for one diffuse texture; without a
     /// `[matl_item]` both are the same material.
     pub fn build(
@@ -10323,7 +10517,7 @@ impl World {
                 }
             }
             for v in render.variants {
-                if let Some(f) = v.free {
+                for f in v.free {
                     for (b, it) in f.cache.into_values() {
                         own_materials.push(b);
                         own_materials.push(it);
@@ -10892,6 +11086,7 @@ impl World {
             instances,
             text_textures,
             script_textures,
+            external_script_textures: Default::default(),
             shared_script: shared_script.is_some(),
             variants,
             own_materials,
@@ -11144,7 +11339,7 @@ impl World {
                     let bump = ov.iter().find_map(|o| o.bumpmap.clone()).filter(|_| envmap.is_some() && omsi_cfg::env::var_os("OMSI_NO_BUMP").is_none()).and_then(|(t, f)| tex!(&subst(&t), &dirs_ref, vehicle_bump_texture).map(|id| (id, f)));
                     // a [matl_freetex] slot gets its texture from a string variable at run
                     // time, so an empty slot here is not a missing file
-                    let freetex = ov.iter().any(|o| o.freetex.is_some());
+                    let freetex = ov_all.iter().any(|o| o.freetex.is_some());
                     if tex.is_none() && !is_null_texture(&m.texture) && text_slot.is_none() && script_slot.is_none() && !freetex && vt.texchange(&m.texture).is_none() {
                         missing_tex.push(format!("{} ({})", tex_name, def.file));
                     }
@@ -11303,8 +11498,11 @@ impl World {
                     materials.extend(more.iter().copied());
                     // [matl_freetex]: the file is only known at run time (the destination
                     // roller builds its path from the map's depot and terminus strings)
-                    let free = ov.iter().find_map(|o| o.freetex.clone()).map(|(_, var)| FreeTex {
+                    let free: Vec<FreeTex> = free_texture_defs(&ov_all).into_iter().map(|(item_only, key, var)| FreeTex {
                         var,
+                        diffuse: key.eq_ignore_ascii_case(&m.texture),
+                        key: tex!(&subst(&key), &dirs_ref),
+                        item_only,
                         dirs: dirs.clone(),
                         textures: self.textures.clone(),
                         cache: HashMap::new(),
@@ -11312,7 +11510,7 @@ impl World {
                         shared: self.vehicle_textures.clone(),
                         held: Vec::new(),
                         wants_upgrade: self.freetex_upgrades.clone(),
-                    });
+                    }).collect();
                     let multi_light = |base: MaterialId, item: MaterialId| -> Option<MultiLight> {
                         let list = ov.iter().map(|o| &o.lightmaps).find(|l| !l.is_empty())?;
                         let maps: Vec<(PathBuf, String)> = list
@@ -11328,11 +11526,11 @@ impl World {
                             held: Vec::new(),
                         })
                     };
-                    if spec.item.is_some() || !entries.is_empty() || free.is_some() {
+                    if spec.item.is_some() || !entries.is_empty() || !free.is_empty() {
                         let tex_var = master.map(|m| m.variable.clone()).unwrap_or_default();
                         variants.push(VariantSlot { mesh: instances.len(), slot, base, item, more, var: change_var.unwrap_or_default(), more_vars: change_vars.iter().skip(1).cloned().collect(), entries, tex_var, free, spec, base_tex, entry_tex, lights: multi_light(base, item) });
                     } else if let Some(lights) = multi_light(base, item) {
-                        variants.push(VariantSlot { mesh: instances.len(), slot, base, item, more: Vec::new(), var: String::new(), more_vars: Vec::new(), entries, tex_var: String::new(), free: None, spec, base_tex, entry_tex, lights: Some(lights) });
+                        variants.push(VariantSlot { mesh: instances.len(), slot, base, item, more: Vec::new(), var: String::new(), more_vars: Vec::new(), entries, tex_var: String::new(), free: Vec::new(), spec, base_tex, entry_tex, lights: Some(lights) });
                     } else if base_dyn.any() {
                         dyn_slots.push(DynSlot { mesh: instances.len(), slot, text: text_slot, script: script_slot, script_trans, tex, alpha, transmap, night, lightmap, envmap, clamp, extra, color, emissive });
                     }
@@ -11629,6 +11827,80 @@ fn object_lanes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn freetex_test_look() -> Look {
+        Look {
+            alpha: AlphaMode::Opaque,
+            color: [1.0; 4],
+            emissive: [0.0; 3],
+            unlit: false,
+            diffuse: None,
+            transmap: None,
+            night: None,
+            lightmap: None,
+            envmap: None,
+            extra: MaterialExtra::default(),
+            dyn_tex: DynTex::default(),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the installed SOR NB content in OMSI_TEST_CONTENT"]
+    fn installed_tangenta_ois_retains_powered_freetex() {
+        let root=PathBuf::from(std::env::var_os("OMSI_TEST_CONTENT").expect("set OMSI_TEST_CONTENT to the OMSI content root"));
+        let model=omsi_model::Model::load(&root.join("Vehicles/SOR NB/model/1_2011.cfg")).unwrap();
+        let definitions:Vec<_>=model.meshes.iter().flat_map(|mesh| {
+            let refs:Vec<_>=mesh.materials.iter().collect();
+            free_texture_defs(&refs)
+        }).filter(|(_,_,var)|var=="mypoldisplej").collect();
+        assert!(!definitions.is_empty());
+        assert!(definitions.iter().any(|(item,key,_)|*item && key.eq_ignore_ascii_case("cerna.bmp")),"{definitions:?}");
+        println!("SOR NB OIS: {definitions:?}");
+    }
+
+    #[test]
+    fn powered_terminal_freetex_is_kept_and_replaces_its_black_nightmap() {
+        // The Tangenta OIS declares the free texture in the powered item, not in
+        // the base [matl]. The black key is also used as its self-lit night map.
+        let model = omsi_model::Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", concat!(
+            "[mesh]\nterminal.o3d\n[matl]\nblack.bmp\n0\n",
+            "[matl_change]\nblack.bmp\n0\npower\n[matl_item]\n",
+            "[matl_nightmap]\nblack.bmp\n[matl_freetex]\nblack.bmp\nscreen\n",
+        )));
+        let defs: Vec<&MaterialDef> = model.meshes[0].materials.iter().collect();
+        assert_eq!(free_texture_defs(&defs), vec![(true, "black.bmp".into(), "screen".into())]);
+        let base = freetex_test_look();
+        let mut powered = base.clone();
+        powered.night = Some(10);
+        let spec = SlotSpec { base, item: Some(powered), more: Vec::new() };
+        let changed = spec.with_freetex(Some(10), 20, true, true);
+        assert_eq!(changed.base.diffuse, None); // unpowered remains black
+        assert_eq!(changed.item.as_ref().unwrap().diffuse, Some(20));
+        assert_eq!(changed.item.as_ref().unwrap().night, Some(20));
+        assert_eq!(spec.item.as_ref().unwrap().night, Some(10)); // reusable template
+    }
+
+    #[test]
+    fn freetex_preserves_other_stages_and_per_vehicle_script_textures() {
+        let mut base = freetex_test_look();
+        base.night = Some(10);
+        base.lightmap = Some(11);
+        base.transmap = Some((10, true));
+        base.envmap = Some((12, 0.5));
+        let mut item = base.clone();
+        item.diffuse = Some(99); // a script texture is not the file being replaced
+        let spec = SlotSpec { base, item: Some(item), more: Vec::new() };
+        let changed = spec.with_freetex(Some(10), 20, true, false);
+        assert_eq!(changed.base.diffuse, Some(20));
+        assert_eq!(changed.base.night, Some(20));
+        assert_eq!(changed.base.lightmap, Some(11));
+        assert_eq!(changed.base.transmap, Some((20, true)));
+        assert_eq!(changed.base.envmap, Some((12, 0.5)));
+        assert_eq!(changed.item.as_ref().unwrap().diffuse, Some(99));
+        let missing_key = spec.with_freetex(None, 21, true, true);
+        assert_eq!(missing_key.item.as_ref().unwrap().night, Some(10));
+        assert_eq!(missing_key.item.as_ref().unwrap().diffuse, Some(99));
+    }
 
     #[test]
     fn spline_batches_keep_materials_cells_shadows_and_long_segments_separate() {
@@ -11952,6 +12224,10 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+#[path = "scene/terrain_mapping_tests.rs"]
+mod terrain_mapping_tests;
 
 #[cfg(test)]
 mod material_tests {

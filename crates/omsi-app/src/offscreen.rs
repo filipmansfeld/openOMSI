@@ -2,6 +2,9 @@
 
 use super::*;
 
+#[cfg(test)]
+mod visual_regression;
+
 pub(crate) fn run_offscreen(
     args: &Args,
     out: &PathBuf,
@@ -170,6 +173,7 @@ pub(crate) fn run_offscreen(
     if let Some(p) = player.as_mut() {
         apply_weather(&mut p.vehicle, &weather, initial_wetness(&weather));
     }
+    if let Some(traffic) = traffic.as_mut() { traffic.set_weather(&weather,initial_wetness(&weather)); }
     // the workshop's waiting time moves the clock on, so the sky has to follow it
     let mut service_seconds = 0.0f64;
     let daylight0 = omsi_sim::Daylight::compute(&start_clock(args), envir.as_ref());

@@ -26,6 +26,7 @@
 //! Wine elsewhere). The frame is one round trip.
 
 pub mod lua;
+mod lua_api;
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -615,6 +616,12 @@ impl Plugin {
 
 /// The game's side of a frame.
 pub trait PluginIo {
+    /// Native, versioned game operations shared with external adapters. Implementations
+    /// execute writes synchronously on the simulation thread and return an error for
+    /// unsupported operations, stale object handles, or invalid arguments.
+    fn api(&mut self, _operation: &str, _arguments: serde_json::Value, _binary: &[u8]) -> Result<serde_json::Value, String> {
+        Err("native game API is not available in this context".into())
+    }
     fn system(&mut self, name: &str) -> Option<f32>;
     fn set_system(&mut self, name: &str, v: f32);
     fn has_vehicle(&self) -> bool;
@@ -632,6 +639,16 @@ pub trait PluginIo {
     fn vehicle_name(&self) -> Option<String> {
         None
     }
+    /// Stable lifetime identity, independent of the display/model name. The fallback
+    /// preserves behavior for existing PluginIo implementations without identities.
+    fn vehicle_identity(&mut self) -> Option<String> {
+        self.vehicle_name()
+    }
+    /// Current loaded map session identity and its display name (Lua lifecycle events).
+    fn map_identity(&mut self) -> Option<String> { None }
+    fn map_name(&self) -> Option<String> { None }
+    /// Whether an actual renderer is currently present. This is not a D3D reset signal.
+    fn renderer_available(&self) -> bool { false }
     /// The player's vehicle: x, y, z and heading in degrees (Lua plugins).
     fn position(&self) -> Option<[f64; 4]> {
         None

@@ -6,6 +6,9 @@ use omsi_vehicle::{SoundCfg, SoundEntry};
 use std::path::Path;
 use std::sync::Arc;
 
+mod native;
+pub use native::{PlaybackControl, SoundInfo};
+
 struct RuntimeSound {
     def: SoundEntry,
     clip: Option<Arc<Clip>>,
@@ -16,9 +19,13 @@ struct RuntimeSound {
     /// Since when the conditions hold (triggered entries: since the trigger last fired) -
     /// what a `[volcurve] -1` reads, see [`SoundSet::curve_input`].
     active_since: Option<std::time::Instant>,
+    original: Option<SoundEntry>,
+    control: PlaybackControl,
+    pitch_multiplier: f32,
 }
 
 pub struct SoundSet {
+    api_id: u64,
     sounds: Vec<RuntimeSound>,
     pub master: f32,
     /// Folder of the sound config: files of `(T.F.)` triggers resolve against it.
@@ -116,10 +123,14 @@ impl SoundSet {
                     voice: None,
                     held: false,
                     active_since: None,
+                    original: None,
+                    control: PlaybackControl::Native,
+                    pitch_multiplier: 1.0,
                 }
             })
             .collect();
         SoundSet {
+            api_id: native::next_id(),
             sounds,
             master: 1.0,
             dir: dir.to_path_buf(),
@@ -267,6 +278,7 @@ impl SoundSet {
         let view = self.view_mask();
         let (muffled, exterior, master) = (self.muffled, self.exterior, self.master);
         for s in self.sounds.iter_mut() {
+            if s.control != PlaybackControl::Native { continue; }
             if !s
                 .def
                 .triggers
@@ -402,6 +414,10 @@ impl SoundSet {
             }
         };
         for s in self.sounds.iter_mut() {
+            if s.control != PlaybackControl::Native {
+                native::update_controlled(engine,s,var,object_to_world,master,exterior,muffled,doppler);
+                continue;
+            }
             // How the exe plays an entry (`TSound` update, 2.2.032):
             // * with a `[trigger]`: once each time the trigger fires, from the start, never
             //   looped (a `[loopsound]` too) and without looking at its conditions;
@@ -411,9 +427,11 @@ impl SoundSet {
             //   The mod buses' air sounds (ECAS kneeling, the parking brake valve, the
             //   start-up chime) are written like that; looped, they hissed for ever.
             let triggered = !s.def.triggers.is_empty();
+            let fired = triggered && triggers.iter().any(|t|s.def.triggers.iter().any(|d|d.eq_ignore_ascii_case(t)));
             let holds = triggered || Self::conditions_hold(&s.def, var);
             let rising = !triggered && holds && !s.held;
             s.held = holds;
+            if fired { s.active_since=Some(std::time::Instant::now()); }
             if !triggered {
                 if !holds {
                     s.active_since = None;
@@ -436,7 +454,7 @@ impl SoundSet {
             let audible = vol.map(|v| v > 0.001).unwrap_or(false) && fast_enough;
             let params = |looping: bool| VoiceParams {
                 gain: vol.unwrap_or(0.0) * master * Self::outside_gain(muffled, exterior),
-                pitch: pitch.max(0.001),
+                pitch: (pitch * s.pitch_multiplier).clamp(0.001,64.0),
                 looping,
                 position: world_pos(s.def.pos),
                 doppler,
@@ -464,12 +482,10 @@ impl SoundSet {
             }
             // one-shot: started by its trigger or by its conditions starting to hold; the
             // volume follows the curves while it plays
-            let fired = triggered
-                && triggers
-                    .iter()
-                    .any(|t| s.def.triggers.iter().any(|d| d.eq_ignore_ascii_case(t)));
             let params = params(false);
-            if (fired || rising) && audible {
+            // A fade-in can begin at zero volume. Keep a real silent voice so its
+            // time curve can become audible later, without requiring another trigger.
+            if (fired || rising) && vol.is_some() && fast_enough {
                 if let Some(id) = s.voice {
                     if s.def.only_one && engine.is_playing(id) {
                         engine.set_params(id, params);

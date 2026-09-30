@@ -1461,6 +1461,12 @@ impl TrafficLightController {
     }
 
     /// Request distance of light `i` (m).
+    pub fn seek(&mut self, time: f64) {
+        self.time = time.rem_euclid(self.cycle_len());
+        self.passed = None;
+        self.started = true;
+    }
+
     pub fn approach_dist(&self, i: usize) -> f32 {
         self.approach.get(i).copied().flatten().unwrap_or(DEFAULT_APPROACH)
     }

@@ -9,6 +9,7 @@ description = "OMSI plugins: the .opl files of the plugins folder and their DLLs
 libloading = "0.8"
 log.workspace = true
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
+serde_json = "1"
 
 [[bin]]
 name = "omsi-plugin-host"

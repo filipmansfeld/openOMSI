@@ -26,7 +26,7 @@ pub(crate) fn load() -> Plugins {
 
 /// The game's side of a plugin frame: the player's bus, when there is one.
 pub(crate) struct Io<'a> {
-    pub vehicle: Option<&'a mut omsi_sim::VehicleInstance>,
+    pub app: &'a mut crate::App,
     /// Seconds since the last frame.
     pub dt: f32,
     /// A plugin's `omsi.message`, shown when the frame is done.
@@ -37,6 +37,15 @@ pub(crate) struct Io<'a> {
     pub commands: Vec<String>,
     /// Keys pressed and let go since the last frame.
     pub keys: Vec<(String, bool)>,
+}
+
+impl Io<'_> {
+    fn vehicle(&self) -> Option<&omsi_sim::VehicleInstance> {
+        self.app.player.as_ref().map(|p| &p.vehicle)
+    }
+    fn vehicle_mut(&mut self) -> Option<&mut omsi_sim::VehicleInstance> {
+        self.app.player.as_mut().map(|p| &mut p.vehicle)
+    }
 }
 
 /// The game menu lines a plugin may run with `omsi.command` (those that do something at
@@ -80,9 +89,13 @@ pub(crate) fn game_info(app: &crate::App) -> Vec<(&'static str, InfoValue)> {
 }
 
 impl PluginIo for Io<'_> {
+    fn api(&mut self, operation: &str, arguments: serde_json::Value, binary: &[u8]) -> Result<serde_json::Value, String> {
+        crate::plugin_api::execute(self.app, operation, arguments, binary)
+    }
+
     fn system(&mut self, name: &str) -> Option<f32> {
         let v = SysVar::from_name(name)?;
-        self.vehicle.as_mut().map(|veh| veh.host.sys_var(v))
+        self.vehicle_mut().map(|veh| veh.host.sys_var(v))
     }
 
     fn set_system(&mut self, name: &str, v: f32) {
@@ -92,27 +105,27 @@ impl PluginIo for Io<'_> {
     }
 
     fn has_vehicle(&self) -> bool {
-        self.vehicle.is_some()
+        self.app.player.is_some()
     }
 
     fn var(&mut self, name: &str) -> Option<f32> {
-        self.vehicle.as_ref()?.var(name)
+        self.vehicle()?.var(name)
     }
 
     fn set_var(&mut self, name: &str, v: f32) {
-        if let Some(veh) = self.vehicle.as_mut() {
+        if let Some(veh) = self.vehicle_mut() {
             veh.set_var(name, v);
         }
     }
 
     fn string(&mut self, name: &str) -> Option<String> {
-        let veh = self.vehicle.as_ref()?;
+        let veh = self.vehicle()?;
         let i = veh.ty.program.str_var(name)?;
         veh.state.str_vars.get(i as usize).cloned()
     }
 
     fn set_string(&mut self, name: &str, s: &str) {
-        if let Some(veh) = self.vehicle.as_mut() {
+        if let Some(veh) = self.vehicle_mut() {
             if let Some(i) = veh.ty.program.str_var(name) {
                 if let Some(slot) = veh.state.str_vars.get_mut(i as usize) {
                     *slot = s.to_string();
@@ -124,7 +137,7 @@ impl PluginIo for Io<'_> {
     /// A key down fires the trigger, a key up `<trigger>_off` (OMSI's keyboard event
     /// handler the original, which the plugin frame calls with the new state).
     fn fire(&mut self, trigger: &str, down: bool) {
-        if let Some(veh) = self.vehicle.as_mut() {
+        if let Some(veh) = self.vehicle_mut() {
             if down {
                 veh.trigger(trigger);
             } else {
@@ -138,11 +151,28 @@ impl PluginIo for Io<'_> {
     }
 
     fn vehicle_name(&self) -> Option<String> {
-        self.vehicle.as_ref().map(|v| format!("{} {}", v.ty.def.manufacturer, v.ty.def.type_name).trim().to_string())
+        self.vehicle().map(|v| format!("{} {}", v.ty.def.manufacturer, v.ty.def.type_name).trim().to_string())
+    }
+
+    fn vehicle_identity(&mut self) -> Option<String> {
+        crate::plugin_api::active_vehicle_identity(self.app)
+    }
+
+    fn map_identity(&mut self) -> Option<String> {
+        self.app.world.as_ref()?;
+        Some(crate::plugin_api::session(self.app))
+    }
+
+    fn map_name(&self) -> Option<String> {
+        self.app.world.as_ref().map(|world|world.global.name.clone())
+    }
+
+    fn renderer_available(&self) -> bool {
+        self.app.renderer.is_some()
     }
 
     fn position(&self) -> Option<[f64; 4]> {
-        self.vehicle.as_ref().map(|v| [v.position.x, v.position.y, v.position.z, v.heading])
+        self.vehicle().map(|v| [v.position.x, v.position.y, v.position.z, v.heading])
     }
 
     fn message(&mut self, text: &str, seconds: f32) {
@@ -163,7 +193,7 @@ impl PluginIo for Io<'_> {
     }
 
     fn var_names(&self) -> (Vec<String>, Vec<String>) {
-        match self.vehicle.as_ref() {
+        match self.vehicle() {
             Some(v) => (v.ty.program.var_names.clone(), v.ty.program.str_var_names.clone()),
             None => (Vec::new(), Vec::new()),
         }

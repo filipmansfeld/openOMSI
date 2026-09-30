@@ -35,6 +35,10 @@ pub struct IndexedSpline {
 /// the spline every `[splineAttachement]` row starts on, and where every object stands.
 #[derive(Default)]
 pub struct MapIndex {
+    /// Parent identities referenced even by objects outside the loaded tiles.
+    pub placement_references: hashbrown::HashSet<i64>,
+    /// Duplicate ground IDs cannot identify one native placement unambiguously.
+    pub placement_duplicates: hashbrown::HashSet<i64>,
     pub splines: HashMap<i64, IndexedSpline>,
     /// (tile index in global.cfg, attachment id) → (spline id, distance of the row's first
     /// object from the start of that spline - negative when it lies before it).
@@ -87,6 +91,8 @@ impl MapIndex {
             .map(|(gi, tx, ty, path)| {
                 let tile = read_tile(path, chrono_dirs)?;
                 let mut part = MapIndex::default();
+                part.placement_references.extend(tile.objects.iter().chain(&tile.attach_objects)
+                    .flat_map(|o| [o.parent_id, o.var_parent].into_iter().flatten()));
                 let mut rows: RowParts = Default::default();
                 for s in tile.splines.iter().filter(|s| !s.deleted) {
                     let map_chain_offset = if tile.version >= 11 || tile.version == 0 {
@@ -128,7 +134,9 @@ impl MapIndex {
                 }
                 for o in &tile.objects {
                     let ground = terrain.as_ref().map(|t| t.sample(o.pos[0].clamp(0.0, tile_size()) as f32, o.pos[1].clamp(0.0, tile_size()) as f32) as f64).unwrap_or(0.0);
-                    part.objects.insert(o.id, ((*tx, *ty), DVec3::new(origin.x + o.pos[0], origin.y + o.pos[1], o.pos[2] + ground), o.rot));
+                    if part.objects.insert(o.id, ((*tx, *ty), DVec3::new(origin.x + o.pos[0], origin.y + o.pos[1], o.pos[2] + ground), o.rot)).is_some() {
+                        part.placement_duplicates.insert(o.id);
+                    }
                     if o.extra.len() >= 2 {
                         part.stop_weights.insert(o.id, stop_exit_weight(&o.extra));
                     }
@@ -143,7 +151,11 @@ impl MapIndex {
                 for a in tile.spline_attachments.iter().filter(|a| a.repeater.is_none()) {
                     let Some(s) = tile.splines.get(a.spline_index.max(0) as usize) else { continue };
                     let Some(first) = row_start(a, s, None).and_then(|st| place_on(a, s, origin, None, st).into_iter().next()) else { continue };
+                    if part.objects.contains_key(&a.id) { part.placement_duplicates.insert(a.id); }
                     part.objects.entry(a.id).or_insert(((*tx, *ty), first.pose.pos, [first.pose.heading(), 0.0, 0.0]));
+                }
+                for a in &tile.attach_objects {
+                    if part.objects.contains_key(&a.id) { part.placement_duplicates.insert(a.id); }
                 }
                 part.tiles_read = 1;
                 Some((part, rows))
@@ -154,9 +166,12 @@ impl MapIndex {
         for p in parts {
             match p {
                 Some((p, (r, q))) => {
+                    index.placement_references.extend(p.placement_references);
+                    index.placement_duplicates.extend(p.placement_duplicates);
                     index.splines.extend(p.splines);
                     for (id, v) in p.objects {
                         if let Some(prev) = index.objects.get(&id).filter(|prev| prev.0 != v.0) {
+                            index.placement_duplicates.insert(id);
                             index.duplicates.insert((prev.0, id), (prev.1, prev.2));
                             index.duplicates.insert((v.0, id), (v.1, v.2));
                         }
@@ -488,18 +503,20 @@ fn place_on(att: &SplineAttachment, spline: &MapSpline, origin: DVec2, index: Op
             // the row's right is the spline's left
             let (u, side, turn) = if backwards { (len - along, -x, 180.0) } else { (along, x, 0.0) };
             let pos = curve.offset_point(u, side, h);
-            let heading = curve.heading_at(u) + turn + att.rot[0];
-            let [_, mut pitch, mut bank] = omsi_geometry::map_rotation(att.rot);
-            if att.tilt {
-                let sign = if backwards { -1.0 } else { 1.0 };
-                pitch += sign * curve.slope_at(u).atan().to_degrees();
-                // (the original: the cant's angle, atan of the percentage, and only
-                // for an object standing within the half cant width)
-                if side.abs() < curve.half_cant_width {
-                    bank += sign * (curve.cant_at(u) / 100.0).atan().to_degrees();
-                }
-            }
-            out.push(RowObject { index: j, pose: Pose { pos, rot: omsi_geometry::object_rotation([heading, pitch, bank]) } });
+            let pitch = if att.tilt { curve.slope_at(u).atan().to_degrees() } else { 0.0 };
+            // The cant lifts only within the spline type's half cant width.
+            let bank = if att.tilt && side.abs() < curve.half_cant_width {
+                (curve.cant_at(u) / 100.0).atan().to_degrees()
+            } else { 0.0 };
+            let mut own = omsi_geometry::map_rotation(att.rot);
+            own[0] += turn;
+            // Tangential objects turn in the spline's inclined frame. Adding the
+            // spline's pitch/bank to the object's Euler angles instead tilts a
+            // sideways railing across the road, and a reversed object downhill.
+            // The half turn of a backwards chain belongs to that same local frame.
+            let rot = omsi_geometry::object_rotation([curve.heading_at(u), pitch, bank])
+                * omsi_geometry::object_rotation(own);
+            out.push(RowObject { index: j, pose: Pose { pos, rot } });
         }
         if interval <= 0.0 {
             break;
@@ -560,7 +577,33 @@ pub fn tile_row_objects(att: &SplineAttachment, splines: &[MapSpline], origin: D
 /// preparation took.
 /// A finished batch: the tiles asked for, what was made of them (a tile that could not be
 /// made is missing), statistics and seconds.
-type Batch = (Vec<(i32, i32)>, Vec<crate::scene::Prepared>, crate::scene::LoadStats, f64);
+type Batch = (u64, Vec<(i32, i32)>, Vec<crate::scene::Prepared>, crate::scene::LoadStats, f64);
+
+/// A reload cancels a worker's eventual result without letting a second worker
+/// race it. The old result releases its own inflight slot but cannot be uploaded.
+#[derive(Default)]
+struct BatchEpoch {
+    generation: u64,
+    inflight: Option<u64>,
+}
+
+impl BatchEpoch {
+    fn invalidate(&mut self) {
+        self.generation = self.generation.checked_add(1).expect("tile upload generation exhausted");
+    }
+
+    fn start(&mut self) -> u64 {
+        debug_assert!(self.inflight.is_none());
+        self.inflight = Some(self.generation);
+        self.generation
+    }
+
+    fn finish(&mut self, generation: u64) -> bool {
+        if self.inflight != Some(generation) { return false; }
+        self.inflight = None;
+        generation == self.generation
+    }
+}
 
 /// The threads tiles are prepared on while the game runs: a pool of their own, a third of
 /// the cores, so that the frame's parallel work (culling, the AI scripts) never waits for a
@@ -622,7 +665,7 @@ pub struct Streamer {
     pub unload_radius: f64,
     tx: std::sync::mpsc::Sender<Batch>,
     rx: std::sync::mpsc::Receiver<Batch>,
-    inflight: bool,
+    epoch: BatchEpoch,
     queue: std::collections::VecDeque<crate::scene::PendingUpload>,
     /// Tiles in flight or waiting for upload.
     requested: hashbrown::HashSet<(i32, i32)>,
@@ -664,7 +707,7 @@ impl Streamer {
             unload_radius: load_radius + tile_size() * 1.5,
             tx,
             rx,
-            inflight: false,
+            epoch: BatchEpoch::default(),
             queue: Default::default(),
             requested: Default::default(),
             failed: Default::default(),
@@ -704,24 +747,40 @@ impl Streamer {
     /// changed): those loaded go and come back with the next batches. `None`: every loaded
     /// tile.
     pub fn reload(&mut self, renderer: &omsi_render::Renderer, scene: &mut omsi_render::Scene, keys: Option<&[(i32, i32)]>, audio: Option<&omsi_audio::AudioEngine>) {
-        let keys: Vec<(i32, i32)> = match keys {
+        // Wait for any preparation already running, invalidate workers that have
+        // not started yet, and cancel queued/partially uploaded old tile content.
+        self.world.forget_all_staged();
+        self.epoch.invalidate();
+        let cancelled: Vec<_> = self.requested.iter().copied().collect();
+        while let Some(pending) = self.queue.pop_front() {
+            self.world.abandon_upload(renderer, scene, pending, audio);
+        }
+        self.requested.clear();
+        let mut keys: Vec<(i32, i32)> = match keys {
             Some(k) => k.to_vec(),
             None => {
-                self.world.forget_all_staged();
+                self.failed.clear();
                 self.world.loaded_tiles()
             }
         };
+        // Preparation also registers CPU tile state. A cancelled tile outside a
+        // selective reload must not stay falsely "loaded" with no GPU content.
+        keys.extend(cancelled);
+        keys.sort_unstable();
+        keys.dedup();
         let mut freed = false;
         for k in &keys {
             self.failed.remove(k);
-            if !self.requested.contains(k) {
-                freed |= self.world.unload_tile(renderer, scene, *k, audio);
-            }
+            freed |= self.world.unload_tile(renderer, scene, *k, audio);
         }
         if freed {
             self.world.trim_object_types();
         }
         self.world.refresh_tile_lists();
+        if let Some((set, done)) = &mut self.initial {
+            let loaded = self.world.loaded_tiles();
+            *done = set.iter().filter(|key| loaded.contains(*key) || self.failed.contains(*key)).count();
+        }
         log::info!("tile streaming: {} tiles to be read again", keys.len());
     }
 
@@ -749,8 +808,8 @@ impl Streamer {
     /// when the loaded tiles changed (the caller then refreshes whatever copies world data).
     pub fn update(&mut self, renderer: &omsi_render::Renderer, scene: &mut omsi_render::Scene, centers: &[DVec3], budget: std::time::Duration, audio: Option<&omsi_audio::AudioEngine>) -> bool {
         let mut changed = false;
-        while let Ok((asked, prepared, stats, secs)) = self.rx.try_recv() {
-            self.inflight = false;
+        while let Ok((generation, asked, prepared, stats, secs)) = self.rx.try_recv() {
+            if !self.epoch.finish(generation) { continue; }
             // a tile the worker could not make is let go (else it stayed "requested" for
             // ever: never retried, never unloaded, and the loading screen waited for it)
             let made: hashbrown::HashSet<(i32, i32)> = prepared.iter().map(|p| (p.tx, p.ty)).collect();
@@ -849,7 +908,7 @@ impl Streamer {
         // Loading and unloading tiles leaves the allocator with pages it keeps for later: they
         // count as the game's memory until they are handed back (half a gigabyte on
         // Ahlheim). At most every few seconds, on a thread of its own.
-        if (self.loaded_total, self.unloaded_total) != (self.relieved_at.0, self.relieved_at.1) && self.relieved_at.2.elapsed().as_secs_f32() >= 4.0 && self.queue.is_empty() && !self.inflight {
+        if (self.loaded_total, self.unloaded_total) != (self.relieved_at.0, self.relieved_at.1) && self.relieved_at.2.elapsed().as_secs_f32() >= 4.0 && self.queue.is_empty() && self.epoch.inflight.is_none() {
             self.relieved_at = (self.loaded_total, self.unloaded_total, std::time::Instant::now());
             self.world.compact_slots(renderer, scene);
             crate::release_free_memory();
@@ -872,7 +931,7 @@ impl Streamer {
         if self.initial.is_none() {
             self.worst_frame_ms = self.worst_frame_ms.max(total.as_secs_f64() * 1000.0);
         }
-        if !self.inflight {
+        if self.epoch.inflight.is_none() {
             let missing = self.missing(centers);
             if !missing.is_empty() {
                 // the first area in bigger bites (the loading screen shows the progress),
@@ -881,7 +940,8 @@ impl Streamer {
                 let batch: Vec<(i32, i32, PathBuf)> = missing.into_iter().take(n).map(|(_, t)| t).collect();
                 let keys: Vec<(i32, i32)> = batch.iter().map(|t| (t.0, t.1)).collect();
                 self.requested.extend(keys.iter().copied());
-                self.inflight = true;
+                let generation = self.epoch.start();
+                let source_generation = self.world.preparation_generation();
                 let world = self.world.clone();
                 let tx = self.tx.clone();
                 // the first area gets every core; later tiles only the loader's own threads
@@ -890,16 +950,16 @@ impl Streamer {
                     let t = std::time::Instant::now();
                     // (a panic on a damaged file must not end the streaming: the batch comes
                     // back empty and its tiles are let go)
-                    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if first { world.prepare_tiles(&batch) } else { loader_pool().install(|| world.prepare_tiles(&batch)) }));
+                    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if first { world.prepare_tiles_for_generation(&batch, source_generation) } else { loader_pool().install(|| world.prepare_tiles_for_generation(&batch, source_generation)) }));
                     let (prepared, stats) = made.unwrap_or_else(|_| {
                         log::error!("tile streaming: loading tiles {:?} failed", batch.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>());
                         Default::default()
                     });
-                    let _ = tx.send((batch.iter().map(|t| (t.0, t.1)).collect(), prepared, stats, t.elapsed().as_secs_f64()));
+                    let _ = tx.send((generation, batch.iter().map(|t| (t.0, t.1)).collect(), prepared, stats, t.elapsed().as_secs_f64()));
                 });
                 if let Err(e) = spawned {
                     log::warn!("tile loader thread: {e}");
-                    self.inflight = false;
+                    self.epoch.finish(generation);
                     for k in keys {
                         self.requested.remove(&k);
                     }
@@ -913,6 +973,24 @@ impl Streamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_rejects_inflight_old_graph_and_allows_fresh_batch() {
+        let mut epoch = BatchEpoch::default();
+        let old = epoch.start();
+        epoch.invalidate();
+        epoch.invalidate(); // e.g. Chrono and season change in the same frame
+        assert_eq!(epoch.inflight, Some(old));
+        assert!(!epoch.finish(old));
+        assert!(epoch.inflight.is_none());
+        let fresh = epoch.start();
+        assert_ne!(fresh, old);
+        // Even a duplicate delayed old result cannot release the newer worker.
+        assert!(!epoch.finish(old));
+        assert_eq!(epoch.inflight, Some(fresh));
+        assert!(epoch.finish(fresh));
+        assert!(epoch.inflight.is_none());
+    }
 
     #[test]
     fn indexed_tile_search_matches_full_distance_scan() {
@@ -972,6 +1050,91 @@ mod tests {
         assert_eq!(one.len(), 1);
         assert!((one[0].pose.pos.y - 100.0).abs() < 1e-6);
         assert!(row_objects(&row(0.0, 0.0, 102.0, None), &dead_end, DVec2::ZERO, None).is_empty());
+    }
+
+    #[test]
+    fn tangential_row_rotates_within_the_spline_plane() {
+        let s = MapSpline {
+            heading: 37.0, radius: 100.0, grad_start: 15.0, grad_end: -5.0,
+            cant_start: 7.0, cant_end: 3.0, ..spline(1, 0, 0, 80.0)
+        };
+        let curve = SplineCurve::from_map(&s, DVec2::ZERO);
+        let u = 25.0;
+        let pitch = curve.slope_at(u).atan();
+        let bank = (curve.cant_at(u) / 100.0).atan();
+        let heading = curve.heading_at(u).to_radians();
+        // An object's normal must not change when it is turned on that surface.
+        let normal = DVec3::new(bank.sin() * pitch.cos(), -pitch.sin(), bank.cos() * pitch.cos());
+        let expected = DVec3::new(
+            normal.x * heading.cos() + normal.y * heading.sin(),
+            -normal.x * heading.sin() + normal.y * heading.cos(), normal.z,
+        ).as_vec3();
+        for own_heading in [0.0, 90.0, 180.0, -90.0, 27.0] {
+            let att = SplineAttachment { tilt: true, rot: [own_heading, 0.0, 0.0], ..row(0.0, 0.0, u, None) };
+            let objects = row_objects(&att, &s, DVec2::ZERO, None);
+            assert_eq!(objects.len(), 1);
+            let rot = objects[0].pose.rot;
+            assert!((rot.transform_vector3(Vec3::Z) - expected).length() < 1e-6, "heading {own_heading}");
+            for axis in [Vec3::X, Vec3::Y] {
+                assert!(rot.transform_vector3(axis).dot(expected).abs() < 1e-6, "heading {own_heading}");
+            }
+        }
+    }
+
+    #[test]
+    fn tangential_row_keeps_its_frame_when_the_spline_runs_backwards() {
+        let s = MapSpline { heading: 31.0, grad_start: 12.0, grad_end: 12.0,
+            cant_start: 5.0, cant_end: 5.0, ..spline(1, 0, 0, 80.0) };
+        let curve = SplineCurve::from_map(&s, DVec2::ZERO);
+        let reverse = MapSpline { pos: curve.end_point().to_array(), heading: s.heading + 180.0,
+            grad_start: -12.0, grad_end: -12.0, cant_start: -5.0, cant_end: -5.0, ..s.clone() };
+        // Include the object's own pitch/bank: the spline frame must compose with
+        // these too, and children inherit the resulting complete rotation.
+        let att = SplineAttachment { tilt: true, rot: [90.0, 3.0, -2.0], ..row(0.0, 0.0, 20.0, None) };
+        let forward = row_objects(&att, &s, DVec2::ZERO, None)[0].pose;
+        let start = RowStart { s: 20.0, j: 0, backwards: true, d0: 20.0, acc: 0.0 };
+        let backward = place_on(&att, &reverse, DVec2::ZERO, None, start)[0].pose;
+        assert!((forward.pos - backward.pos).length() < 1e-8);
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            assert!((forward.rot.transform_vector3(axis) - backward.rot.transform_vector3(axis)).length() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn upright_row_and_objects_outside_cant_width_keep_their_placement_rules() {
+        let s = MapSpline { heading: 65.0, grad_start: 10.0, grad_end: 10.0,
+            cant_start: 20.0, cant_end: 20.0, ..spline(1, 0, 0, 80.0) };
+        let att = SplineAttachment { rot: [90.0, 3.0, -2.0], ..row(0.0, 0.0, 20.0, None) };
+        let upright = row_objects(&att, &s, DVec2::ZERO, None)[0].pose;
+        let expected = omsi_geometry::object_rotation([155.0, -3.0, 2.0]);
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            assert!((upright.rot.transform_vector3(axis) - expected.transform_vector3(axis)).length() < 1e-6);
+        }
+        let outside = SplineAttachment { tilt: true, offset: [11.0, 0.25, 20.0], rot: [90.0, 0.0, 0.0], ..att };
+        let pose = row_objects(&outside, &s, DVec2::ZERO, None)[0].pose;
+        let right = SplineCurve::dir(s.heading + 90.0).as_vec2().extend(0.0);
+        assert!(pose.rot.transform_vector3(Vec3::Z).dot(right).abs() < 1e-6,
+            "beyond the half cant width, the row follows only the longitudinal slope");
+        assert!((pose.pos.z - 10.25).abs() < 1e-8, "the position still includes the cant's clamped height");
+    }
+
+    #[test]
+    fn tangential_railing_follows_the_praha_spline() {
+        // Placement of railing 26386 on spline 24096, Praha 200 tile 2623/10579.
+        // Its mesh runs along local X, so the map turns it 90 degrees to the road.
+        let s = MapSpline { id: 24096, pos: [163.9941, 44.16156, 270.8004],
+            heading: -90.15699, length: 46.00197, grad_start: -0.5, grad_end: -0.5,
+            tex_offset: 771.2027, ..Default::default() };
+        let att = SplineAttachment { id: 26386, offset: [-0.0584662628010295, 0.279999999041864, 785.154450166645],
+            rot: [90.0000020235813, 0.0, 0.0], tilt: true, ..Default::default() };
+        let mut index = MapIndex::default();
+        index.splines.insert(s.id, IndexedSpline { length: s.length, map_chain_offset: Some(s.tex_offset), prev: 0, next: 0 });
+        let objects = row_objects(&att, &s, DVec2::ZERO, Some(&index));
+        assert_eq!(objects.len(), 1);
+        let direction = SplineCurve::dir(s.heading);
+        let tangent = DVec3::new(direction.x, direction.y, -0.005).normalize().as_vec3();
+        assert!((-objects[0].pose.rot.transform_vector3(Vec3::X) - tangent).length() < 1e-6,
+            "the railing must descend along the kerb, not lean across it");
     }
 
     /// The chain of the Spandau buffer stop 3212811: a dead-end track of 250 m behind 600 m
