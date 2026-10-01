@@ -161,6 +161,7 @@ fn map_stations(map_cfg: &std::path::Path) -> (Vec<(String, String)>, Frequencie
     (stations, frequencies)
 }
 
+#[derive(Default)]
 pub struct Radio {
     /// What the buttons play: the map's stations, then the player's.
     stations: Vec<(String, String)>,

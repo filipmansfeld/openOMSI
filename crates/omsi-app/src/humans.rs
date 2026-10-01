@@ -58,6 +58,9 @@ use std::sync::Arc;
 mod pax;
 use pax::*;
 
+#[path = "humans/plugin_api.rs"]
+mod plugin_api;
+
 /// The map's traffic keeps left (its stops are on the left): see the doors of `Cabin`.
 pub(crate) static LEFT_HAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1338,6 +1341,10 @@ fn arrive(from: DVec2, to: DVec2, pace: f64) -> DVec2 {
 const CHAT_PAUSE: f64 = 12.0;
 
 pub struct Humans {
+    /// Native plugin handles must not resolve to a different person after a map reload.
+    plugin_epoch: u64,
+    plugin_motion: HashMap<u32, plugin_api::MotionCommand>,
+    plugin_desired_motion: HashMap<u32, (DVec2, Option<f64>)>,
     types: Vec<Arc<HumanType>>,
     pub people: Vec<Person>,
     rng: u64,
@@ -1629,6 +1636,9 @@ impl Humans {
             }
         }
         Humans {
+            plugin_epoch: plugin_api::new_epoch(),
+            plugin_motion: HashMap::new(),
+            plugin_desired_motion: HashMap::new(),
             types,
             people: Vec::new(),
             rng: 0x1234_5678_9ABC_DEF1,
@@ -2191,6 +2201,8 @@ impl Humans {
 
     /// Someone has gone: hidden, and their meshes kept for the next person of the type.
     fn retire(&mut self, p: &Person) {
+        self.plugin_motion.remove(&p.id);
+        self.plugin_desired_motion.remove(&p.id);
         let tkey = Arc::as_ptr(&p.ty) as usize;
         for (mi, m) in p.meshes.iter().enumerate() {
             self.hidden.push(m.1);
@@ -2981,10 +2993,143 @@ impl Humans {
         }
         self.seats.remove(&bus);
         self.bus_motion.remove(&bus);
+        self.pax_req.remove(&bus);
+        self.odometer.remove(&bus);
+        self.last_door_open.remove(&bus);
+        self.last_buses.retain(|b| b.id != bus);
+        self.remote_now.retain(|b| b.id != bus);
+        if let BusId::Ai(id) = bus {
+            self.ai_visits.remove(&id);
+            self.holds.retain(|(b, _)| *b != id);
+            self.ai_requests.retain(|(b, _, _)| *b != id);
+        }
         if bus == BusId::Player {
             self.player_cabin = None;
             self.served_stop = None;
+            self.request = None;
+            self.paid = None;
+            self.change_due = None;
+            self.desk_busy = None;
+            self.entry_req.clear();
+            self.exit_req.clear();
         }
+    }
+
+    /// A calendar/Chrono transition replaced the traffic graph. Pavement indices and
+    /// platform geometry belong to the old graph, so ordinary ground agents retire
+    /// through the same resource/reservation path as unloaded tiles. Cabin passengers
+    /// and their payment/seat ownership stay in their actual vehicles. The caller must
+    /// evict removed AI buses before calling this method.
+    pub(crate) fn invalidate_traffic_network(&mut self) -> usize {
+        let mut removed = 0;
+        for index in (0..self.people.len()).rev() {
+            let p = &self.people[index];
+            if p.place != Place::Ground {
+                continue;
+            }
+            let externally_controlled =
+                p.remote || p.puppet.is_some() || self.avatars.values().any(|id| *id == p.id);
+            self.release(index);
+            if externally_controlled {
+                // External controllers supply movement, but their last native state
+                // must not retain a dangling pavement leg or platform reservation.
+                let p = &mut self.people[index];
+                p.state = State::Idle;
+                p.t_state = 0.0;
+            } else {
+                let person = self.people.swap_remove(index);
+                self.claimed.remove(&person.id);
+                self.claims_out.retain(|id| *id != person.id);
+                self.retire(&person);
+                removed += 1;
+            }
+        }
+        self.ped = None;
+        self.stops.clear();
+        self.tiles_seen = u64::MAX;
+        self.plugin_motion.clear();
+        self.plugin_desired_motion.clear();
+        self.started = false;
+        self.stroll_timer = 0.0;
+        self.served_stop = None;
+        self.entry_req.fill(false);
+        self.holds.clear();
+        self.ai_requests.clear();
+        self.ai_visits.clear();
+        removed
+    }
+
+    /// Passenger destinations are now stop names, not indices into the timetable.
+    /// A calendar change therefore preserves the native destination without remapping
+    /// it to a potentially different stop at the old numeric index.
+    pub(crate) fn reconcile_player_stop_ids(&mut self, _stop_ids: &[i64]) {
+        self.served_stop = None;
+    }
+
+    /// Ticket indices and cashdesk amounts are a single transaction. A date change
+    /// cannot swap their catalogue while a rider is paying against the old fare.
+    pub(crate) fn preflight_ticket_pack(
+        &self,
+        next: &Option<Arc<omsi_content::tickets::TicketPack>>,
+    ) -> Result<bool, String> {
+        if self.tickets.as_deref() == next.as_deref() {
+            return Ok(false);
+        }
+        if self.request.is_some()
+            || self.paid.is_some()
+            || self.change_due.is_some()
+            || self
+                .people
+                .iter()
+                .any(|p| self.desk_busy == Some(p.id))
+        {
+            return Err("ticket catalogue cannot change during an active cashdesk transaction; finish serving the passenger first".into());
+        }
+        Ok(true)
+    }
+
+    /// Commit after preflight. Passengers who chose but have not yet bought a ticket
+    /// retain a uniquely named product when it still exists; otherwise the native
+    /// age/time-weighted ticket chooser selects from the new catalogue.
+    pub(crate) fn commit_ticket_pack(
+        &mut self,
+        next: Option<Arc<omsi_content::tickets::TicketPack>>,
+    ) {
+        if self.tickets.as_deref() == next.as_deref() {
+            return;
+        }
+        let old = std::mem::replace(&mut self.tickets, next);
+        let no_catalogue = self.tickets.is_none();
+        for index in 0..self.people.len() {
+            let Some(passenger) = self.pax(index).filter(|p| p.ticket == TICKET_BUY) else {
+                continue;
+            };
+            let previous = passenger.ticket_id.checked_sub(1).map(usize::from);
+            let name = previous
+                .and_then(|i| old.as_ref()?.tickets.get(i))
+                .map(|ticket| ticket.name.as_str());
+            let matching: Vec<_> = self
+                .tickets
+                .as_ref()
+                .into_iter()
+                .flat_map(|pack| pack.tickets.iter().enumerate())
+                .filter(|(_, ticket)| Some(ticket.name.as_str()) == name)
+                .map(|(i, _)| i)
+                .collect();
+            let ticket = if matching.len() == 1 {
+                Some(matching[0])
+            } else {
+                self.pick_ticket(self.people[index].age)
+            };
+            let p = self.pax_mut(index).unwrap();
+            p.ticket_id = ticket.and_then(|n| u8::try_from(n + 1).ok()).unwrap_or(0);
+            if no_catalogue {
+                p.ticket = TICKET_NONE;
+            }
+        }
+        // Voice paths may change with the pack; old voice throttling keys should not
+        // suppress the newly selected catalogue's messages.
+        self.voice_said.clear();
     }
 
     /// Everyone and everything that belongs to bus `from` belongs to `to` now.
@@ -3704,15 +3849,24 @@ impl Humans {
             blocks.extend(pb.blocks());
         }
         let mut wants: Vec<Want> = Vec::with_capacity(self.people.len());
+        let mut plugin_motion = std::mem::take(&mut self.plugin_motion);
+        self.plugin_desired_motion.clear();
         for i in 0..self.people.len() {
             self.people[i].t_state += dt;
-            let w = if self.people[i].puppet.is_some() || matches!(self.people[i].state, State::Pax(_)) {
+            let mut w = if self.people[i].puppet.is_some() || matches!(self.people[i].state, State::Pax(_)) {
                 Want::stand(None, Activity::Stand)
             } else if self.people[i].remote {
                 self.mirror_want(i, &buses)
             } else {
                 self.decide(i, dt, world, net, traffic, &cars, &mut remove)
             };
+            if let Some(command) = plugin_motion.remove(&self.people[i].id) {
+                plugin_api::apply_motion(&self.people[i], &mut w, command);
+            }
+            if !matches!(self.people[i].state, State::Pax(_)) {
+                self.plugin_desired_motion
+                    .insert(self.people[i].id, (w.vel, w.face));
+            }
             wants.push(w);
         }
         // a standing vehicle in the way: wait, then go round it

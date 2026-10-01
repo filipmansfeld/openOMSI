@@ -22,6 +22,9 @@ use omsi_vehicle::{SoundCfg, SoundEntry};
 use std::path::Path;
 use std::sync::Arc;
 
+mod native;
+pub use native::{PlaybackControl, SoundInfo};
+
 struct RuntimeSound {
     def: SoundEntry,
     clip: Option<Arc<Clip>>,
@@ -37,15 +40,19 @@ struct RuntimeSound {
     last_gain: f32,
     /// The buffer's playback rate relative to the clip, as last taken by `SetFrequency`.
     last_pitch: f32,
+    original: Option<SoundEntry>,
+    control: PlaybackControl,
+    pitch_multiplier: f32,
 }
 
 impl RuntimeSound {
     fn new(def: SoundEntry, clip: Option<Arc<Clip>>) -> RuntimeSound {
-        RuntimeSound { def, clip, voice: None, held: false, active_since: None, last_gain: 1.0, last_pitch: 1.0 }
+        RuntimeSound { def, clip, voice: None, held: false, active_since: None, last_gain: 1.0, last_pitch: 1.0, original: None, control: PlaybackControl::Native, pitch_multiplier: 1.0 }
     }
 }
 
 pub struct SoundSet {
+    api_id: u64,
     sounds: Vec<RuntimeSound>,
     /// The `[sound_ai]`/`[sound_scenery]` share of this set (the settings' sliders).
     pub master: f32,
@@ -178,6 +185,7 @@ impl SoundSet {
             })
             .collect();
         SoundSet {
+            api_id: native::next_id(),
             sounds,
             master: 1.0,
             dir: dir.to_path_buf(),
@@ -289,7 +297,7 @@ impl SoundSet {
         };
         let ctx = self.ctx(engine);
         for s in self.sounds.iter_mut() {
-            if !s.def.triggers.iter().any(|d| d.trim().eq_ignore_ascii_case(trigger)) {
+            if s.control != PlaybackControl::Native || !s.def.triggers.iter().any(|d| d.trim().eq_ignore_ascii_case(trigger)) {
                 continue;
             }
             if let Some(id) = s.voice.take() {
@@ -391,6 +399,10 @@ impl SoundSet {
         }
         let ctx = self.ctx(engine);
         for s in self.sounds.iter_mut() {
+            if s.control != PlaybackControl::Native {
+                native::update_controlled(engine, s, var, object_to_world, &ctx);
+                continue;
+            }
             // How the exe plays an entry (`TSound` update, 2.2.032):
             // * with a `[trigger]`: once each time the trigger fires, from the start, never
             //   looped (a `[loopsound]` too) and without looking at its conditions;
@@ -600,12 +612,15 @@ impl Ctx {
     /// takes them, and whether it can be started.
     fn eval(&self, s: &mut RuntimeSound, var: &dyn Fn(&str) -> Option<f32>, object_to_world: &Mat4) -> Eval {
         let def = &s.def;
-        if !self.view_lets_through(def.viewpoint) {
+        // Explicit API playback bypasses automatic starts/view selection, while the
+        // current runtime still computes curves, spatial gain and cabin attenuation.
+        let controlled = s.control != PlaybackControl::Native;
+        if !controlled && !self.view_lets_through(def.viewpoint) {
             return Eval { gain: 0.0, audible: false, pitch: s.last_pitch, wrong_view: true };
         }
         let triggered = !def.triggers.is_empty();
         let pos = def.pos.map(|p| object_to_world.transform_point3(Vec3::from_array(p)));
-        let active = if triggered {
+        let active = if triggered && !controlled {
             TRIGGERED_ACTIVE
         } else {
             s.active_since.map_or(0.0, |t| t.elapsed().as_secs_f32())
@@ -619,7 +634,7 @@ impl Ctx {
             (None, _) => 0.0,
         };
         // (an untriggered entry whose conditions fail is at volume 0)
-        let mut vol = if triggered || SoundSet::conditions_hold(def, var) { def.volume * self.master } else { 0.0 };
+        let mut vol = if controlled || triggered || SoundSet::conditions_hold(def, var) { def.volume * self.master } else { 0.0 };
         for vc in &def.vol_curves {
             if let Some(x) = SoundSet::curve_input(vc, var, active, facing) {
                 vol *= curve(&vc.points, x);
@@ -664,7 +679,7 @@ impl Ctx {
         let position = s.def.pos.map(|p| object_to_world.transform_point3(Vec3::from_array(p)));
         VoiceParams {
             gain: e.gain,
-            pitch: e.pitch.max(0.001),
+            pitch: (e.pitch * s.pitch_multiplier).max(0.001),
             looping,
             position,
             // (Omsi.exe shifts the frequency of a `[3d]` loop sound only: a `[sound]`
@@ -807,7 +822,7 @@ mod tests {
         assert_eq!(eval(&ctx(2, true), hit.clone(), &now).gain, 0.0, "read at the frame's end: silent");
         let fired = |n: &str| at_fire("ev_doorhitclose_0", n).or_else(|| now(n));
         assert_eq!(eval(&ctx(2, true), hit.clone(), &fired).gain, 1.0);
-        let set = SoundSet { sounds: vec![RuntimeSound::new(hit, None)], master: 1.0, dir: Default::default(), inside: true, ai: false, listener_vehicle: true, muffled: false, parts: Vec::new() };
+        let set = SoundSet { api_id: native::next_id(), sounds: vec![RuntimeSound::new(hit, None)], master: 1.0, dir: Default::default(), inside: true, ai: false, listener_vehicle: true, muffled: false, parts: Vec::new() };
         assert_eq!(set.curve_triggers(), vec!["ev_doorhitclose_0".to_string()]);
     }
 }

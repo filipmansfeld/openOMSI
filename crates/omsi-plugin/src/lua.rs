@@ -27,6 +27,19 @@ const MAX_ERRORS: u32 = 10;
 /// The game's side while a plugin runs: set only for the length of a call.
 type IoSlot = Rc<Cell<Option<*mut (dyn PluginIo + 'static)>>>;
 
+/// The erased IO pointer must never survive its borrowed callback, including when
+/// a native handler panics and an outer simulator boundary catches the unwind.
+struct IoCallScope {
+    io: IoSlot,
+    deadline: Rc<Cell<Option<Instant>>>,
+}
+impl Drop for IoCallScope {
+    fn drop(&mut self) {
+        self.deadline.set(None);
+        self.io.set(None);
+    }
+}
+
 /// Every Lua plugin of a plugins folder: top-level `*.lua` files and `<folder>/main.lua`.
 pub fn find_lua(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
@@ -58,7 +71,10 @@ pub struct LuaPlugin {
     /// Newest change time of the plugin's files when it was loaded.
     stamp: Option<SystemTime>,
     last_check: Option<Instant>,
+    /// Lifetimes are compared separately from the event's display-name payload.
     vehicle: Option<String>,
+    map: Option<String>,
+    renderer: bool,
     errors: u32,
     pub disabled: bool,
 }
@@ -80,6 +96,8 @@ impl LuaPlugin {
             stamp: None,
             last_check: None,
             vehicle: None,
+            map: None,
+            renderer: false,
             errors: 0,
             disabled: false,
         };
@@ -120,12 +138,22 @@ impl LuaPlugin {
         let source = std::fs::read(&self.path).map_err(|e| e.to_string())?;
         let lua = self.new_state().map_err(|e| e.to_string())?;
         self.lua = Some(lua);
-        self.vehicle = io.vehicle_name().filter(|_| io.has_vehicle());
+        self.vehicle = io.vehicle_identity().filter(|_| io.has_vehicle());
+        self.map = io.map_identity();
+        self.renderer = io.renderer_available();
         let chunk_name = format!("@{}", self.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
-        let vehicle = self.vehicle.clone();
+        let vehicle = io.vehicle_name().filter(|_| self.vehicle.is_some());
+        let map = io.map_name().filter(|_| self.map.is_some());
+        let renderer = self.renderer;
         let ok = self.call(io, |lua| {
             lua.load(&source[..]).set_name(chunk_name).exec()?;
             emit(lua, "start", ())?;
+            if let Some(name) = map {
+                emit(lua, "map", name)?;
+            }
+            if renderer {
+                emit(lua, "renderer", true)?;
+            }
             if let Some(v) = vehicle {
                 emit(lua, "vehicle", v)?;
             }
@@ -225,6 +253,16 @@ impl LuaPlugin {
         func!("release", String, |io, n| () => io.fire(&n, false));
         func!("trigger", String, |io, n| () => { io.fire(&n, true); io.fire(&n, false) });
         func!("message", (String, Option<f32>), |io, (t, s)| () => io.message(&t, s.unwrap_or(5.0)));
+        // Native operations use the same engine dispatcher as external adapters. Lua
+        // calls stay on the frame thread; a successful return means the write applied.
+        let api_io = self.io.clone();
+        crate::lua_api::install(&lua, &omsi, move |op, args, binary| {
+            let p = api_io.get().ok_or_else(|| {
+                "native game API is unavailable outside a plugin callback".to_string()
+            })?;
+            // SAFETY: `call` installs this pointer for the synchronous callback only.
+            unsafe { (&mut *p).api(op, args, binary) }
+        })?;
         // position: x, y, z, heading - four numbers, or nothing on foot
         let with2 = with.clone();
         omsi.set(
@@ -312,13 +350,16 @@ impl LuaPlugin {
     fn call(&mut self, io: &mut dyn PluginIo, f: impl FnOnce(&Lua) -> mlua::Result<()>) -> bool {
         let Some(lua) = self.lua.as_ref() else { return false };
         // SAFETY: the lifetime is erased only for the length of this call; the slot is
-        // cleared before `io` goes out of reach
+        // cleared by the scoped guard before `io` goes out of reach, also on unwind.
+        let scope = IoCallScope {
+            io: self.io.clone(),
+            deadline: self.deadline.clone(),
+        };
         let ptr: *mut (dyn PluginIo + '_) = io;
         self.io.set(Some(unsafe { std::mem::transmute::<*mut (dyn PluginIo + '_), *mut (dyn PluginIo + 'static)>(ptr) }));
         self.deadline.set(Some(Instant::now() + CALL_BUDGET));
         let r = f(lua);
-        self.deadline.set(None);
-        self.io.set(None);
+        drop(scope);
         match r {
             Ok(()) => true,
             Err(e) => {
@@ -334,8 +375,8 @@ impl LuaPlugin {
         }
     }
 
-    /// One frame: a reload when the files changed, the `vehicle` event when the player's
-    /// bus changed, then timers, watches and `frame`.
+    /// One frame: reload changed files, map/renderer/vehicle lifecycle events, then
+    /// timers, watches and `frame`. Identities are independent of display names.
     pub fn frame(&mut self, io: &mut dyn PluginIo) {
         if self.last_check.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
             self.last_check = Some(Instant::now());
@@ -354,10 +395,22 @@ impl LuaPlugin {
         if self.disabled || self.lua.is_none() {
             return;
         }
-        let now = io.vehicle_name().filter(|_| io.has_vehicle());
+        let map = io.map_identity();
+        if map != self.map {
+            self.map = map;
+            let name = io.map_name().filter(|_| self.map.is_some());
+            self.call(io, |lua| emit(lua, "map", name));
+        }
+        let renderer = io.renderer_available();
+        if renderer != self.renderer {
+            self.renderer = renderer;
+            self.call(io, |lua| emit(lua, "renderer", renderer));
+        }
+        let now = io.vehicle_identity().filter(|_| io.has_vehicle());
         if now != self.vehicle {
-            self.vehicle = now.clone();
-            self.call(io, |lua| emit(lua, "vehicle", now));
+            self.vehicle = now;
+            let name = io.vehicle_name().filter(|_| self.vehicle.is_some());
+            self.call(io, |lua| emit(lua, "vehicle", name));
         }
         let dt = io.dt();
         self.call(io, |lua| lua.globals().get::<Table>("omsi")?.get::<Function>("_tick")?.call::<()>(dt));
@@ -405,4 +458,51 @@ impl PluginIo for NoVehicle {
     }
     fn set_string(&mut self, _: &str, _: &str) {}
     fn fire(&mut self, _: &str, _: bool) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_callback_unwind_clears_erased_io_and_deadline() {
+        let lua = Lua::new();
+        lua.globals()
+            .set(
+                "native_panic",
+                lua.create_function(|_, (): ()| -> mlua::Result<()> {
+                    panic!("fixture native callback panic");
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let mut plugin = LuaPlugin {
+            name: "unwind-fixture".into(),
+            path: PathBuf::new(),
+            data_path: PathBuf::new(),
+            lua: Some(lua),
+            io: Rc::new(Cell::new(None)),
+            deadline: Rc::new(Cell::new(None)),
+            stamp: None,
+            last_check: None,
+            vehicle: None,
+            map: None,
+            renderer: false,
+            errors: 0,
+            disabled: false,
+        };
+        let mut io = NoVehicle;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            plugin.call(&mut io, |lua| lua.load("native_panic()").exec());
+        }));
+        assert!(result.is_err());
+        assert!(plugin.io.get().is_none());
+        assert!(plugin.deadline.get().is_none());
+        let slot = plugin.io.clone();
+        assert!(plugin.call(&mut io, move |_| {
+            assert!(slot.get().is_some());
+            Ok(())
+        }));
+        assert!(plugin.io.get().is_none());
+        assert!(plugin.deadline.get().is_none());
+    }
 }

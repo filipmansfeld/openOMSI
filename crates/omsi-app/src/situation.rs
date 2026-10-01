@@ -14,7 +14,7 @@ pub(crate) fn find_hof(
     if let Some(h) = &args.hof {
         names.push(h.clone());
     }
-    names.extend(world.ailists.groups.iter().filter_map(|g| g.hof.clone()));
+    names.extend(world.ai_lists().groups.iter().filter_map(|g| g.hof.clone()));
     // every wanted name in order: the bus's own depot files first (by file name, then by
     // the [name] inside), then the map's depot as another vehicle folder has it (a mod bus
     // brings only the depot of its own map: see `omsi_vehicle::hof::depot_anywhere`)

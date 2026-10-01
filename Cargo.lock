@@ -3232,6 +3232,7 @@ dependencies = [
  "openxr",
  "parking_lot",
  "pollster",
+ "rand",
  "rayon",
  "rfd",
  "rust-i18n",
@@ -3395,6 +3396,7 @@ dependencies = [
  "libloading",
  "log",
  "mlua",
+ "serde_json",
 ]
 
 [[package]]

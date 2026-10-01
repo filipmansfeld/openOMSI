@@ -1461,6 +1461,8 @@ pub const DEFAULT_APPROACH: f32 = 50.0;
 /// of the time of day, because the program may wait at a stop point or jump.
 #[derive(Debug, Clone)]
 pub struct TrafficLightController {
+    /// Authored signal names, in the same order as the phase programs.
+    pub names: Vec<String>,
     /// Per light: phases (state, duration).
     pub lights: Vec<Vec<(i32, f32)>>,
     /// Cycle length (`[traffic_lights_group]`); 0 = the longest light's phases.
@@ -1475,6 +1477,9 @@ pub struct TrafficLightController {
     pub request: Vec<bool>,
     /// The clock waits at a stop point.
     pub held: bool,
+    /// Whether the group clock advances. A plugin may pause it independently of
+    /// demand-controlled stop points or a one-step external hold.
+    pub running: bool,
     /// A stop point the clock has just been let past without moving (it is not asked again
     /// at the same instant).
     passed: Option<usize>,
@@ -1487,7 +1492,21 @@ pub struct TrafficLightController {
 impl TrafficLightController {
     pub fn new(lights: Vec<Vec<(i32, f32)>>, cycle: f32) -> TrafficLightController {
         let n = lights.len();
-        TrafficLightController { lights, cycle, offset: 0.0, approach: vec![None; n], stops: Vec::new(), time: 0.0, request: vec![false; n], held: false, passed: None, rewound: None, started: false }
+        TrafficLightController {
+            names: vec![String::new(); n],
+            lights,
+            cycle,
+            offset: 0.0,
+            approach: vec![None; n],
+            stops: Vec::new(),
+            time: 0.0,
+            request: vec![false; n],
+            held: false,
+            running: true,
+            passed: None,
+            rewound: None,
+            started: false,
+        }
     }
 
     /// From the `[traffic_light]` program of a crossing object: (per light: name, phases
@@ -1522,6 +1541,23 @@ impl TrafficLightController {
         }
     }
 
+    pub fn set_running(&mut self, running: bool) {
+        self.running = running;
+        if !running {
+            // A pause before the first simulation step must freeze the time
+            // already observed by the caller, rather than seed it on that step.
+            self.started = true;
+        }
+    }
+
+    /// Set the cycle position explicitly, clearing the program's previous jump state.
+    pub fn seek(&mut self, time: f64) {
+        self.time = time.rem_euclid(self.cycle_len());
+        self.passed = None;
+        self.rewound = None;
+        self.started = true;
+    }
+
     /// Request distance of light `i` (m).
     pub fn approach_dist(&self, i: usize) -> f32 {
         self.approach.get(i).copied().flatten().unwrap_or(DEFAULT_APPROACH)
@@ -1530,6 +1566,10 @@ impl TrafficLightController {
     /// Run the cycle clock on by `dt` seconds of game time, honouring the stop and jump
     /// points with this frame's requests (`request`, set by the caller before).
     pub fn advance(&mut self, dt: f32) {
+        if !self.running {
+            self.held = true;
+            return;
+        }
         let cycle = self.cycle_len();
         let mut left = dt.max(0.0) as f64;
         self.held = false;

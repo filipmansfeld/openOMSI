@@ -16,6 +16,9 @@ use glam::{DVec2, DVec3};
 use omsi_sim::collision::Obb;
 use winit::keyboard::KeyCode;
 
+#[path = "on_foot/plugin_api.rs"]
+pub(crate) mod plugin_api;
+
 /// The local player's avatar key (other players' walkers are `REMOTE_KEY + id`).
 pub(crate) const AVATAR_KEY: u32 = 0;
 pub(crate) const REMOTE_KEY: u32 = 1_000_000;
@@ -39,6 +42,8 @@ pub(crate) enum FootCam {
 }
 
 pub(crate) struct OnFoot {
+    pub api_id: u64,
+    pub api_control: Option<plugin_api::WalkControl>,
     /// The feet on the ground.
     pub pos: DVec3,
     pub heading: f64,
@@ -300,6 +305,8 @@ impl App {
             (None, None) => (pos, look_yaw, None, None),
         };
         self.on_foot = Some(OnFoot {
+            api_id: plugin_api::new_id(),
+            api_control: None,
             pos,
             heading: face,
             vel: DVec2::ZERO,
@@ -429,6 +436,8 @@ impl App {
             self.humans = Some(h);
         }
         self.on_foot = Some(OnFoot {
+            api_id: plugin_api::new_id(),
+            api_control: None,
             pos,
             heading,
             vel: DVec2::ZERO,
@@ -786,6 +795,7 @@ impl App {
             _ => {}
         }
         let Some(mut f) = self.on_foot.take() else { return };
+        let api_control = f.api_control.take();
         let dt64 = dt as f64;
         let key = |k: KeyCode| self.keys.contains(&k);
         if key(KeyCode::ArrowLeft) {
@@ -841,6 +851,14 @@ impl App {
             }
         }
         if f.seat.is_none() && !self.paused && !free && f.transit.is_none() {
+            if let Some(control) = api_control {
+                if let Some(heading) = control.heading {
+                    f.yaw = heading as f32;
+                }
+                if control.jump && f.inside.is_none() && f.grounded() {
+                    f.vz = JUMP;
+                }
+            }
             // where the keys go, as the camera looks
             let y = (f.yaw as f64).to_radians();
             let (fwd, right) = (DVec2::new(y.sin(), y.cos()), DVec2::new(y.cos(), -y.sin()));
@@ -858,7 +876,9 @@ impl App {
                 dir -= right;
             }
             let run = key(KeyCode::ShiftLeft) || key(KeyCode::ShiftRight);
-            let want = dir.normalize_or_zero() * if run { RUN } else { WALK };
+            let want = api_control
+                .map(|c| c.velocity(f.yaw as f64))
+                .unwrap_or_else(|| dir.normalize_or_zero() * if run { RUN } else { WALK });
             // (in the air only a little steering)
             let k = 1.0 - (-dt64 * if f.grounded() { ACCEL } else { 1.0 }).exp();
             f.vel += (want - f.vel) * k;

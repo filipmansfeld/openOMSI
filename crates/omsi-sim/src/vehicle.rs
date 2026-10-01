@@ -837,6 +837,10 @@ pub struct VehicleInstance {
     pub mesh_transforms: Vec<Mat4>,
     pub mesh_props: Vec<MeshProps>,
     pub physics: VehiclePhysics,
+    /// A native plugin's one-step input. Applied after normal input has been sampled,
+    /// so a write at the end of one frame reaches the following simulation step.
+    native_controls: Option<Controls>,
+    native_controls_restore: Option<Controls>,
     /// `[texttexture]` states, parallel to `ty.model.text_textures`.
     pub text_textures: Vec<crate::texttex::TextTextureState>,
     pub html_textures: Vec<crate::htmltex::HtmlTexture>,
@@ -1005,8 +1009,9 @@ impl VehicleInstance {
         for (name, value) in [
             ("Dirt_Norm", 0.0),
             ("DirtRate", 0.0),
-            ("PrecipRate", 0.0),
-            ("StreetCond", 0.0),
+            ("PrecipType", host.precip_type),
+            ("PrecipRate", host.precip_rate),
+            ("StreetCond", host.street_cond),
         ] {
             let key = name.to_ascii_lowercase();
             let id = match var_index.get(&key).copied() {
@@ -1124,6 +1129,8 @@ impl VehicleInstance {
         };
         VehicleInstance {
             a_trans: OmsiFrames::default(),
+            native_controls: None,
+            native_controls_restore: None,
             particles: ParticleSet::new(ty.model.particle_systems(), std::ptr::addr_of!(host) as u64 ^ 0x9e37_79b9),
             light_fade: Vec::new(),
             v_springfactor,
@@ -1271,6 +1278,15 @@ impl VehicleInstance {
 
     pub fn set_controls(&mut self, c: Controls) {
         self.physics.controls = c;
+        self.native_controls_restore = None;
+    }
+
+    pub fn queue_native_controls(&mut self, c: Controls) {
+        self.native_controls = Some(c);
+    }
+
+    pub fn queued_native_controls(&self) -> Option<Controls> {
+        self.native_controls
     }
 
     fn get(&self, id: Option<omsi_script::VarId>) -> f32 {
@@ -2022,6 +2038,15 @@ impl VehicleInstance {
 
     /// Run one simulation frame: physics, scripts, then animations.
     pub fn update(&mut self, dt: f32) {
+        if dt > 0.0 {
+            if let Some(controls) = self.native_controls_restore.take() {
+                self.physics.controls = controls;
+            }
+            if let Some(controls) = self.native_controls.take() {
+                self.native_controls_restore =
+                    Some(std::mem::replace(&mut self.physics.controls, controls));
+            }
+        }
         self.host.clock.advance(dt);
         self.step_physics(dt);
         self.update_ground_probe();
@@ -2040,6 +2065,8 @@ impl VehicleInstance {
         self.show_radio_text();
         self.clear_pax_requests();
         self.update_visuals(dt);
+        // Keep current-step inputs until the next sample/update: rail traction is
+        // applied by the app after this call. Placed vehicles restore on next update.
     }
 
     /// The station and the song on a radio whose display is a text of its script. OMSI has
@@ -2109,7 +2136,7 @@ impl VehicleInstance {
     /// 0.3 m). Read the other way round (ground minus point) the sensor sat at 0, the
     /// right-hand bellows of an Urbino never let their air out and the bus leant 1.7° to
     /// the left all the way.
-    fn update_ground_probe(&mut self) {
+    pub fn update_ground_probe(&mut self) {
         if self.ground.is_none() {
             return;
         }
