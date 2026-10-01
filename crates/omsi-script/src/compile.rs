@@ -86,6 +86,14 @@ impl Program {
         self.consts.get(&name.to_ascii_lowercase()).copied()
     }
 
+    /// The actual compile-time values, for native script introspection. Instructions
+    /// inline these values; changing a returned copy does not rewrite the program.
+    pub fn constants(&self) -> impl Iterator<Item = (&str, f32)> {
+        self.consts
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+    }
+
     /// Declare a variable (idempotent), returning its id.
     pub fn declare_var(&mut self, name: &str) -> VarId {
         let key = name.trim().to_ascii_lowercase();

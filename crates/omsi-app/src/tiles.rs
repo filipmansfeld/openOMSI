@@ -35,6 +35,10 @@ pub struct IndexedSpline {
 /// the spline every `[splineAttachement]` row starts on, and where every object stands.
 #[derive(Default)]
 pub struct MapIndex {
+    /// Parent identities referenced even by objects outside the loaded tiles.
+    pub placement_references: hashbrown::HashSet<i64>,
+    /// Duplicate ground IDs cannot identify one native placement unambiguously.
+    pub placement_duplicates: hashbrown::HashSet<i64>,
     pub splines: HashMap<i64, IndexedSpline>,
     /// (tile index in global.cfg, attachment id) → (spline id, distance of the row's first
     /// object from the start of that spline - negative when it lies before it).
@@ -87,6 +91,12 @@ impl MapIndex {
             .map(|(gi, tx, ty, path)| {
                 let tile = read_tile(path, chrono_dirs)?;
                 let mut part = MapIndex::default();
+                part.placement_references.extend(
+                    tile.objects
+                        .iter()
+                        .chain(&tile.attach_objects)
+                        .flat_map(|o| [o.parent_id, o.var_parent].into_iter().flatten()),
+                );
                 let mut rows: RowParts = Default::default();
                 for s in tile.splines.iter().filter(|s| !s.deleted) {
                     let map_chain_offset = if tile.version >= 11 || tile.version == 0 {
@@ -127,8 +137,33 @@ impl MapIndex {
                     name(f);
                 }
                 for o in &tile.objects {
-                    let ground = terrain.as_ref().map(|t| t.sample(o.pos[0].clamp(0.0, tile_size()) as f32, o.pos[1].clamp(0.0, tile_size()) as f32) as f64).unwrap_or(0.0);
-                    part.objects.insert(o.id, ((*tx, *ty), DVec3::new(origin.x + o.pos[0], origin.y + o.pos[1], o.pos[2] + ground), o.rot));
+                    let ground = terrain
+                        .as_ref()
+                        .map(|t| {
+                            t.sample(
+                                o.pos[0].clamp(0.0, tile_size()) as f32,
+                                o.pos[1].clamp(0.0, tile_size()) as f32,
+                            ) as f64
+                        })
+                        .unwrap_or(0.0);
+                    if part
+                        .objects
+                        .insert(
+                            o.id,
+                            (
+                                (*tx, *ty),
+                                DVec3::new(
+                                    origin.x + o.pos[0],
+                                    origin.y + o.pos[1],
+                                    o.pos[2] + ground,
+                                ),
+                                o.rot,
+                            ),
+                        )
+                        .is_some()
+                    {
+                        part.placement_duplicates.insert(o.id);
+                    }
                     if o.extra.len() >= 2 {
                         part.stop_weights.insert(o.id, stop_exit_weight(&o.extra));
                     }
@@ -140,10 +175,32 @@ impl MapIndex {
                 // on the road): where the row's first object stands on its own spline - enough
                 // to find it and load its tiles (the placed object gives the exact place; a
                 // Novi Sad entry point was "not in the map" before)
-                for a in tile.spline_attachments.iter().filter(|a| a.repeater.is_none()) {
-                    let Some(s) = tile.splines.get(a.spline_index.max(0) as usize) else { continue };
-                    let Some(first) = row_start(a, s, None).and_then(|st| place_on(a, s, origin, None, st).into_iter().next()) else { continue };
-                    part.objects.entry(a.id).or_insert(((*tx, *ty), first.pose.pos, [first.pose.heading(), 0.0, 0.0]));
+                for a in tile
+                    .spline_attachments
+                    .iter()
+                    .filter(|a| a.repeater.is_none())
+                {
+                    let Some(s) = tile.splines.get(a.spline_index.max(0) as usize) else {
+                        continue;
+                    };
+                    let Some(first) = row_start(a, s, None)
+                        .and_then(|st| place_on(a, s, origin, None, st).into_iter().next())
+                    else {
+                        continue;
+                    };
+                    if part.objects.contains_key(&a.id) {
+                        part.placement_duplicates.insert(a.id);
+                    }
+                    part.objects.entry(a.id).or_insert((
+                        (*tx, *ty),
+                        first.pose.pos,
+                        [first.pose.heading(), 0.0, 0.0],
+                    ));
+                }
+                for a in &tile.attach_objects {
+                    if part.objects.contains_key(&a.id) {
+                        part.placement_duplicates.insert(a.id);
+                    }
                 }
                 part.tiles_read = 1;
                 Some((part, rows))
@@ -154,9 +211,12 @@ impl MapIndex {
         for p in parts {
             match p {
                 Some((p, (r, q))) => {
+                    index.placement_references.extend(p.placement_references);
+                    index.placement_duplicates.extend(p.placement_duplicates);
                     index.splines.extend(p.splines);
                     for (id, v) in p.objects {
                         if let Some(prev) = index.objects.get(&id).filter(|prev| prev.0 != v.0) {
+                            index.placement_duplicates.insert(id);
                             index.duplicates.insert((prev.0, id), (prev.1, prev.2));
                             index.duplicates.insert((v.0, id), (v.1, v.2));
                         }
@@ -562,7 +622,44 @@ pub fn tile_row_objects(att: &SplineAttachment, splines: &[MapSpline], origin: D
 /// preparation took.
 /// A finished batch: the tiles asked for, what was made of them (a tile that could not be
 /// made is missing), statistics and seconds.
-type Batch = (Vec<(i32, i32)>, Vec<crate::scene::Prepared>, crate::scene::LoadStats, f64);
+type Batch = (
+    u64,
+    Vec<(i32, i32)>,
+    Vec<crate::scene::Prepared>,
+    crate::scene::LoadStats,
+    f64,
+);
+
+/// A reload cancels a worker's eventual result without letting a second worker
+/// race it. The old result releases its own inflight slot but cannot be uploaded.
+#[derive(Default)]
+struct BatchEpoch {
+    generation: u64,
+    inflight: Option<u64>,
+}
+
+impl BatchEpoch {
+    fn invalidate(&mut self) {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("tile upload generation exhausted");
+    }
+
+    fn start(&mut self) -> u64 {
+        debug_assert!(self.inflight.is_none());
+        self.inflight = Some(self.generation);
+        self.generation
+    }
+
+    fn finish(&mut self, generation: u64) -> bool {
+        if self.inflight != Some(generation) {
+            return false;
+        }
+        self.inflight = None;
+        generation == self.generation
+    }
+}
 
 /// The threads tiles are prepared on while the game runs: a pool of their own, a third of
 /// the cores, so that the frame's parallel work (culling, the AI scripts) never waits for a
@@ -624,7 +721,7 @@ pub struct Streamer {
     pub unload_radius: f64,
     tx: std::sync::mpsc::Sender<Batch>,
     rx: std::sync::mpsc::Receiver<Batch>,
-    inflight: bool,
+    epoch: BatchEpoch,
     queue: std::collections::VecDeque<crate::scene::PendingUpload>,
     /// Tiles in flight or waiting for upload.
     requested: hashbrown::HashSet<(i32, i32)>,
@@ -666,7 +763,7 @@ impl Streamer {
             unload_radius: load_radius + tile_size() * 1.5,
             tx,
             rx,
-            inflight: false,
+            epoch: BatchEpoch::default(),
             queue: Default::default(),
             requested: Default::default(),
             failed: Default::default(),
@@ -706,24 +803,43 @@ impl Streamer {
     /// changed): those loaded go and come back with the next batches. `None`: every loaded
     /// tile.
     pub fn reload(&mut self, renderer: &omsi_render::Renderer, scene: &mut omsi_render::Scene, keys: Option<&[(i32, i32)]>, audio: Option<&omsi_audio::AudioEngine>) {
-        let keys: Vec<(i32, i32)> = match keys {
+        // Wait for any preparation already running, invalidate workers that have
+        // not started yet, and cancel queued/partially uploaded old tile content.
+        self.world.forget_all_staged();
+        self.epoch.invalidate();
+        let cancelled: Vec<_> = self.requested.iter().copied().collect();
+        while let Some(pending) = self.queue.pop_front() {
+            self.world.abandon_upload(renderer, scene, pending, audio);
+        }
+        self.requested.clear();
+        let mut keys: Vec<(i32, i32)> = match keys {
             Some(k) => k.to_vec(),
             None => {
-                self.world.forget_all_staged();
+                self.failed.clear();
                 self.world.loaded_tiles()
             }
         };
+        // Preparation also registers CPU tile state. A cancelled tile outside a
+        // selective reload must not stay falsely "loaded" with no GPU content.
+        keys.extend(cancelled);
+        keys.sort_unstable();
+        keys.dedup();
         let mut freed = false;
         for k in &keys {
             self.failed.remove(k);
-            if !self.requested.contains(k) {
-                freed |= self.world.unload_tile(renderer, scene, *k, audio);
-            }
+            freed |= self.world.unload_tile(renderer, scene, *k, audio);
         }
         if freed {
             self.world.trim_object_types();
         }
         self.world.refresh_tile_lists();
+        if let Some((set, done)) = &mut self.initial {
+            let loaded = self.world.loaded_tiles();
+            *done = set
+                .iter()
+                .filter(|key| loaded.contains(*key) || self.failed.contains(*key))
+                .count();
+        }
         log::info!("tile streaming: {} tiles to be read again", keys.len());
     }
 
@@ -751,8 +867,10 @@ impl Streamer {
     /// when the loaded tiles changed (the caller then refreshes whatever copies world data).
     pub fn update(&mut self, renderer: &omsi_render::Renderer, scene: &mut omsi_render::Scene, centers: &[DVec3], budget: std::time::Duration, audio: Option<&omsi_audio::AudioEngine>) -> bool {
         let mut changed = false;
-        while let Ok((asked, prepared, stats, secs)) = self.rx.try_recv() {
-            self.inflight = false;
+        while let Ok((generation, asked, prepared, stats, secs)) = self.rx.try_recv() {
+            if !self.epoch.finish(generation) {
+                continue;
+            }
             // a tile the worker could not make is let go (else it stayed "requested" for
             // ever: never retried, never unloaded, and the loading screen waited for it)
             let made: hashbrown::HashSet<(i32, i32)> = prepared.iter().map(|p| (p.tx, p.ty)).collect();
@@ -851,8 +969,16 @@ impl Streamer {
         // Loading and unloading tiles leaves the allocator with pages it keeps for later: they
         // count as the game's memory until they are handed back (half a gigabyte on
         // Ahlheim). At most every few seconds, on a thread of its own.
-        if (self.loaded_total, self.unloaded_total) != (self.relieved_at.0, self.relieved_at.1) && self.relieved_at.2.elapsed().as_secs_f32() >= 4.0 && self.queue.is_empty() && !self.inflight {
-            self.relieved_at = (self.loaded_total, self.unloaded_total, std::time::Instant::now());
+        if (self.loaded_total, self.unloaded_total) != (self.relieved_at.0, self.relieved_at.1)
+            && self.relieved_at.2.elapsed().as_secs_f32() >= 4.0
+            && self.queue.is_empty()
+            && self.epoch.inflight.is_none()
+        {
+            self.relieved_at = (
+                self.loaded_total,
+                self.unloaded_total,
+                std::time::Instant::now(),
+            );
             self.world.compact_slots(renderer, scene);
             crate::release_free_memory();
         }
@@ -874,7 +1000,7 @@ impl Streamer {
         if self.initial.is_none() {
             self.worst_frame_ms = self.worst_frame_ms.max(total.as_secs_f64() * 1000.0);
         }
-        if !self.inflight {
+        if self.epoch.inflight.is_none() {
             let missing = self.missing(centers);
             if !missing.is_empty() {
                 // the first area in bigger bites (the loading screen shows the progress),
@@ -883,25 +1009,45 @@ impl Streamer {
                 let batch: Vec<(i32, i32, PathBuf)> = missing.into_iter().take(n).map(|(_, t)| t).collect();
                 let keys: Vec<(i32, i32)> = batch.iter().map(|t| (t.0, t.1)).collect();
                 self.requested.extend(keys.iter().copied());
-                self.inflight = true;
+                let generation = self.epoch.start();
+                let source_generation = self.world.preparation_generation();
                 let world = self.world.clone();
                 let tx = self.tx.clone();
                 // the first area gets every core; later tiles only the loader's own threads
                 let first = self.initial.is_some();
-                let spawned = std::thread::Builder::new().name("tile loader".into()).spawn(move || {
-                    let t = std::time::Instant::now();
-                    // (a panic on a damaged file must not end the streaming: the batch comes
-                    // back empty and its tiles are let go)
-                    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| if first { world.prepare_tiles(&batch) } else { loader_pool().install(|| world.prepare_tiles(&batch)) }));
-                    let (prepared, stats) = made.unwrap_or_else(|_| {
-                        log::error!("tile streaming: loading tiles {:?} failed", batch.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>());
-                        Default::default()
+                let spawned = std::thread::Builder::new()
+                    .name("tile loader".into())
+                    .spawn(move || {
+                        let t = std::time::Instant::now();
+                        // (a panic on a damaged file must not end the streaming: the batch comes
+                        // back empty and its tiles are let go)
+                        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if first {
+                                world.prepare_tiles_for_generation(&batch, source_generation)
+                            } else {
+                                loader_pool().install(|| {
+                                    world.prepare_tiles_for_generation(&batch, source_generation)
+                                })
+                            }
+                        }));
+                        let (prepared, stats) = made.unwrap_or_else(|_| {
+                            log::error!(
+                                "tile streaming: loading tiles {:?} failed",
+                                batch.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>()
+                            );
+                            Default::default()
+                        });
+                        let _ = tx.send((
+                            generation,
+                            batch.iter().map(|t| (t.0, t.1)).collect(),
+                            prepared,
+                            stats,
+                            t.elapsed().as_secs_f64(),
+                        ));
                     });
-                    let _ = tx.send((batch.iter().map(|t| (t.0, t.1)).collect(), prepared, stats, t.elapsed().as_secs_f64()));
-                });
                 if let Err(e) = spawned {
                     log::warn!("tile loader thread: {e}");
-                    self.inflight = false;
+                    self.epoch.finish(generation);
                     for k in keys {
                         self.requested.remove(&k);
                     }
@@ -915,6 +1061,24 @@ impl Streamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reload_rejects_inflight_old_graph_and_allows_fresh_batch() {
+        let mut epoch = BatchEpoch::default();
+        let old = epoch.start();
+        epoch.invalidate();
+        epoch.invalidate(); // e.g. Chrono and season change in the same frame
+        assert_eq!(epoch.inflight, Some(old));
+        assert!(!epoch.finish(old));
+        assert!(epoch.inflight.is_none());
+        let fresh = epoch.start();
+        assert_ne!(fresh, old);
+        // Even a duplicate delayed old result cannot release the newer worker.
+        assert!(!epoch.finish(old));
+        assert_eq!(epoch.inflight, Some(fresh));
+        assert!(epoch.finish(fresh));
+        assert!(epoch.inflight.is_none());
+    }
 
     #[test]
     fn indexed_tile_search_matches_full_distance_scan() {

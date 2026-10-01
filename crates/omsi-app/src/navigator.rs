@@ -358,6 +358,31 @@ impl Navigator {
         self.building = Some(rx);
     }
 
+    /// A Chrono/date transition changed the map behind the current navigator.
+    /// Retain UI preferences and GPU targets, but never accept an old worker's map.
+    pub(crate) fn invalidate_map(&mut self) {
+        self.building = None;
+        self.own_net = None;
+        self.global = None;
+        self.stop_pos = Default::default();
+        self.extra_roads = Default::default();
+        self.streets = None;
+        self.global_version = self.global_version.wrapping_add(1);
+        self.roads = None;
+        self.clear_route();
+        self.route_mesh = (u64::MAX, 0, DVec2::ZERO, 0, 0);
+        self.congestion.clear();
+        self.route_jam.clear();
+        self.jam_version = self.jam_version.wrapping_add(1);
+        self.stop_spots.clear();
+        self.next_dist = None;
+        self.next_turn = None;
+        self.street_here = None;
+        self.jam_cost = 0.0;
+        self.city.roads = None;
+        self.city.route = ((u64::MAX, u64::MAX, 0, u64::MAX), 0);
+    }
+
     /// The map's network given at once (an offscreen picture reads it on its own thread).
     pub fn set_map(&mut self, map: crate::scene::NavigationMap) {
         let mut net = Network { lanes: map.lanes, ..Default::default() };
@@ -2166,6 +2191,41 @@ impl Navigator {
 mod tests {
     use super::*;
     use omsi_sim::traffic::Lane;
+
+    #[test]
+    fn date_invalidation_clears_map_data_but_keeps_ui_and_gpu_targets() {
+        let mut nav = Navigator::new(true, 0.7, "right");
+        nav.schedule = true;
+        nav.target = Some((123, 320, 240));
+        nav.city.target = Some((124, 640, 480));
+        nav.city.open = true;
+        nav.global = Some(std::sync::Arc::new(Network::default()));
+        nav.own_net = Some(std::sync::Arc::new(Network::default()));
+        nav.stop_pos = std::sync::Arc::new(HashMap::from([(1, DVec3::ZERO)]));
+        nav.route.key = "old trip".into();
+        nav.route.lanes.push(0);
+        nav.congestion.insert(0, 1.0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        nav.building = Some(receiver);
+        nav.invalidate_map();
+        assert!(nav.global.is_none() && nav.own_net.is_none() && nav.building.is_none());
+        assert!(nav.stop_pos.is_empty() && nav.route.lanes.is_empty() && nav.congestion.is_empty());
+        assert!(nav.enabled && nav.schedule && nav.city.open);
+        assert_eq!(nav.target, Some((123, 320, 240)));
+        assert_eq!(nav.city.target, Some((124, 640, 480)));
+        assert!(sender
+            .send((
+                Network::default(),
+                HashMap::new(),
+                Streets {
+                    names: Vec::new(),
+                    of_lane: Vec::new(),
+                    labels: Vec::new()
+                },
+                Vec::new()
+            ))
+            .is_err());
+    }
 
     fn straight(a: (f64, f64), b: (f64, f64)) -> Lane {
         omsi_sim::traffic::LaneBuilder::polyline(vec![DVec3::new(a.0, a.1, 0.0), DVec3::new(b.0, b.1, 0.0)], LaneKind::Street, 3.0)

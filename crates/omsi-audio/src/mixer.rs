@@ -425,6 +425,21 @@ fn watch_default_device(first: String, reopen: std::sync::Weak<AtomicBool>) {
 impl AudioEngine {
     /// Open the default output device. Returns a silent engine if none is available.
     pub fn new() -> AudioEngine {
+        let engine = Self::new_silent();
+        let enabled = engine.open_default();
+        let engine = AudioEngine { enabled, ..engine };
+        if enabled {
+            watch_default_device(
+                engine.device.borrow().clone(),
+                Arc::downgrade(&engine.reopen),
+            );
+        }
+        engine
+    }
+
+    /// Mixer state without an operating-system device (offline tools and tests).
+    /// Voices remain inspectable; no hardware playback is implied.
+    pub fn new_silent() -> AudioEngine {
         let shared = Arc::new(Shared {
             voices: Mutex::new(Vec::new()),
             updates: Mutex::new(Vec::new()),
@@ -448,11 +463,6 @@ impl AudioEngine {
             loading: Default::default(),
             enabled: false,
         };
-        let enabled = engine.open_default();
-        let engine = AudioEngine { enabled, ..engine };
-        if enabled {
-            watch_default_device(engine.device.borrow().clone(), Arc::downgrade(&reopen));
-        }
         engine
     }
 
