@@ -25,6 +25,15 @@ use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod bridge;
+#[cfg(test)]
+mod date_reset;
+mod placement;
+mod positions;
+#[cfg(test)]
+mod variable_only;
+pub(crate) use bridge::{bridge_release_script_texture, bridge_script_texture};
+
 /// A loaded scenery object type: model meshes + material descriptions.
 pub struct ObjectType {
     pub sco: SceneryObject,
@@ -43,7 +52,7 @@ pub struct ObjectType {
     pub mesh_shadow: Vec<bool>,
     /// `[shadow]` per loaded mesh: the meshes OMSI casts (stencil) shadows from.
     pub mesh_casts: Vec<bool>,
-    /// Compiled scripts when the object is scripted or animated.
+    /// Compiled scripts and declared variables, including objects without an OSC script.
     pub program: Option<Arc<omsi_script::Program>>,
     /// Further `[LOD]` levels: (min screen size, meshes), in model order after LOD 0.
     pub lower_lods: Vec<(
@@ -196,7 +205,14 @@ impl ObjectType {
 }
 
 /// A placed scenery object with a running script / animations.
+fn next_scenery_api_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct ScriptedObject {
+    /// Native API handle for this loaded instance; never reused after tile unloading.
+    pub api_id: u64,
     pub ty: Arc<ObjectType>,
     pub pos: DVec3,
     pub xf: Mat4,
@@ -264,6 +280,10 @@ pub struct StopBoards {
 /// light `index` of the crossing `parent`.
 #[derive(Clone)]
 pub struct LightObject {
+    pub api_id: u64,
+    pub map_id: i64,
+    pub tile: (i32, i32),
+    pub type_path: PathBuf,
     pub parent: i64,
     pub index: usize,
     /// The map names no light for it (no string, or an empty one): a gate that is its own
@@ -609,6 +629,7 @@ pub struct PlacedObject {
 /// A scenery object the object editor can take hold of (see [`World::edit_objects`]).
 #[derive(Clone)]
 pub struct EditObject {
+    pub api_id: u64,
     pub tile: (i32, i32),
     pub pos: DVec3,
     pub xf: Mat4,
@@ -617,6 +638,11 @@ pub struct EditObject {
     pub instances: Vec<usize>,
     /// Its `.sco`, for the editor's display.
     pub sco: std::path::PathBuf,
+    pub(crate) ty: Arc<ObjectType>,
+    /// Native runtime relocation is scoped to this loaded instance. Preserve the
+    /// authored pose so unloading restores the map-wide position index.
+    pub(crate) native_origin: Option<Pose>,
+    pub(crate) terrain_mapped: bool,
 }
 
 /// What the object editor did to one object: moved by `moved` (m), turned by `turned`
@@ -1727,6 +1753,9 @@ pub struct World {
     upgrades_done: Arc<Mutex<Vec<(PathBuf, Arc<TextureData>)>>>,
     /// Roller-blind pictures (`[matl_freetex]`) uploaded as RGBA, to be compressed.
     freetex_upgrades: Arc<Mutex<Vec<PathBuf>>>,
+    /// Files refreshed by an external display/card producer; old background compression
+    /// results must not replace their newer pixels. Bounded by the bridge helper.
+    bridge_texture_paths: Mutex<hashbrown::HashSet<PathBuf>>,
     /// OMSI's `[texmemlimit]`: bytes the scenery and vehicle textures may take on the GPU
     /// (0 = no limit), and when the budget was last looked at.
     texture_limit: std::sync::atomic::AtomicU64,
@@ -1822,10 +1851,12 @@ pub struct World {
     /// Chrono folders active on the sim date, in order, and the merged AI lists / date.
     /// The chrono scenarios in force on the sim date (changed at midnight: `set_date`).
     pub chrono_dirs: parking_lot::RwLock<Vec<PathBuf>>,
-    pub ailists: omsi_map::AiLists,
+    ailists: RwLock<Arc<omsi_map::AiLists>>,
+    /// Date changes wait for source preparation before invalidating its caches.
+    preparation: RwLock<u64>,
     pub date: i32,
     /// Ticket pack (chrono folders may override the map's).
-    pub ticket_pack: String,
+    ticket_pack: RwLock<String>,
     /// Fonts for text and script textures, shared by all vehicles.
     pub fonts: Arc<Mutex<omsi_sim::texttex::FontLibrary>>,
     /// Scenery material variants switched by `NightlightA`: (instance, slot, material on, off).
@@ -2555,9 +2586,10 @@ impl World {
             parklist: Mutex::new(HashMap::new()),
             mirror_textures: Mutex::new(Vec::new()),
             chrono_dirs: parking_lot::RwLock::new(chrono_dirs),
-            ailists,
+            ailists: RwLock::new(Arc::new(ailists)),
+            preparation: RwLock::new(0),
             date,
-            ticket_pack,
+            ticket_pack: RwLock::new(ticket_pack),
             object_types: Mutex::new(HashMap::new()),
             spline_types: Mutex::new(HashMap::new()),
             textures: Arc::new(TextureCache::new()),
@@ -2572,6 +2604,7 @@ impl World {
             upgrades_pending: Default::default(),
             upgrades_done: Default::default(),
             freetex_upgrades: Default::default(),
+            bridge_texture_paths: Default::default(),
             texture_limit: Default::default(),
             budget_checked: Default::default(),
             lanes: Mutex::new(Vec::new()),
@@ -2793,7 +2826,8 @@ impl World {
                 }
             }
             let paint_scheme_count = paint_schemes.len();
-            // scripts (or an empty program) for objects that are scripted or animated
+            // Declared variables belong to the placed object even without an OSC script:
+            // plugins can read its map labels and drive its material selectors.
             let animated = mesh_def_index.iter().any(|d| {
                 !model.meshes[*d].animations.is_empty() || model.meshes[*d].visible.is_some()
             });
@@ -3174,6 +3208,9 @@ impl World {
     /// Returns the tiles a scenario that came or went changes (to be read again), and
     /// forgets the map index built with the old ones.
     pub fn set_date(&self, date: i32) -> Vec<(i32, i32)> {
+        let mut preparation = self.preparation.write();
+        *self.ailists.write() = Arc::new(self.ai_lists_on_date(date));
+        *self.ticket_pack.write() = self.ticket_pack_on_date(date);
         let new = omsi_map::active_chrono_dirs(&self.map_dir, date);
         let old = self.chrono_dirs.read().clone();
         if new == old {
@@ -3190,14 +3227,106 @@ impl World {
                 }
             }
         }
+        if !tiles.is_empty() {
+            *preparation = preparation
+                .checked_add(1)
+                .expect("tile preparation generation exhausted");
+        }
+        // Index::objects relinquishes its tile attribution to object_positions.
+        // Read only changed source tiles on both sides of the transition, so moved,
+        // removed and newly introduced IDs lose their old positions while unchanged
+        // loaded tiles keep their final terrain/road-adjusted heights.
+        let mut changed_ids = hashbrown::HashSet::new();
+        let mut complete = true;
+        for tile in self
+            .global
+            .tiles
+            .iter()
+            .filter(|tile| tiles.contains(&(tile.x, tile.y)))
+        {
+            let path = omsi_cfg::resolve_path(&self.map_dir, &tile.file);
+            for dirs in [&old, &new] {
+                match crate::tiles::read_tile(&path, dirs) {
+                    Some(tile) => positions::collect_ids(&tile, &mut changed_ids),
+                    None => complete = false,
+                }
+            }
+        }
         *self.chrono_dirs.write() = new;
-        *self.index.lock() = None;
+        // A changed source wins over an old runtime relocation even if the new
+        // authored position happens to equal that live object's last position.
+        for (id, o) in self.edit_objects.lock().iter_mut() {
+            if !complete || tiles.contains(&o.tile) || changed_ids.contains(id) {
+                o.native_origin = None;
+            }
+        }
+        {
+            let mut index = self.index.lock();
+            let mut duplicates = self.object_dups.lock();
+            let mut cached = self.object_positions.lock();
+            positions::invalidate(&mut cached, &mut duplicates, &tiles, &changed_ids, complete);
+            *index = None;
+        }
         let keys: Vec<(i32, i32)> = tiles.into_iter().collect();
         self.forget_staged(&keys);
         keys
     }
 
     /// Drop the read tiles `keys` from the staging cache (they are read again when asked).
+    pub(crate) fn ai_lists_on_date(&self, date: i32) -> omsi_map::AiLists {
+        let dirs = omsi_map::active_chrono_dirs(&self.map_dir, date);
+        let mut lists = omsi_map::ailists::ailists_with_chrono(&self.map_dir, &dirs);
+        for group in &mut lists.groups {
+            for types in &mut group.typgroups {
+                types
+                    .entries
+                    .retain(|entry| omsi_map::typgroup_entry_valid(entry, date));
+            }
+        }
+        lists
+    }
+
+    pub(crate) fn ai_lists(&self) -> Arc<omsi_map::AiLists> {
+        self.ailists.read().clone()
+    }
+
+    pub(crate) fn ticket_pack(&self) -> String {
+        self.ticket_pack.read().clone()
+    }
+
+    /// Resolve the date's effective authored pack without changing the active
+    /// world. Clock transactions load and validate this before committing.
+    pub(crate) fn ticket_pack_on_date(&self, date: i32) -> String {
+        let mut path = self.global.ticket_pack.clone();
+        for dir in omsi_map::active_chrono_dirs(&self.map_dir, date) {
+            let cfg = omsi_cfg::resolve_path(&dir, "Chrono.cfg");
+            if let Ok(cfg) = omsi_cfg::CfgFile::read(&cfg) {
+                if let Some(pack) = omsi_map::ailists::parse_chrono_cfg(&cfg).ticket_pack {
+                    path = pack;
+                }
+            }
+        }
+        path
+    }
+
+    /// The caller has retired AI users of the old graph. Every loaded tile must then
+    /// be reloaded so paths/controllers are freshly seeded from the new Chrono files.
+    pub(crate) fn reset_traffic_sources(&self) {
+        let mut preparation = self.preparation.write();
+        *preparation = preparation
+            .checked_add(1)
+            .expect("tile preparation generation exhausted");
+        let mut lanes = self.lanes.lock();
+        lanes.clear();
+        self.lane_tiles.lock().clear();
+        self.parked_cars.lock().clear();
+        self.seeded.lock().clear();
+        self.traffic_lights.lock().clear();
+        self.controller_of_object.lock().clear();
+        self.staged.lock().clear();
+        *self.layout.lock() = None;
+    }
+
     pub fn forget_staged(&self, keys: &[(i32, i32)]) {
         let mut st = self.staged.lock();
         for k in keys {
@@ -3207,7 +3336,15 @@ impl World {
 
     /// Drop every read tile from the staging cache.
     pub fn forget_all_staged(&self) {
+        let mut preparation = self.preparation.write();
+        *preparation = preparation
+            .checked_add(1)
+            .expect("tile preparation generation exhausted");
         self.staged.lock().clear();
+    }
+
+    pub(crate) fn preparation_generation(&self) -> u64 {
+        *self.preparation.read()
     }
 
     /// The map index, built on first use (every tile file read once, in parallel).
@@ -3296,6 +3433,25 @@ impl World {
     /// ([`TileLayout::sources_of`]), not by what else happens to be loaded, so a tile
     /// streamed in gets exactly the ground and the cut a whole-map load gives it.
     pub fn prepare_tiles(&self, tiles: &[(i32, i32, PathBuf)]) -> (Vec<Prepared>, LoadStats) {
+        let _preparation = self.preparation.read();
+        self.prepare_tiles_inner(tiles)
+    }
+
+    /// A queued worker may start after a date/season reset. Check its source
+    /// generation under the preparation gate before it can repopulate caches.
+    pub(crate) fn prepare_tiles_for_generation(
+        &self,
+        tiles: &[(i32, i32, PathBuf)],
+        generation: u64,
+    ) -> (Vec<Prepared>, LoadStats) {
+        let preparation = self.preparation.read();
+        if *preparation != generation {
+            return Default::default();
+        }
+        self.prepare_tiles_inner(tiles)
+    }
+
+    fn prepare_tiles_inner(&self, tiles: &[(i32, i32, PathBuf)]) -> (Vec<Prepared>, LoadStats) {
         let profile = omsi_cfg::env::var_os("OMSI_PROFILE").is_some();
         let t0 = std::time::Instant::now();
         let index = self.index();
@@ -4455,7 +4611,8 @@ impl World {
                 let known = self.controller_of_object.lock().get(&o.id).copied();
                 Some(known.unwrap_or_else(|| {
                     let program = ot.sco.traffic_lights.iter().map(|l| (l.phases.iter().map(|p| (p.state, p.duration)).collect(), l.approach_dist)).collect();
-                    let c = TrafficLightController::from_program(program, ot.sco.traffic_lights_group, &ot.sco.traffic_light_stop, &ot.sco.traffic_light_jump);
+                    let mut c = TrafficLightController::from_program(program, ot.sco.traffic_lights_group, &ot.sco.traffic_light_stop, &ot.sco.traffic_light_jump);
+                    c.names = ot.sco.traffic_lights.iter().map(|light| light.name.clone()).collect();
                     let mut list = self.traffic_lights.lock();
                     list.push(c);
                     let idx = list.len() - 1;
@@ -4467,8 +4624,14 @@ impl World {
                 }))
             };
             if ot.sco.only_editor || ot.sco.is_help_arrow || ot.meshes.is_empty() {
-                // invisible sound sources (ambient sound objects) still run their script
-                if let (Some(program), true) = (&ot.program, ot.sco.sound.is_some()) {
+                // Invisible helpers retain their declared variables as well as sounds;
+                // having no rendered mesh must not erase the object's plugin state.
+                if let (Some(program), true) = (
+                    &ot.program,
+                    ot.sco.sound.is_some()
+                        || !ot.sco.scripts.varlists.is_empty()
+                        || !ot.sco.scripts.stringvarlists.is_empty(),
+                ) {
                     let inst = omsi_sim::scenery::SceneryInstance::new(
                         program.clone(),
                         &ot.mesh_defs(),
@@ -4476,12 +4639,13 @@ impl World {
                         &o.extra,
                     );
                     self.scripted.lock().push(ScriptedObject {
+                        api_id: next_scenery_api_id(),
                         ty: ot.clone(),
                         pos,
                         xf,
                         instances: Vec::new(),
                         inst,
-                        controller: None,
+                        controller,
                         light_index: 0,
                         map_id: o.id,
                         variants: Vec::new(),
@@ -4684,6 +4848,7 @@ impl World {
             // (surface objects too - a petrol station is a drivable [surface] with a roof)
             if let Some(shape) = ot.camera_shape() {
                 state.blockers.push(crate::camera_arm::Blocker {
+                    object_key: o.key,
                     ty: Arc::downgrade(&ot),
                     pos,
                     xf,
@@ -5862,6 +6027,7 @@ impl World {
             self.poles.lock().retain(|k, _| !poles.contains(k));
             self.parked_objects.lock().retain(|_, p| p.tile != key);
             self.departed_objects.lock().retain(|_, (p, _, _)| p.tile != key);
+            self.forget_native_placements(key);
             self.edit_objects.lock().retain(|_, o| o.tile != key);
             freed = self.gpu.lock().release_tile(renderer, scene, tg) > 0;
         }
@@ -6929,8 +7095,23 @@ impl World {
                         }
                     }
                     if editable {
-                        let instances: Vec<usize> = all_instances.iter().chain(&lod_instances).copied().collect();
-                        let eo = EditObject { tile: key, pos, xf, key: collision_key, instances, sco: ot.sco.path.clone() };
+                        let instances: Vec<usize> = all_instances
+                            .iter()
+                            .chain(&lod_instances)
+                            .copied()
+                            .collect();
+                        let eo = EditObject {
+                            api_id: next_scenery_api_id(),
+                            tile: key,
+                            pos,
+                            xf,
+                            key: collision_key,
+                            instances,
+                            sco: ot.sco.path.clone(),
+                            ty: ot.clone(),
+                            native_origin: None,
+                            terrain_mapped: !ground_meshes.is_empty() || warped.is_some(),
+                        };
                         // an object edited before its tile went shows the edit again
                         if let Some(e) = self.object_edits.lock().get(&map_id).copied() {
                             show_edit(renderer, scene, &eo, e);
@@ -6967,6 +7148,10 @@ impl World {
                             omsi_cfg::resolve_path(&dir, rel)
                         });
                         pl.light_objects.push(LightObject {
+                            api_id: next_scenery_api_id(),
+                            map_id,
+                            tile: key,
+                            type_path: ot.sco.path.clone(),
                             parent,
                             index,
                             any_light,
@@ -7021,6 +7206,8 @@ impl World {
                             }
                         }
                         if inst.is_dynamic()
+                            || !ot.sco.scripts.varlists.is_empty()
+                            || !ot.sco.scripts.stringvarlists.is_empty()
                             || !object_variants.is_empty()
                             || ot.sco.sound.is_some()
                             || !script_texts.is_empty()
@@ -7032,6 +7219,7 @@ impl World {
                             // than its script has meshes: "index out of bounds", #111)
                             all_instances.truncate(mesh_instances);
                             self.scripted.lock().push(ScriptedObject {
+                                api_id: next_scenery_api_id(),
                                 ty: ot.clone(),
                                 pos,
                                 xf,
@@ -7341,6 +7529,7 @@ impl World {
         let _ = self.parked_live.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| Some(n.saturating_sub(state.parked_count)));
         self.parked_objects.lock().retain(|_, p| p.tile != key);
             self.departed_objects.lock().retain(|_, (p, _, _)| p.tile != key);
+        self.forget_native_placements(key);
         self.edit_objects.lock().retain(|_, o| o.tile != key);
         {
             // the posts' instances go back to the pool with the tile
@@ -7793,6 +7982,9 @@ impl World {
         if !wanted.is_empty() {
             let mut pending = self.upgrades_pending.lock();
             for path in wanted {
+                if self.bridge_texture_paths.lock().contains(&path) {
+                    continue;
+                }
                 if !pending.insert(path.clone()) {
                     continue;
                 }
@@ -7837,6 +8029,9 @@ impl World {
                 break;
             };
             self.upgrades_pending.lock().remove(&path);
+            if self.bridge_texture_paths.lock().contains(&path) {
+                continue;
+            }
             // the texture is still up under that name (it may have gone meanwhile)
             let vid = self.vehicle_textures.lock().get(&path).map(|e| e.0);
             let id = match vid {
@@ -9407,6 +9602,9 @@ pub fn sync_vehicle_textures(
     }
     let mut rebound = Vec::new();
     for (i, st) in vehicle.host.script_textures.iter_mut().enumerate() {
+        if render.external_script_textures.contains(&i) {
+            continue;
+        }
         // (far away what the scripts redraw goes up every half second: `displays_far`)
         if !render.displays_far {
             if let Some(Some(tex)) = render.script_textures.get(i) {
@@ -9425,6 +9623,16 @@ pub fn sync_vehicle_textures(
                     if renderer.update_texture_mips(scene, *tex, &img) {
                         rebound.push(*tex);
                     }
+                } else if renderer.texture_levels(scene, *tex) != Some((st.width, st.height, 1)) {
+                    renderer.replace_texture(
+                        scene,
+                        *tex,
+                        &TextureData {
+                            gpu_mips: false,
+                            ..TextureData::from_image(img)
+                        },
+                    );
+                    rebound.push(*tex);
                 } else {
                     renderer.update_texture(scene, *tex, &img);
                 }
@@ -9875,6 +10083,8 @@ pub struct VehicleRender {
     pub text_textures: Vec<Option<TextureId>>,
     /// GPU texture per `[scripttexture]` index.
     pub script_textures: Vec<Option<TextureId>>,
+    /// Slots currently supplied by an external client, for this vehicle lifetime only.
+    pub external_script_textures: hashbrown::HashSet<usize>,
     /// `script_textures` belong to the vehicle this part is coupled to (`[scriptshare]`):
     /// they are not this render's to give back.
     pub shared_script: bool,
@@ -11306,6 +11516,7 @@ impl World {
             instances,
             text_textures,
             script_textures,
+            external_script_textures: Default::default(),
             shared_script: shared_script.is_some(),
             variants,
             own_materials,
