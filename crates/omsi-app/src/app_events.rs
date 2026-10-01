@@ -1263,6 +1263,9 @@ impl ApplicationHandler for App {
                         d.set(crate::discord::Presence { details, state });
                     }
                 }
+                // The optional companion bridge also serves reads without Lua/DLL plugins
+                // or while paused; vehicle scripts have completed this frame.
+                crate::native_bridge::poll(self);
                 // the plugins' frame, with the bus's scripts done
                 let plugins = self.plugins.get_or_insert_with(crate::plugins::load);
                 if !plugins.is_empty() && !self.paused {

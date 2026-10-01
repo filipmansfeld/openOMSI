@@ -81,6 +81,7 @@ mod route_arrows;
 mod server;
 mod player;
 mod plugins;
+mod native_bridge;
 mod services;
 mod situation;
 mod spawn;
@@ -406,6 +407,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
     let view = args.view.clone();
     let args_root_for_keys = args.root.clone();
     let clock_note = args.clock_moved.clone();
+    let native_bridge = native_bridge::Bridge::from_env(&args.root);
     let mut app = App {
         args,
         instance: graphics_instance(),
@@ -532,6 +534,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         service_msg: clock_note.map(|m| (m, 10.0)),
         log_state: Default::default(),
         plugins: None,
+        native_bridge,
         career: Default::default(),
         wetness: 0.0,
         cloud_drift: [0.0; 2],

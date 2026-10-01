@@ -10,6 +10,11 @@ content root):
 
 ## Lua plugins
 
+Standalone companion applications can opt in to the
+[local vehicle scripting API](COMPANION_API.md) for current-vehicle variables,
+declared triggers and refreshing a replaced texture file. Its complete request
+and response contract and a runnable client example are documented separately.
+
 ### Your first plugin
 
 Create `plugins/hello.lua` next to the game:

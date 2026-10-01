@@ -25,6 +25,8 @@ use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod texture_refresh;
+
 /// A loaded scenery object type: model meshes + material descriptions.
 pub struct ObjectType {
     pub sco: SceneryObject,
@@ -1710,6 +1712,8 @@ pub struct World {
     upgrades_done: Arc<Mutex<Vec<(PathBuf, Arc<TextureData>)>>>,
     /// Roller-blind pictures (`[matl_freetex]`) uploaded as RGBA, to be compressed.
     freetex_upgrades: Arc<Mutex<Vec<PathBuf>>>,
+    /// Refreshed files cannot be replaced by an older background decode (at most 64 keys).
+    refreshed_texture_paths: Mutex<hashbrown::HashSet<PathBuf>>,
     /// OMSI's `[texmemlimit]`: bytes the scenery and vehicle textures may take on the GPU
     /// (0 = no limit), and when the budget was last looked at.
     texture_limit: std::sync::atomic::AtomicU64,
@@ -2541,6 +2545,7 @@ impl World {
             upgrades_pending: Default::default(),
             upgrades_done: Default::default(),
             freetex_upgrades: Default::default(),
+            refreshed_texture_paths: Default::default(),
             texture_limit: Default::default(),
             budget_checked: Default::default(),
             lanes: Mutex::new(Vec::new()),
@@ -7798,6 +7803,9 @@ impl World {
         if !wanted.is_empty() {
             let mut pending = self.upgrades_pending.lock();
             for path in wanted {
+                if self.refreshed_texture_paths.lock().contains(&path) {
+                    continue;
+                }
                 if !pending.insert(path.clone()) {
                     continue;
                 }
@@ -7842,6 +7850,9 @@ impl World {
                 break;
             };
             self.upgrades_pending.lock().remove(&path);
+            if self.refreshed_texture_paths.lock().contains(&path) {
+                continue;
+            }
             // the texture is still up under that name (it may have gone meanwhile)
             let vid = self.vehicle_textures.lock().get(&path).map(|e| e.0);
             let id = match vid {

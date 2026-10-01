@@ -271,6 +271,7 @@ pub(crate) struct App {
     pub(crate) cpu_mark: Option<(f64, Instant, u32)>,
     /// The OMSI plugins (`plugins/*.opl`), loaded with the first frame.
     pub(crate) plugins: Option<omsi_plugin::Plugins>,
+    pub(crate) native_bridge: Option<crate::native_bridge::Bridge>,
     /// The on-screen controls of a phone (see `touch.rs`).
     pub(crate) touch: crate::touch::Touch,
 }
