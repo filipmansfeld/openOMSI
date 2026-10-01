@@ -80,6 +80,22 @@ mod route_arrows;
 mod server;
 mod player;
 mod plugins;
+mod native_bridge;
+mod plugin_api;
+mod plugin_api_audio;
+mod plugin_api_camera;
+#[cfg(test)]
+mod plugin_api_contract;
+mod plugin_api_environment;
+#[cfg(test)]
+mod plugin_api_launcher_contract;
+mod plugin_api_particles;
+mod plugin_api_physics;
+#[cfg(test)]
+mod plugin_api_texture_contract;
+mod plugin_api_timetable;
+mod plugin_api_vehicle;
+mod plugin_api_world;
 mod services;
 mod situation;
 mod spawn;
@@ -402,11 +418,28 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         lan_mods::clean_up();
         return r.map(|_| None);
     }
+    let radio = radio::Radio::load(&args.root);
+    let native_bridge = native_bridge::Bridge::from_env(&args.root);
+    let mut app = new_app(args, settings);
+    app.radio = radio;
+    app.native_bridge = native_bridge;
+    app.lan = lan;
+    app.remotes = lan_game;
+    // (the LAN status file stays while the game runs; `exiting` removes it)
+    std::mem::forget(_lan_status);
+    Ok(Some(app))
+}
+
+/// Construct the application state separately from startup's filesystem/network work.
+/// Native API tests can use this same state without opening a window or joining a game.
+fn new_app(args: Args, settings: settings::Settings) -> App {
     let view = args.view.clone();
     let args_root_for_keys = args.root.clone();
     let clock_note = args.clock_moved.clone();
-    let mut app = App {
+    App {
         args,
+        native_bridge: None,
+        plugin_api: Some(plugin_api::ApiState::default()),
         instance: graphics_instance(),
         window: None,
         surface: None,
@@ -438,7 +471,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         menu: None,
         populate_t: 0.0,
         humans_populate_t: 0.0,
-        radio: radio::Radio::load(&args_root_for_keys),
+        radio: radio::Radio::default(),
         profile: Default::default(),
         profile_prev: Default::default(),
         first_populate: true,
@@ -549,12 +582,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         stand_in: None,
         cpu_mark: None,
         touch: touch::Touch::new(),
-    };
-    app.lan = lan;
-    app.remotes = lan_game;
-    // (the LAN status file stays while the game runs; `exiting` removes it)
-    std::mem::forget(_lan_status);
-    Ok(Some(app))
+    }
 }
 
 #[cfg(test)]

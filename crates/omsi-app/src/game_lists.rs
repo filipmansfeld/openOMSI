@@ -494,7 +494,7 @@ pub(crate) fn run(app: &mut App, kind: &ListKind, action: &str) -> Option<ListKi
         ListKind::Lines => match verb {
             "line" => Some(ListKind::Tours(arg.to_string())),
             "free" => {
-                app.duty = None;
+                clear_duty(app);
                 app.service_msg = Some(("Free drive: no duty".into(), 4.0));
                 None
             }
@@ -661,7 +661,33 @@ fn fleet_numbers(v: &omsi_sim::VehicleInstance) -> Vec<(String, String)> {
 
 /// Take on line `line`, tour `tour` from now: the duty, and the IBIS typed for it.
 fn start_duty(app: &mut App, line: &str, tour: &str) {
-    let (Some(w), Some(sch)) = (app.world.clone(), app.schedule.as_mut()) else { return };
+    if let Err(error) = assign_duty(app, line, tour) {
+        app.service_msg = Some((format!("No duty: {error}"), 8.0));
+    }
+}
+
+pub(crate) fn clear_duty(app: &mut App) {
+    if let Some(schedule) = app.schedule.as_mut() {
+        schedule.release_player_tour();
+    }
+    app.duty = None;
+    app.args.line = None;
+    app.args.tour = None;
+    if let Some(player) = app.player.as_mut() {
+        player.vehicle.host.schedule_active = 0.0;
+        player.vehicle.host.tt_line.clear();
+        player.vehicle.host.tt_delay = 0.0;
+        player.vehicle.host.tt_stops.clear();
+        player.vehicle.host.tt_stop_ids.clear();
+        player.vehicle.host.tt_terminus_index = -1;
+        player.vehicle.host.tt_busstop_index = -1;
+    }
+}
+
+pub(crate) fn assign_duty(app: &mut App, line: &str, tour: &str) -> Result<(), String> {
+    let w = app.world.clone().ok_or("map is not loaded")?;
+    let sch = app.schedule.as_mut().ok_or("timetable is not loaded")?;
+    sch.require_tour(line, tour)?;
     let now = app.clock.time;
     match sch.player_duty(&w, line, tour, now, None, false) {
         Ok(mut d) => {
@@ -682,8 +708,9 @@ fn start_duty(app: &mut App, line: &str, tour: &str) {
             app.args.tour = Some(tour.to_string());
             app.duty = Some(d);
             app.service_msg = Some((format!("Line {line}, tour {}", tour.trim()), 4.0));
+            Ok(())
         }
-        Err(e) => app.service_msg = Some((format!("No duty: {e}"), 8.0)),
+        Err(e) => Err(e),
     }
 }
 

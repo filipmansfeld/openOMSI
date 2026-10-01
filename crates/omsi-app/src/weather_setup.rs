@@ -324,19 +324,49 @@ pub(crate) fn precip_of(w: &omsi_content::weather::Weather) -> (i32, f32) {
     (kind, rate)
 }
 
+/// Small current snapshot used before AI `{init}` as well as on live instances.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VehicleWeather {
+    precip_type: f32,
+    precip_rate: f32,
+    street_cond: f32,
+    temperature: f32,
+    abs_humidity: f32,
+}
+impl VehicleWeather {
+    pub(crate) fn from_weather(weather: &omsi_content::weather::Weather, wetness: f32) -> Self {
+        let (kind, rate) = precip_of(weather);
+        Self {
+            precip_type: kind as f32,
+            precip_rate: rate,
+            street_cond: street_condition(weather, wetness),
+            temperature: weather.temp.0,
+            abs_humidity: weather.temp.1,
+        }
+    }
+
+    pub(crate) fn apply_host(self, host: &mut omsi_sim::VehicleHost) {
+        host.precip_type = self.precip_type;
+        host.precip_rate = self.precip_rate;
+        host.street_cond = self.street_cond;
+        host.temperature = self.temperature;
+        host.abs_humidity = self.abs_humidity;
+    }
+
+    pub(crate) fn apply_vehicle(self, vehicle: &mut omsi_sim::VehicleInstance) {
+        self.apply_host(&mut vehicle.host);
+        vehicle.set_var("PrecipType", self.precip_type);
+        vehicle.set_var("PrecipRate", self.precip_rate);
+        vehicle.set_var("StreetCond", self.street_cond);
+    }
+}
+
 pub(crate) fn apply_weather(
     v: &mut omsi_sim::VehicleInstance,
     w: &omsi_content::weather::Weather,
     wetness: f32,
 ) {
-    let (kind, rate) = precip_of(w);
-    v.host.precip_type = kind as f32;
-    v.host.precip_rate = rate;
-    v.host.street_cond = street_condition(w, wetness);
-    v.set_var("PrecipType", kind as f32);
-    v.set_var("PrecipRate", rate);
-    v.host.temperature = w.temp.0;
-    v.host.abs_humidity = w.temp.1;
+    VehicleWeather::from_weather(w, wetness).apply_vehicle(v);
     omsi_sim::host::set_ambient_weather(w.temp.0, w.temp.1);
 }
 

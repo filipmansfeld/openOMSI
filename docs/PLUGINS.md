@@ -51,13 +51,23 @@ by defining a global function `on_<event>`:
 | Event | Arguments | When |
 | --- | --- | --- |
 | `start` | - | right after the file was loaded (also after a reload) |
-| `vehicle` | name or `nil` | the player got into a vehicle, changed it, or left it |
+| `map` | name or `nil` | the loaded map session changed or unloaded, including a new session with the same map name |
+| `renderer` | `true`/`false` | an actual renderer became available or unavailable between plugin frames |
+| `vehicle` | name or `nil` | the player got into a vehicle, changed it, or left it; replacing a bus with the same model/name also fires |
 | `frame` | `dt` (seconds) | every frame of the game, after the bus's own scripts; not while paused |
 | `stop` | - | the game ends, or the file is about to be loaded again |
 | `key` | key name, `true`/`false` | a key went down / came up (`"KeyH"`, `"F5"`, `"Numpad8"`, ...) |
 | `next_stop` | new, old | the duty's next stop changed |
 | `view` | new, old | the view changed (`"driver"`, `"pax"`, `"outside"`, `"free"`, `"foot"`) |
 | `duty` | line, tour | a line and tour were taken (or given up: `nil`) |
+
+Lifecycle changes are observed on the next plugin frame (after resuming if paused),
+in `map`, `renderer`, `vehicle` order before timers/watches and `frame`. The `vehicle`
+payload remains the display name; lifetime comparisons use the engine session and
+vehicle ID/generation. `map` also fires when a date change replaces the native map
+session. `renderer` reports presence only: it does not claim Direct3D device-lost/reset
+or GPU context-replacement semantics, and a disappearance/reappearance entirely
+between two plugin frames is not observed.
 
 ```lua
 function on_frame(dt)
@@ -69,6 +79,11 @@ You can send your own events too: `omsi.emit("my_event", 1, 2)` calls every
 `omsi.on("my_event", ...)` handler (handy between the modules of a bigger plugin).
 
 ### The `omsi` table
+
+The development native game API also exposes structured game objects and mutations
+through `omsi.api(operation, arguments[, binary])`. See [Native game API](NATIVE_API.md)
+for the implemented operations, object lifetime rules and examples. It is additional
+to the simple bus functions below; it is not a claim of complete OmsiHook parity.
 
 #### The player's bus
 

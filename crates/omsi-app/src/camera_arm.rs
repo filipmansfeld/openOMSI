@@ -291,6 +291,8 @@ pub fn classify(ot: &ObjectType) -> BlockerShape {
 /// A placed object that stops the camera (kept per tile, see `TileState::blockers`).
 #[derive(Clone)]
 pub struct Blocker {
+    /// Source collision identity; equal-position objects must remain independent.
+    pub object_key: i64,
     pub ty: std::sync::Weak<ObjectType>,
     pub pos: DVec3,
     pub xf: Mat4,
