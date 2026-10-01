@@ -1,0 +1,84 @@
+{
+  "before_commit": "b15f5cb9b65503fbe121d9fcaab1021ce1285cdd",
+  "after_commit": "41f128473df3eaa158a101fd542e9570101222f6",
+  "pr_base": "def0f02849098eec0e8df391de9d346b17415e66",
+  "before_release": "https://github.com/turbo-devv/openOMSI/releases/tag/v0.1.479",
+  "captures": [
+    {
+      "name": "stock-freimuth-lighting",
+      "camera": "887341.1,4198676.8,42,82,-85,60",
+      "common_args": [
+        "--map",
+        "maps/Berlin-Spandau/global.cfg",
+        "--radius",
+        "1",
+        "--time",
+        "12:00",
+        "--date",
+        "1989-06-15",
+        "--season",
+        "summer",
+        "--size",
+        "1600x900",
+        "--view",
+        "free",
+        "--no-menu",
+        "--enhanced",
+        "--traffic",
+        "0"
+      ],
+      "settings": "version=2\ngraphics=enhanced\nenhanced=1\nmsaa=1\nanisotropy=16\nssao=0\nshadows=0\ndetail_textures=0\npost_aa=off\nrender_scale=1\nnavigator=0\nclouds=0\ndiscord_status=0\ntexture_compression=1\n",
+      "settings_sha256": "c01e8b386ce55fe4dc057bc71f4357f62308f8604a0801d972da0f2e10bfd4eb",
+      "before": {
+        "png": "lighting-before.png",
+        "png_sha256": "050f09acfd59a1d5a81f2564699dcf7b21dd082952f70c63e495304bba9ddfcf",
+        "executable_sha256": "ed08835d62fb1a1161600a4f58093d6adcf4b11a2ae3797f72af50d55d43bc15",
+        "source_commit": "b15f5cb9b65503fbe121d9fcaab1021ce1285cdd"
+      },
+      "after": {
+        "png": "lighting-after.png",
+        "png_sha256": "75ba85a74b47538e3f29d511756c86d3c1841659b4c802370682904e8beb6989",
+        "executable_sha256": "0a100b76fd8decae34504906ce96197cf8bdbda2dec42e49db1d49eb797c95f6",
+        "source_commit": "41f128473df3eaa158a101fd542e9570101222f6"
+      }
+    },
+    {
+      "name": "stock-exposed-damm-first-layer",
+      "camera": "893110.72,4195363.20,42,285.32,-89,50",
+      "common_args": [
+        "--map",
+        "maps/Berlin-Spandau/global.cfg",
+        "--radius",
+        "1",
+        "--time",
+        "12:00",
+        "--date",
+        "1989-06-15",
+        "--season",
+        "summer",
+        "--size",
+        "1600x900",
+        "--view",
+        "free",
+        "--no-menu",
+        "--enhanced",
+        "--traffic",
+        "0"
+      ],
+      "settings": "version=2\ngraphics=enhanced\nenhanced=1\nmsaa=1\nanisotropy=16\nssao=0\nshadows=0\ndetail_textures=0\npost_aa=off\nrender_scale=1\nnavigator=0\nclouds=0\ndiscord_status=0\ntexture_compression=1\n",
+      "settings_sha256": "c01e8b386ce55fe4dc057bc71f4357f62308f8604a0801d972da0f2e10bfd4eb",
+      "before": {
+        "png": "first-layer-before.png",
+        "png_sha256": "c8cc3fec97510fbad274d034acc98d65f2fa46978e541f67459990993f05d64e",
+        "executable_sha256": "ed08835d62fb1a1161600a4f58093d6adcf4b11a2ae3797f72af50d55d43bc15",
+        "source_commit": "b15f5cb9b65503fbe121d9fcaab1021ce1285cdd"
+      },
+      "after": {
+        "png": "first-layer-after.png",
+        "png_sha256": "061d1913d22e09cdafec52228d3daa9f4a4e310d9f474ef4fbf0913a9e3e45ff",
+        "executable_sha256": "0a100b76fd8decae34504906ce96197cf8bdbda2dec42e49db1d49eb797c95f6",
+        "source_commit": "41f128473df3eaa158a101fd542e9570101222f6"
+      }
+    }
+  ]
+}
