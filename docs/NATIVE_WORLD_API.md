@@ -212,7 +212,11 @@ traffic-light association, and rules. A controller association uses the same
 `controller_index` exposed by the light list.
 
 Set accepts a `values` object with `speed_limit_kmh`, `priority`, `density`,
-`no_cars`, `no_trucks`, and `turn` (0 none, 1 left, 2 right). Changes refresh the
+`no_cars`, `rule_bus`, `rule_trucks`, and `turn` (0 none, 1 left, 2 right).
+The legacy `no_trucks` field is the inverse of native `rule_trucks`; reads and
+writes translate directly to that rule. A write must not specify both aliases.
+Enabling `rule_bus` or `rule_trucks` also allows taxis on a `no_cars` path, as in
+the native v0.1.800 traffic rules. Changes refresh the
 native spawning weights and reachable-network distances. Unsupported properties
 are errors, including geometry/topology writes that would require rebuilding
 the network. A lane closure affects route choice; it does not despawn cars

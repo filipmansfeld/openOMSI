@@ -169,7 +169,7 @@ fn declared_scenery_variables_survive_loading_and_native_api_updates_without_scr
         &mut scene,
         0.016,
         DVec3::new(100.0, 100.0, 0.0),
-        false,
+        1.0,
         &|_, _| (0.0, 0.0),
         None,
         false,

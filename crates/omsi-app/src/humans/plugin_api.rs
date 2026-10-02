@@ -420,7 +420,11 @@ impl Humans {
                     .ok_or("the destination stop is not loaded; wait for its native stop record")?;
                 if stops
                     .iter()
-                    .filter(|other| self.stops.get(other).is_some_and(|s| s.name.trim() == name))
+                    .filter(|other| {
+                        self.stops
+                            .get(*other)
+                            .is_some_and(|s| s.name.trim() == name)
+                    })
                     .count()
                     > 1
                 {
