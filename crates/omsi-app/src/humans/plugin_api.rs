@@ -697,6 +697,7 @@ mod tests {
     fn stop(name: &str) -> PaxStop {
         PaxStop {
             name: name.into(),
+            alias: String::new(),
             pos: DVec3::ZERO,
             heading: 0.0,
             gather: DVec3::ZERO,
@@ -765,6 +766,8 @@ mod tests {
             state: State::Pax(Box::new(pax)),
             t_state: 0.0,
             skins: vec![],
+            skin_bones: None,
+            pose_changed: false,
             interior: 0.0,
             lit: 0.0,
             tilt: Mat4::IDENTITY,
