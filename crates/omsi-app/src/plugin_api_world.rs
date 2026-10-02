@@ -1,10 +1,10 @@
 //! Main-thread native access to live scenery, AI vehicles and traffic light programs.
 //! Handles describe native loaded instances, not OMSI's unrelated memory-array indexes.
 
-use crate::{scene::World, App};
+use crate::{App, scene::World};
 use omsi_script::{Program, State};
 use omsi_sim::scenery::SceneryInstance;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 
 pub(crate) fn execute(app: &mut App, op: &str, args: &Value) -> Option<Result<Value, String>> {
@@ -1055,7 +1055,8 @@ fn path_row(index: usize, lane: &omsi_sim::traffic::Lane) -> Value {
         "file_name":lane.name,"kind":format!("{:?}",lane.kind).to_lowercase(),"reversed":lane.reversed,
         "width_m":lane.width,"length_m":lane.length(),"speed_limit_kmh":lane.speed_limit_kmh,
         "priority":lane.priority,"density":lane.density,"group_density":lane.group_density,
-        "no_cars":lane.no_cars,"no_trucks":lane.no_trucks,"turn":lane.turn,
+        "no_cars":lane.no_cars,"no_trucks":!lane.rule_trucks,"turn":lane.turn,
+        "rule_bus":lane.rule_bus,"rule_trucks":lane.rule_trucks,
         "next":lane.next,"left":lane.left,"right":lane.right,"block_paths":lane.blocks,
         "traffic_light":lane.traffic_light.map(|(controller,index)|json!({"controller_index":controller,"light_index":index})),
     })
@@ -1143,22 +1144,25 @@ fn path_access(app: &mut App, op: &str, args: &Value) -> Result<Value, String> {
     let lane = &traffic.net.lanes[index];
     let mut result = path_row(index, lane);
     result["generation"] = json!(path_generation(traffic));
-    result["points"] = json!(lane
-        .points
-        .iter()
-        .map(|p| [p.x, p.y, p.z])
-        .collect::<Vec<_>>());
+    result["points"] = json!(
+        lane.points
+            .iter()
+            .map(|p| [p.x, p.y, p.z])
+            .collect::<Vec<_>>()
+    );
     result["headings_deg"] = json!(lane.headings);
     result["curvature_per_m"] = json!(lane.curvature);
     result["distances_m"] = json!(lane.dist);
     result["conflicts"] = json!(traffic.net.conflicts.get(index));
     result["previous"] = json!(traffic.net.prev.get(index));
-    result["reserved_by"] = json!(traffic
-        .cars
-        .iter()
-        .filter(|c| c.reserved.contains(&index))
-        .map(|c| format!("traffic:{}", c.api_id))
-        .collect::<Vec<_>>());
+    result["reserved_by"] = json!(
+        traffic
+            .cars
+            .iter()
+            .filter(|c| c.reserved.contains(&index))
+            .map(|c| format!("traffic:{}", c.api_id))
+            .collect::<Vec<_>>()
+    );
     Ok(result)
 }
 
@@ -1169,6 +1173,9 @@ fn path_rules_apply(lane: &mut omsi_sim::traffic::Lane, args: &Value) -> Result<
         .and_then(Value::as_object)
         .filter(|v| !v.is_empty())
         .ok_or("values must be a nonempty object")?;
+    if values.contains_key("no_trucks") && values.contains_key("rule_trucks") {
+        return Err("use either no_trucks or rule_trucks, not both".into());
+    }
     // Clone so all field types and bounds are checked before native rules change.
     let mut edited = lane.clone();
     for (name, value) in values {
@@ -1178,7 +1185,11 @@ fn path_rules_apply(lane: &mut omsi_sim::traffic::Lane, args: &Value) -> Result<
             "density" => edited.density = number(value, name, 0.0, 1000.0)?,
             "no_cars" => edited.no_cars = value.as_bool().ok_or("no_cars must be a boolean")?,
             "no_trucks" => {
-                edited.no_trucks = value.as_bool().ok_or("no_trucks must be a boolean")?
+                edited.rule_trucks = !value.as_bool().ok_or("no_trucks must be a boolean")?
+            }
+            "rule_bus" => edited.rule_bus = value.as_bool().ok_or("rule_bus must be a boolean")?,
+            "rule_trucks" => {
+                edited.rule_trucks = value.as_bool().ok_or("rule_trucks must be a boolean")?
             }
             "turn" => {
                 edited.turn = value
@@ -1255,11 +1266,13 @@ mod tests {
     #[test]
     fn light_program_edits_are_atomic_and_drive_real_phase_lookup() {
         let mut ctl = omsi_sim::traffic::TrafficLightController::new(vec![vec![(0, 30.0)]], 30.0);
-        assert!(light_state_apply(
-            &mut ctl,
-            &json!({"cycle":60,"lights":[[{"state":3,"duration":-1}]]})
-        )
-        .is_err());
+        assert!(
+            light_state_apply(
+                &mut ctl,
+                &json!({"cycle":60,"lights":[[{"state":3,"duration":-1}]]})
+            )
+            .is_err()
+        );
         assert_eq!(ctl.cycle, 30.0);
         light_state_apply(
             &mut ctl,
@@ -1349,14 +1362,16 @@ mod tests {
         );
         // The complete group is guarded, including an approach other than the
         // one the plugin wants to extend.
-        assert!(light_state_apply(
-            &mut ctl,
-            &json!({
-                "expected_phase_indices":[3,0],"time":12,
-            })
-        )
-        .unwrap_err()
-        .starts_with("traffic light phase precondition failed"));
+        assert!(
+            light_state_apply(
+                &mut ctl,
+                &json!({
+                    "expected_phase_indices":[3,0],"time":12,
+                })
+            )
+            .unwrap_err()
+            .starts_with("traffic light phase precondition failed")
+        );
         assert_eq!(light_row(123, &ctl), before);
         light_state_apply(
             &mut ctl,
@@ -1398,14 +1413,16 @@ mod tests {
             assert_eq!(light_row(123, &ctl), before);
         }
         // Equal color codes in adjacent phases do not make an old phase index current.
-        assert!(light_state_apply(
-            &mut ctl,
-            &json!({
-                "expected_phase_indices":[0],"time":0,
-            })
-        )
-        .unwrap_err()
-        .starts_with("traffic light phase precondition failed"));
+        assert!(
+            light_state_apply(
+                &mut ctl,
+                &json!({
+                    "expected_phase_indices":[0],"time":0,
+                })
+            )
+            .unwrap_err()
+            .starts_with("traffic light phase precondition failed")
+        );
         assert_eq!(light_row(123, &ctl), before);
         // An authored empty program is reported as phase -1 and can be guarded too.
         let mut empty = omsi_sim::traffic::TrafficLightController::new(vec![vec![]], 30.0);
@@ -1428,11 +1445,13 @@ mod tests {
             omsi_sim::traffic::LaneKind::Street,
             3.0,
         );
-        assert!(path_rules_apply(
-            &mut lane,
-            &json!({"values":{"speed_limit_kmh":30,"priority":"high"}})
-        )
-        .is_err());
+        assert!(
+            path_rules_apply(
+                &mut lane,
+                &json!({"values":{"speed_limit_kmh":30,"priority":"high"}})
+            )
+            .is_err()
+        );
         assert_eq!(lane.speed_limit_kmh, 50.0);
         assert!(path_rules_apply(&mut lane, &json!({"values":{"density":0,"missing":1}})).is_err());
         assert_eq!(lane.density, 1.0);
@@ -1444,17 +1463,38 @@ mod tests {
         assert_eq!(lane.speed_limit_kmh, 30.0);
         assert_eq!(lane.priority, 192.0);
         assert!(lane.no_cars);
+        path_rules_apply(
+            &mut lane,
+            &json!({"values":{"no_trucks":false,"rule_bus":true}}),
+        )
+        .unwrap();
+        assert!(lane.allows(2));
+        assert!(lane.allows(3));
+        assert_eq!(path_row(0, &lane)["no_trucks"], false);
+        assert!(
+            path_rules_apply(
+                &mut lane,
+                &json!({"values":{"no_trucks":true,"rule_trucks":true,"rule_bus":false}})
+            )
+            .is_err()
+        );
+        assert!(lane.rule_bus && lane.rule_trucks);
+        path_rules_apply(&mut lane, &json!({"values":{"rule_trucks":false}})).unwrap();
+        assert!(!lane.allows(3));
+        assert_eq!(path_row(0, &lane)["no_trucks"], true);
     }
 
     #[test]
     fn ai_driver_changes_are_atomic_and_reject_unmapped_state() {
         let mut state = omsi_sim::traffic::AiState::new(0, 0.0, 1);
         let initial_accel = state.accel;
-        assert!(behavior_apply(
-            &mut state,
-            &json!({"values":{"accel_mps2":3,"headway_s":0}})
-        )
-        .is_err());
+        assert!(
+            behavior_apply(
+                &mut state,
+                &json!({"values":{"accel_mps2":3,"headway_s":0}})
+            )
+            .is_err()
+        );
         assert_eq!(state.accel, initial_accel);
         assert!(
             behavior_apply(&mut state, &json!({"values":{"accel_mps2":3,"position":0}})).is_err()
@@ -1489,16 +1529,14 @@ mod tests {
 
     #[test]
     fn service_commands_obey_native_phase_and_update_both_departure_fields() {
-        let mut service = crate::bus_service::BusService::new(
-            vec![crate::bus_service::Stop {
-                ri: 0,
-                s: 10.0,
-                bay: 0.0,
-                depart: 120.0,
-                id: 42,
-                side: 0.0,
-            }],
-        );
+        let mut service = crate::bus_service::BusService::new(vec![crate::bus_service::Stop {
+            ri: 0,
+            s: 10.0,
+            bay: 0.0,
+            depart: 120.0,
+            id: 42,
+            side: 0.0,
+        }]);
         assert!(
             service_apply(&mut service, "traffic.service.hold", &json!({"seconds":10})).is_err()
         );
@@ -1506,12 +1544,14 @@ mod tests {
         service.phase = crate::bus_service::Phase::Boarding;
         service_apply(&mut service, "traffic.service.hold", &json!({"seconds":10})).unwrap();
         assert_eq!(service.boarding, 10.0);
-        assert!(service_apply(
-            &mut service,
-            "traffic.service.set_departure",
-            &json!({"departure_seconds":-1})
-        )
-        .is_err());
+        assert!(
+            service_apply(
+                &mut service,
+                "traffic.service.set_departure",
+                &json!({"departure_seconds":-1})
+            )
+            .is_err()
+        );
         assert_eq!(service.stops.front().unwrap().depart, 120.0);
         service_apply(
             &mut service,

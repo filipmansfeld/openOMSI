@@ -249,7 +249,13 @@ fn native_texture_pixels_leases_resize_and_placed_vehicle_cleanup() {
     let original = [255, 0, 0, 255].repeat(4);
     player.vehicle.host.script_textures[2].rgba = original.clone();
     player.vehicle.host.script_textures[2].dirty = true;
-    crate::scene::sync_vehicle_textures(&renderer, &mut scene, &mut player.vehicle, &player.render);
+    crate::scene::sync_vehicle_textures(
+        &renderer,
+        &mut scene,
+        &mut player.vehicle,
+        &player.render,
+        &mut { usize::MAX },
+    );
     let mut app = crate::new_app(
         crate::Args::parse_from(["openomsi", "--root", fixture.0.to_str().unwrap()]),
         crate::settings::Settings::default(),
@@ -318,6 +324,7 @@ fn native_texture_pixels_leases_resize_and_placed_vehicle_cleanup() {
             app.scene.as_mut().unwrap(),
             &mut player.vehicle,
             &player.render,
+            &mut { usize::MAX },
         );
     }
     assert_rgba(&app, texture, &rgba); // Script redraw cannot overwrite an external lease.

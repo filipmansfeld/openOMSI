@@ -230,7 +230,7 @@ fn lua_plugin_mutates_real_engine_state_and_rejects_stale_writes() {
     assert_eq!(v.host.temperature, -3.0);
     let p = app.player.as_mut().unwrap();
     let head_before = p.head.x;
-    p.move_head(0.016, true, false);
+    p.move_head(0.016, true);
     assert!(
         p.head.x < head_before && p.head_vel.x < 0.0,
         "the actual head spring must continue from the API state"
