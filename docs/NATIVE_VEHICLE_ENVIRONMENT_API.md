@@ -1,5 +1,31 @@
 # Native vehicle physics and weather
 
+### Cockpit pointer observations
+
+`vehicle.input_events` reads actual accepted mouse presses and releases on vehicle
+`[mouseevent]` meshes, including coupled sections. Supply `id` and `generation` from
+`vehicle.get`/`vehicle.list`, optional `after` as an unsigned decimal sequence string,
+and `limit` in 1–64 (default 64). Without `after`, the response contains no historical
+events and returns the current cursor. Reuse `next_after` for the next read. Reads
+are nondestructive, so each consumer maintains its own cursor. All sequence fields
+are strings, including `next_after`, `last_sequence` and each event's `sequence`.
+
+The instance retains its latest 128 events in chronological order. `missed=true`
+means older events after the supplied cursor were overwritten. A future cursor,
+invalid limit, stale generation, or old session is rejected. Unloading the vehicle
+ends the event lifetime; obtain the replacement's identity and cursor before reading.
+The snapshot advertises capability `vehicle_input_events` and operation
+`vehicle.input_events` for both Lua and the authenticated local bridge.
+
+Each event includes `section` (0 front, 1 first coupled section), the exact
+`trigger`/`mesh` from the model, `kind` (`down`/`up`), `pressed`, simulation time,
+and optional `uv` and `mesh_position`. Positions use the original mesh coordinates
+(x right, y up, z forward) before animation, body transforms or world placement.
+Coordinates are null for forgiving picks without an exact central-ray hit and for
+releases without a ray. Releasing while keeping a momentary switch held still
+reports the physical release but preserves the native no-`_off` behavior.
+Keyboard events and API-generated script triggers do not enter this pointer stream.
+
 Use `omsi.api(operation, arguments)`. Vehicle operations accept the identity described
 in [NATIVE_API.md](NATIVE_API.md): an explicit `id` requires its `generation` for writes;
 retained identities should also carry `session_id`. Omit the ID to follow the player.

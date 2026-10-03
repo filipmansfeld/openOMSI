@@ -2,6 +2,9 @@
 
 use super::*;
 
+#[path = "player/input_events.rs"]
+mod input_events;
+
 fn indicator_toggle_action(state: &mut u8, lever: Option<u8>, want: u8) -> &'static str {
     // Scripts can cancel the lever themselves after a turn; prefer their current state.
     if let Some(lever) = lever { *state = lever; }
@@ -1662,6 +1665,7 @@ impl Player {
                 .clone()
                 .unwrap();
             log::info!("mouse event {ev}");
+            input_events::record(&mut self.vehicle, 0, i, true, Some((origin, dir)));
             let plain = self.vehicle.trigger(&ev);
             self.repair_roller_blind(&ev);
             self.pressed_mesh = Some(i);
@@ -1676,6 +1680,7 @@ impl Player {
             .clone()
             .unwrap();
         log::info!("trailer mouse event {ev} (part {ti})");
+        input_events::record(&mut self.vehicle, ti + 1, i, true, Some((origin, dir)));
         self.vehicle.trigger(&ev);
         self.repair_roller_blind(&ev);
         self.pressed_trailer_mesh = Some((ti, i));
@@ -1742,14 +1747,18 @@ impl Player {
     /// column's adjustment, #769) until it is clicked and let go again.
     pub(crate) fn release_keeping(&mut self) {
         if let Some(i) = self.pressed_mesh.take() {
+            input_events::record(&mut self.vehicle, 0, i, false, None);
             let def = &self.vehicle.ty.model.meshes[self.vehicle.ty.meshes[i].def_index];
             log::info!("mouse event {:?}: let go with the right button held, the switch stays", def.mouse_event);
         }
-        self.pressed_trailer_mesh = None;
+        if let Some((ti, i)) = self.pressed_trailer_mesh.take() {
+            input_events::record(&mut self.vehicle, ti + 1, i, false, None);
+        }
     }
 
     pub(crate) fn release(&mut self) {
         if let Some(i) = self.pressed_mesh.take() {
+            input_events::record(&mut self.vehicle, 0, i, false, None);
             let ty = self.vehicle.ty.clone();
             let def = &ty.model.meshes[ty.meshes[i].def_index];
             if let Some(ev) = def.mouse_event.clone() {
@@ -1767,6 +1776,7 @@ impl Player {
             }
         }
         if let Some((ti, i)) = self.pressed_trailer_mesh.take() {
+            input_events::record(&mut self.vehicle, ti + 1, i, false, None);
             if let Some(ev) = self.vehicle.trailers[ti].ty.model.meshes
                 [self.vehicle.trailers[ti].ty.meshes[i].def_index]
                 .mouse_event

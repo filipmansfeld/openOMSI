@@ -841,6 +841,7 @@ pub struct VehicleInstance {
     /// so a write at the end of one frame reaches the following simulation step.
     native_controls: Option<Controls>,
     native_controls_restore: Option<Controls>,
+    input_events: crate::vehicle_input::InputEvents,
     /// `[texttexture]` states, parallel to `ty.model.text_textures`.
     pub text_textures: Vec<crate::texttex::TextTextureState>,
     pub html_textures: Vec<crate::htmltex::HtmlTexture>,
@@ -1126,6 +1127,7 @@ impl VehicleInstance {
             a_trans: OmsiFrames::default(),
             native_controls: None,
             native_controls_restore: None,
+            input_events: Default::default(),
             particles: ParticleSet::new(ty.model.particle_systems(), std::ptr::addr_of!(host) as u64 ^ 0x9e37_79b9),
             light_fade: Vec::new(),
             v_springfactor,
@@ -1280,6 +1282,20 @@ impl VehicleInstance {
 
     pub fn queued_native_controls(&self) -> Option<Controls> {
         self.native_controls
+    }
+
+    /// Called by accepted cockpit pointer input, never by synthetic script triggers.
+    pub fn record_pointer_input(&mut self, section: usize, trigger: String, mesh: String,
+        pressed: bool, uv: Option<[f32; 2]>, mesh_position: Option<[f32; 3]>) {
+        self.input_events.record(crate::vehicle_input::VehicleInputEvent {
+            sequence: 0, section, trigger, mesh, pressed,
+            simulation_seconds: self.host.clock.time, uv, mesh_position,
+        });
+    }
+
+    pub fn pointer_input_events(&self, after: Option<u64>, limit: usize)
+        -> Result<crate::vehicle_input::InputEventPage<'_>, String> {
+        self.input_events.page(after, limit)
     }
 
     fn get(&self, id: Option<omsi_script::VarId>) -> f32 {

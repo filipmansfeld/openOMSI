@@ -23,6 +23,7 @@ pub mod texttex;
 pub mod traffic;
 pub mod vehicle;
 pub mod vehicle_api;
+pub mod vehicle_input;
 
 pub use anim::{AnimState, MeshAnimator};
 pub use clock::SimClock;

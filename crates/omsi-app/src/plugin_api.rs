@@ -16,6 +16,7 @@ const NATIVE_OPERATIONS: &[&str] = &[
     "clock.set",
     "vehicle.list",
     "vehicle.get",
+    "vehicle.input_events",
     "vehicle.set_variables",
     "vehicle.trigger",
     "vehicle.set_speed",
@@ -361,6 +362,7 @@ impl ApiState {
                 ),
             )?,
             "vehicle.get"
+            | "vehicle.input_events"
             | "vehicle.set_variables"
             | "set_variables"
             | "vehicle.trigger"
@@ -391,6 +393,7 @@ impl ApiState {
                 !matches!(
                     operation,
                     "vehicle.get"
+                        | "vehicle.input_events"
                         | "vehicle.physics"
                         | "vehicle.physics.parameters"
                         | "vehicle.head"
@@ -405,6 +408,16 @@ impl ApiState {
         };
         if let Some(result) = crate::plugin_api_audio::execute(app, id, operation, args) {
             return result;
+        }
+        if operation == "vehicle.input_events" {
+            if args.get("generation").is_none()
+                || (args.get("id").is_none() && args.get("vehicle_id").is_none()) {
+                return Err("id and generation from vehicle.list or vehicle.get are required for input events".into());
+            }
+            let mut result = crate::plugin_api_vehicle::input_events(&player(app, id)?.vehicle, args)?;
+            result["id"] = json!(id.to_string());
+            result["generation"] = json!(self.vehicles[&id].1.to_string());
+            return Ok(result);
         }
         if let Some(result) = crate::plugin_api_particles::execute(app, id, operation, args) {
             return result;
@@ -795,7 +808,7 @@ fn snapshot_value(
         .as_ref()
         .map(|p| vehicle_snapshot(app, p, generation, hof));
     json!({"session_id":session,"sequence":sequence,
-        "capabilities":["variables","scenery_variables_source","script_texture","script_texture_release","invalidate_texture","hof","timetable_basic","set_clock","native_api","traffic_light_phase_precondition"],
+        "capabilities":["variables","scenery_variables_source","script_texture","script_texture_release","invalidate_texture","hof","timetable_basic","set_clock","native_api","traffic_light_phase_precondition","vehicle_input_events"],
         "native_operations":NATIVE_OPERATIONS,
         "map_name":app.world.as_ref().map(|w|w.global.name.as_str()).unwrap_or(""),
         "game_root":app.args.root.to_string_lossy(),

@@ -26,6 +26,29 @@ fn number(value: &Value, name: &str) -> Result<f64, String> {
         .ok_or_else(|| format!("{name} must be a finite number"))
 }
 
+pub(crate) fn input_events(vehicle: &VehicleInstance, args: &Value) -> Result<Value, String> {
+    keys(args, &["after", "limit"])?;
+    let after = args.get("after").map(|value| {
+        let value = value.as_str().filter(|text| !text.is_empty()
+            && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .ok_or("after must be an unsigned decimal sequence string")?;
+        value.parse::<u64>().map_err(|_| "after exceeds the unsigned 64-bit range")
+    }).transpose()?;
+    let limit = args.get("limit").map(|value| value.as_u64()
+        .filter(|n| (1..=64).contains(n)).ok_or("limit must be an integer in 1..64"))
+        .transpose()?.unwrap_or(64) as usize;
+    let page = vehicle.pointer_input_events(after, limit)?;
+    let events: Vec<_> = page.events.iter().map(|event| json!({
+        "sequence":event.sequence.to_string(), "section":event.section,
+        "trigger":event.trigger, "mesh":event.mesh,
+        "kind":if event.pressed { "down" } else { "up" }, "pressed":event.pressed,
+        "simulation_seconds":event.simulation_seconds,
+        "uv":event.uv, "mesh_position":event.mesh_position,
+    })).collect();
+    Ok(json!({"events":events,"next_after":page.next_after.to_string(),
+        "last_sequence":page.last_sequence.to_string(),"missed":page.missed}))
+}
+
 pub(crate) fn world_position(value: &Value) -> Result<DVec3, String> {
     let p = value
         .as_object()
