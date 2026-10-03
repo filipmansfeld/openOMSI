@@ -502,6 +502,7 @@ pub fn terrain_hole_profiles(def: &Spline) -> Vec<Vec<[f32; 3]>> {
         return def.terrain_hole_profiles.clone();
     }
     const JOIN: f32 = 0.01;
+    const INSET: f32 = 0.03;
     let profiles: Vec<Vec<(f32, f32)>> = def.profiles.iter().map(|p| p.points.iter().map(|q| (q.x, q.z)).collect()).collect();
     let mut used = vec![false; profiles.len()];
     let mut out = Vec::new();
@@ -537,6 +538,12 @@ pub fn terrain_hole_profiles(def: &Spline) -> Vec<Vec<[f32; 3]>> {
                 }
             }
         }
+        // An automatic trough needs positive width after both insets. Thin overhead
+        // wires otherwise produce an inverted cut with terrain walls up to the wire.
+        // Explicit terrainholeprofiles returned above keep their authored dimensions.
+        if xl + INSET >= xr - INSET {
+            continue;
+        }
         let points = || chain.iter().flat_map(|&j| profiles[j].iter().copied());
         let low = points().fold(zl.min(zr), |m, (_, z)| m.min(z));
         let bottom_left = if low < zl {
@@ -550,7 +557,7 @@ pub fn terrain_hole_profiles(def: &Spline) -> Vec<Vec<[f32; 3]>> {
             (xr - xl) * 3.0 / 4.0 + xl
         };
         let low = low - 0.1;
-        out.push(vec![[xl + 0.03, zl - 0.003, 0.0], [bottom_left, low, -0.5], [bottom_right, low, -0.5], [xr - 0.03, zr - 0.003, 0.0]]);
+        out.push(vec![[xl + INSET, zl - 0.003, 0.0], [bottom_left, low, -0.5], [bottom_right, low, -0.5], [xr - INSET, zr - 0.003, 0.0]]);
     }
     out
 }

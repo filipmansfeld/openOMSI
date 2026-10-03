@@ -421,6 +421,61 @@ mod tests {
     }
 
     #[test]
+    fn automatic_holes_reject_inverted_wire_profiles_but_keep_authored_narrow_cuts() {
+        use omsi_scenery::sli::{SplineProfile, SplineProfilePoint};
+        let profile = |x0, x1, z| SplineProfile {
+            points: [x0, x1]
+                .into_iter()
+                .map(|x| SplineProfilePoint {
+                    x,
+                    z,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut def = Spline {
+            profiles: vec![
+                profile(-2.0, 2.0, 0.0),
+                profile(0.0, 0.02, 5.0), // The two 3 cm insets invert a thin wire.
+                profile(0.0, 0.06, 6.0), // An exactly collapsed trough also has no width.
+            ],
+            ..Default::default()
+        };
+        let curve = SplineCurve::from_map(
+            &MapSpline {
+                pos: [40.0, 40.0, 10.0],
+                length: 20.0,
+                ..Default::default()
+            },
+            DVec2::ZERO,
+        );
+        assert_eq!(crate::terrain_hole_profiles(&def).len(), 1);
+        for mirror in [false, true] {
+            let rims = spline_hole_rims(&def, &curve, mirror, 1);
+            assert_eq!(rims.len(), 1);
+            let walls = terrain_hole_walls(&rims, &terrain(1, |_, _| 12.0));
+            assert!(!walls.indices.is_empty());
+            assert!(walls.positions.iter().all(|p| p.z <= 12.0));
+        }
+        // Width validity is independent of elevation: an authored elevated surface
+        // with enough room for both insets still connects to the terrain.
+        def.profiles.push(profile(3.0, 5.0, 20.0));
+        assert_eq!(crate::terrain_hole_profiles(&def).len(), 2);
+        let rims = spline_hole_rims(&def, &curve, false, 1);
+        assert!(rims.iter().flatten().any(|p| p.z > 29.0));
+
+        let authored = vec![vec![[0.0, 5.0, 0.0], [0.02, 5.0, 0.0]]];
+        def.terrain_hole_profiles = authored.clone();
+        assert_eq!(crate::terrain_hole_profiles(&def), authored);
+        let rims = spline_hole_rims(&def, &curve, false, 1);
+        assert_eq!(rims.len(), 1);
+        let walls = terrain_hole_walls(&rims, &terrain(1, |_, _| 12.0));
+        assert!(!walls.indices.is_empty());
+        assert!(walls.positions.iter().any(|p| p.z == 15.0));
+    }
+
+    #[test]
     fn object_rims_weld_seams_keep_transformed_heights_and_reject_closed_meshes() {
         let a = Vec3::new(0.0, 0.0, -2.0);
         let b = Vec3::new(4.0, 0.0, -1.0);
