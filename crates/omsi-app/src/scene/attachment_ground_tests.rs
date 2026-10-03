@@ -6,10 +6,14 @@ fn ground(height: f32) -> Terrain {
 }
 
 fn object_type() -> Arc<ObjectType> {
+    // Attachment operations are bare SCO subcommands, unlike [new_attachment].
+    let sco = SceneryObject::parse(&omsi_cfg::CfgFile::from_str(
+        "parent.sco", "[new_attachment]\nattach_trans\n2\n3\n4\n",
+    ));
+    assert_eq!(sco.attachments.len(), 1);
+    assert_eq!(sco.attachments[0].ops, vec![("attach_trans".to_string(), vec![2.0, 3.0, 4.0])]);
     Arc::new(ObjectType {
-        sco: SceneryObject::parse(&omsi_cfg::CfgFile::from_str(
-            "parent.sco", "[new_attachment]\n[attach_trans]\n2\n3\n4\n",
-        )),
+        sco,
         sound_path: Default::default(),
         model: Model::default(),
         model_dir: PathBuf::new(),
