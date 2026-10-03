@@ -9833,7 +9833,7 @@ pub(crate) fn attach_pbr(renderer: &Renderer, scene: &mut Scene, path: &Path, id
         return;
     }
     if let Some(set) = omsi_texture::pbr::load_set(&files) {
-        log::info!("PBR maps for {}: normal {:?}, occlusion/roughness/metal {:?}", path.display(), set.normal.as_ref().map(|i| (i.width, i.height)), set.flags);
+        log::info!("PBR maps for {}: normal {:?}, occlusion/roughness/metal {:?}, height range {} m", path.display(), set.normal.as_ref().map(|i| (i.width, i.height)), set.flags, set.height_scale);
         renderer.add_pbr_maps(scene, id, &set);
     }
 }
