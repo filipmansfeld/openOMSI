@@ -1705,12 +1705,18 @@ mod tests {
         let content = dir.join("content");
         omsi_cfg::ensure_content_layout(&content).unwrap();
         let zip = dir.join("Big.zip");
-        let files: Vec<(String, usize)> = (0..400).map(|i| (format!("Vehicles/Big/Texture/t{i}.dds"), 200_000)).collect();
-        let refs: Vec<(&str, usize)> = files.iter().map(|(n, s)| (n.as_str(), *s)).collect();
-        let mut with_bus = refs.clone();
-        with_bus.push(("Vehicles/Big/big.bus", 10));
-        write_zip(&zip, &with_bus);
-        let p = run_blocking(content.clone(), None, zip, InstallMode::Extract, Some(std::time::Duration::from_millis(1)), false);
+        write_zip(&zip, &[("Vehicles/Big/big.bus", 10), ("Vehicles/Big/Texture/a.dds", 2000), ("Vehicles/Big/Texture/b.dds", 2000)]);
+        // Hold the worker after real partial extraction instead of racing its speed
+        // against run_blocking's 50 ms polling interval on a fast filesystem.
+        let job = start_inner(content.clone(), None, zip, InstallMode::Extract, false, 2);
+        wait_for(&job, 2);
+        let partial = job.snapshot();
+        let staged = staging_dir(&content, job.id).exists();
+        job.cancel();
+        let p = wait_done(&job);
+        assert_eq!(partial.files_done, 2, "{partial:?}");
+        assert!(partial.finished.is_none(), "{partial:?}");
+        assert!(staged, "real partial files were staged before cancelling");
         assert_eq!(p.state, "cancelled", "{p:?}");
         assert!(!content.join("Vehicles/Big").exists());
         assert!(!content.join(STAGING).exists());
