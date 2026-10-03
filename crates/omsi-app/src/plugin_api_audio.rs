@@ -1,7 +1,7 @@
 //! Vehicle sound definitions and mixer-backed playback, after central identity checks.
 use crate::App;
 use omsi_audio::{AudioEngine, SoundSet};
-use omsi_vehicle::sound::Condition;
+use omsi_vehicle::sound::{Condition, ConditionKind};
 use omsi_vehicle::{SoundEntry, VolCurve};
 use serde_json::{json, Value};
 
@@ -137,6 +137,7 @@ fn patch(
                     .map(|c| {
                         exact_object(c, &["variable", "relation", "value"])?;
                         Ok(Condition {
+                            kind: ConditionKind::Single,
                             variable: variable(&c["variable"])?,
                             relation: c["relation"]
                                 .as_u64()
@@ -398,11 +399,15 @@ mod tests {
             &original,
             1.0,
             &json!({"volume":0.8,"pitch_multiplier":2.0,
+            "conditions":[{"variable":"rpm","relation":4,"value":2.5}],
             "volume_curves":[{"variable":"rpm","points":[[0,0],[1,1]]}]}),
             &|n| n == "rpm",
         )
         .unwrap();
         assert_eq!((updated.volume, pitch), (0.8, 2.0));
         assert_eq!(updated.vol_curves.len(), 1);
+        assert_eq!(updated.conditions[0].kind, ConditionKind::Single);
+        assert!(updated.conditions[0].holds(2.5));
+        assert!(!updated.conditions[0].holds(3.0));
     }
 }

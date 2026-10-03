@@ -41,7 +41,9 @@ An integer filename retains the engine's dynamic-file-entry convention; it does
 not itself supply a decoded clip for explicit playback.
 
 Conditions are `{variable, relation, value}` records using native relation codes
-0 through 5. Volume curves are `{variable, points: [[x,y], ...]}` records with
+0 through 5. Writes create floating-point (`conditionSingle`) conditions, compared
+exactly by the current engine; integer/boolean condition kinds are not writable
+through this record format. Volume curves are `{variable, points: [[x,y], ...]}` records with
 strictly increasing x coordinates. Curve variable `"-1"` reads time since
 activation for explicit playback; ordinary triggered entries retain the current
 engine's uptime-based convention. `"-2"` reads listener-facing direction. Up to 64 conditions, curves

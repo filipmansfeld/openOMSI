@@ -3000,7 +3000,7 @@ impl Humans {
         self.remote_now.retain(|b| b.id != bus);
         if let BusId::Ai(id) = bus {
             self.ai_visits.remove(&id);
-            self.holds.retain(|(b, _)| *b != id);
+            self.holds.retain(|(b, _, _)| *b != id);
             self.ai_requests.retain(|(b, _, _)| *b != id);
         }
         if bus == BusId::Player {
