@@ -97,9 +97,11 @@ road cutouts and diffuse alpha coverage keep their original coordinates. Deep pa
 still need authored geometry if those effects matter. Content without PBR sidecars and
 Vanilla graphics keep their current paths.
 
-For an identical-content comparison, launch with `OMSI_PARALLAX=0` to disable parallax
-while retaining the height-derived normals and roughness. Parallax is enabled by default;
-restart the renderer after changing this environment variable. Its cost depends on the
+The Graphics settings' **Parallax** checkbox enables or disables the effect and is saved
+with the selected graphics profile. It applies when the game starts; height-derived
+normals and roughness stay enabled when parallax is off. Parallax is enabled by default.
+For an identical-content diagnostic comparison, launch with `OMSI_PARALLAX=0` to disable
+it as well; restart the renderer after changing this environment variable. Its cost depends on the
 pixels covered by eligible materials, the view angle and the graphics device; measure
 the same scene, camera and graphics settings when comparing performance.
 
