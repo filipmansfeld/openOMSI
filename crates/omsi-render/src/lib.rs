@@ -1478,6 +1478,9 @@ pub struct RenderOptions {
     /// Mali and Adreno drivers before the first frame, #364, #333, #316, #371). Asked for,
     /// they are built on every device and graphics API; a computer always builds them.
     pub no_enhanced: bool,
+    /// Authored height parallax in Enhanced graphics. Normal shading stays enabled
+    /// when this is off; OMSI_PARALLAX=0 also disables it for comparisons.
+    pub height_parallax: bool,
 }
 
 impl Default for RenderOptions {
@@ -1496,6 +1499,7 @@ impl Default for RenderOptions {
             shadow_blobs: true,
             reflections: true,
             no_enhanced: false,
+            height_parallax: true,
         }
     }
 }
@@ -2316,7 +2320,7 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
         };
-        let height_parallax = omsi_cfg::env::var("OMSI_PARALLAX").as_deref() != Ok("0");
+        let height_parallax = options.height_parallax && omsi_cfg::env::var("OMSI_PARALLAX").as_deref() != Ok("0");
         let make = |format: wgpu::TextureFormat,
                     fs: &str,
                     blend: Option<wgpu::BlendState>,
