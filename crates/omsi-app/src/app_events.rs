@@ -1153,6 +1153,20 @@ impl ApplicationHandler for App {
                 *self.profile.entry("player").or_default() += __t.elapsed().as_secs_f64();
                 let __t = Instant::now();
                 self.tick_lan(dt);
+                let duty_confirmed = self.duty.as_ref().is_some_and(|d| self.lan.as_ref()
+                    .is_none_or(|l| l.tour_claim_confirmed(&format!("{}/{}", d.line, d.tour))));
+                let duty_activated = duty_confirmed && self.lan.as_ref()
+                    .is_some_and(|l| l.role == omsi_net::Role::Client && l.exclusive_tours()) &&
+                    self.player.as_ref().is_some_and(|p| p.vehicle.host.schedule_active < 0.5);
+                if let Some(p) = self.player.as_mut() {
+                    let h = &mut p.vehicle.host;
+                    if !duty_confirmed { h.schedule_active = 0.0; }
+                    else if !self.paused { h.schedule_active = 1.0; }
+                    if self.duty.is_some() && !duty_confirmed {
+                        h.tt_line.clear(); h.tt_stops.clear(); h.tt_stop_ids.clear();
+                        h.tt_busstop_index = -1; h.tt_terminus_index = -1; h.tt_delay = 0.0;
+                    }
+                }
                 // (a stage of its own: a joining player's bus is loaded here, and that frame
                 // was counted as the people's)
                 *self.profile.entry("lan").or_default() += __t.elapsed().as_secs_f64();
@@ -1190,7 +1204,7 @@ impl ApplicationHandler for App {
                         // (OMSI's `AIPassFactor`, the passengers setting in per cent)
                         * self.settings.pax_density;
                     h.time_of_day = self.clock.time;
-                    h.delay = self.duty.as_ref().map(|d| d.delay(self.clock.time)).unwrap_or(0.0);
+                    h.delay = self.duty.as_ref().filter(|_| duty_confirmed).map(|d| d.delay(self.clock.time)).unwrap_or(0.0);
                     self.humans_populate_t -= dt;
                     if self.humans_populate_t <= 0.0 && !self.paused {
                         self.humans_populate_t = 2.0;
@@ -1272,7 +1286,7 @@ impl ApplicationHandler for App {
                     self.duty.as_mut(),
                     self.player.as_mut(),
                     self.world.as_ref(),
-                    self.paused,
+                    self.paused || !duty_confirmed,
                 ) {
                     if let Some(stop) = p.html_next_stop.take() {
                         if d.skip_to(stop) {
@@ -1283,7 +1297,7 @@ impl ApplicationHandler for App {
                     if let Some((arrival, departure)) = d.update(&mut p.vehicle, self.clock.time) {
                         self.career.stop_served(arrival, departure);
                     }
-                    if d.take_trip_change() && p.duty_typed {
+                    if duty_activated || (d.take_trip_change() && p.duty_typed) {
                         let (trip, stop) = d.trip_for_ibis();
                         p.set_duty_destination(trip, stop);
                     }
@@ -1300,7 +1314,8 @@ impl ApplicationHandler for App {
                     let riders = self.humans.as_ref().map(|h| h.riding()).unwrap_or(0);
                     // the engine's own variables of the bus (see `update_engine_vars`)
                     p.vehicle.host.humans_count = riders as f32;
-                    p.vehicle.host.schedule_active = if self.duty.is_some() { 1.0 } else { 0.0 };
+                    // The confirmed flag was applied before passengers above. Do not
+                    // consume a pending duty's first activation while the game is paused.
                     let crash = std::mem::take(&mut p.vehicle.last_crash);
                     // (a frame after the session was written must not start another one)
                     if !self.exiting && !self.paused {

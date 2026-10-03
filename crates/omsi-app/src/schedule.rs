@@ -3535,6 +3535,22 @@ impl Schedule {
         n
     }
 
+    /// End a locally selected duty after the host refused it. Future departures can
+    /// return to AI, unless another accepted LAN player still owns the tour.
+    pub fn release_player_tour(&mut self) {
+        let Some((line, tour)) = self.player_tour.take() else { return };
+        let departure = self.player_departure.take();
+        self.purge_player_tour = false;
+        for i in 0..self.departures.len() {
+            let d = &self.departures[i];
+            if d.line.eq_ignore_ascii_case(&line) && d.tour.eq_ignore_ascii_case(&tour) &&
+                departure.is_none_or(|time| (d.time - time).abs() < 30.0) &&
+                d.time > self.last_tod && !self.is_player_tour(i) {
+                self.departures[i].spawned = false;
+            }
+        }
+    }
+
     /// LAN play (host): the tours the other players drive now. A tour taken leaves the
     /// timetable like the player's own (its bus on the road goes); one given up (the player
     /// left, or took another duty) runs again from its next departure.

@@ -8,6 +8,11 @@ pub(crate) fn run_offscreen(
     mut lan_off: Option<omsi_net::LanSession>,
     mut remotes_off: lan::LanGame,
 ) -> Result<()> {
+    if args.server.is_some() {
+        if let Some(l) = lan_off.as_mut() {
+            l.configure_dedicated(crate::server::SERVER_MAX_PLAYERS.get().copied().unwrap_or(omsi_net::MAX_PEERS));
+        }
+    }
     let (w, h) = args
         .size
         .split_once('x')
@@ -100,14 +105,13 @@ pub(crate) fn run_offscreen(
                 if let Some(k) = args.duty_trip {
                     d.start_at(k, args.duty_first_stop);
                 }
-                d.update(&mut p.vehicle, parse_time(&args.time));
-                let mut fonts = world.fonts.lock();
-                if let Err(e) = crate::schedule_paper::update_vehicle(
-                    &mut p.vehicle,
-                    &d,
-                    &mut fonts,
-                ) {
-                    log::warn!("driver timetable paper: {e:#}");
+                let confirmed = lan_off.as_ref().is_none_or(|l| l.tour_claim_confirmed(&format!("{}/{}", d.line, d.tour)));
+                if confirmed {
+                    d.update(&mut p.vehicle, parse_time(&args.time));
+                    let mut fonts = world.fonts.lock();
+                    if let Err(e) = crate::schedule_paper::update_vehicle(&mut p.vehicle, &d, &mut fonts) {
+                        log::warn!("driver timetable paper: {e:#}");
+                    }
                 }
                 log::info!(
                     "duty: line {} tour {} trip {} next stop {} ({}) delay {:.0} s, stops {:?}",
@@ -143,7 +147,8 @@ pub(crate) fn run_offscreen(
         }
     }
     if let Some(p) = player.as_mut() {
-        let active = if duty.is_some() { 1.0 } else { 0.0 };
+        let active = if duty.as_ref().is_some_and(|d| lan_off.as_ref()
+            .is_none_or(|l| l.tour_claim_confirmed(&format!("{}/{}", d.line, d.tour)))) { 1.0 } else { 0.0 };
         p.vehicle.host.schedule_active = active;
         p.vehicle.set_var("schedule_active", active);
     }
@@ -364,7 +369,9 @@ pub(crate) fn run_offscreen(
             l.clock_speed = *speed;
         }
     }
+    let mut srv_ticks = crate::server::TickMetrics::default();
     for i in 0..total_frames {
+        let tick_started = server.then(std::time::Instant::now);
         let t_s = i as f32 * dt;
         if server {
             srv_clock += dt as f64 * lan_off.as_ref().map(|l| l.clock_speed).unwrap_or(1.0);
@@ -467,9 +474,6 @@ pub(crate) fn run_offscreen(
                 if let Some(l) = lan_off.as_ref() {
                     crate::server::tick_status(l, parse_time(&args.time) + srv_clock + srv_admin.shift, srv_weather_name.as_str());
                 }
-            }
-            if lan_off.is_none() {
-                std::thread::sleep(std::time::Duration::from_secs_f32(dt));
             }
         }
         if let Some(t) = traffic.as_mut() {
@@ -593,7 +597,17 @@ pub(crate) fn run_offscreen(
         }
         if let Some(player) = player.as_mut() {
             player.tick_startup(dt);
-            if let Some(d) = duty.as_mut() {
+            let confirmed = duty.as_ref().is_some_and(|d| lan_off.as_ref()
+                .is_none_or(|l| l.tour_claim_confirmed(&format!("{}/{}", d.line, d.tour))));
+            let activated = confirmed && lan_off.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client && l.exclusive_tours())
+                && player.vehicle.host.schedule_active < 0.5;
+            player.vehicle.host.schedule_active = if confirmed { 1.0 } else { 0.0 };
+            if duty.is_some() && !confirmed {
+                let h = &mut player.vehicle.host;
+                h.tt_line.clear(); h.tt_stops.clear(); h.tt_stop_ids.clear();
+                h.tt_busstop_index = -1; h.tt_terminus_index = -1; h.tt_delay = 0.0;
+            }
+            if let Some(d) = duty.as_mut().filter(|_| confirmed) {
                 if let Some(stop) = player.html_next_stop.take() {
                     if d.skip_to(stop) {
                         let (trip, k) = d.trip_for_ibis();
@@ -605,7 +619,7 @@ pub(crate) fn run_offscreen(
                 {
                     career.stop_served(arrival, departure);
                 }
-                if d.take_trip_change() && player.duty_typed {
+                if activated || (d.take_trip_change() && player.duty_typed) {
                     let (trip, stop) = d.trip_for_ibis();
                     player.set_duty_destination(trip, stop);
                 }
@@ -1053,12 +1067,40 @@ pub(crate) fn run_offscreen(
                 &frame,
             );
             for u in updates {
-                if let (lan::WorldUpdate::Tours(tours), Some(s)) = (u, schedule.as_mut()) {
-                    s.set_lan_tours(tours);
+                match u {
+                    lan::WorldUpdate::Tours(tours) => {
+                        if let Some(s) = schedule.as_mut() { s.set_lan_tours(tours); }
+                    }
+                    lan::WorldUpdate::PolicyRejected(reply) => {
+                        let current = duty.as_ref().map(|d| format!("{}/{}", d.line, d.tour)).unwrap_or_default();
+                        let current_bus = player.as_ref().map(|p| lan::content_relative(&p.vehicle.ty.def.path, &args.root)).unwrap_or_default();
+                        let matches_bus = current_bus.replace('\\', "/").eq_ignore_ascii_case(&reply.bus.replace('\\', "/"));
+                        if (reply.vehicle && matches_bus) || (!reply.vehicle && omsi_net::policy::same_tour(&current, &reply.tour)) {
+                            duty = None;
+                            if let Some(s) = schedule.as_mut() { s.release_player_tour(); }
+                            if let Some(p) = player.as_mut() {
+                                let h = &mut p.vehicle.host;
+                                h.tt_line.clear(); h.tt_stops.clear(); h.tt_stop_ids.clear();
+                                h.tt_busstop_index = -1; h.tt_terminus_index = -1; h.tt_delay = 0.0;
+                            }
+                            if reply.vehicle {
+                                if let Some(mut p) = player.take() {
+                                    if let Some(h) = humans_off.as_mut() { h.evict(crate::humans::BusId::Player, &world); }
+                                    if let Some(mut d) = p.driver.take() { d.hide(&renderer, &mut scene); }
+                                    world.release_vehicle(&renderer, &mut scene, p.render);
+                                    for t in p.trailer_renders { world.release_vehicle(&renderer, &mut scene, t); }
+                                }
+                            }
+                            log::warn!("LAN: {}", reply.reason);
+                        }
+                    }
+                    _ => {}
                 }
             }
             // the other games run in real time
-            std::thread::sleep(std::time::Duration::from_secs_f32(dt));
+            if !server {
+                std::thread::sleep(std::time::Duration::from_secs_f32(dt));
+            }
         }
         // mid-run snapshots (relative to the first overtake with --follow auto)
         let auto_base = match args.follow.as_deref() {
@@ -1188,6 +1230,9 @@ pub(crate) fn run_offscreen(
                     cam.yaw
                 );
             }
+        }
+        if let Some(started) = tick_started {
+            srv_ticks.finish(started, std::time::Duration::from_secs_f32(dt), lan_off.as_ref().map(|l| l.player_count()).unwrap_or(0));
         }
     }
     if let Some(id) = follow_id(args, traffic.as_ref()) {

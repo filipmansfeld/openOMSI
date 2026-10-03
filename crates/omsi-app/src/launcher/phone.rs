@@ -325,16 +325,25 @@ fn bar(l: &mut Launcher, r: Rect, title: &str, search: bool) -> bool {
 
 /// A big row of a sheet: its title, a line under it, and whether it is the one chosen.
 fn big_row(ui: &mut super::ui::Ui, id: &str, r: Rect, title: &str, sub: &str, chosen: bool, badge: Option<(&str, Color)>) -> bool {
-    let clicked = ui.row(id, r, chosen);
+    big_row_state(ui, id, r, title, sub, chosen, badge, false, None)
+}
+
+fn big_row_state(ui: &mut super::ui::Ui, id: &str, r: Rect, title: &str, sub: &str, chosen: bool, badge: Option<(&str, Color)>, disabled: bool, availability: Option<&crate::game_lists::TourChoiceState>) -> bool {
+    let clicked = !disabled && ui.row(id, r, chosen);
+    if disabled { ui.p().rounded(r, 6.0, Color::rgba(38, 29, 29, 1.0)); }
     let tx = r.x + 16.0;
     let mut tw = r.w - 60.0;
-    if let Some((b, c)) = badge {
+    if let Some(status) = availability {
+        let bw = ui.width(status.label(), 11.5, Weight::Bold) + 16.0;
+        super::drive::tour_status_badge(ui, Vec2::new(r.right() - 48.0 - bw, r.y + 12.0), status);
+        tw -= bw + 12.0;
+    } else if let Some((b, c)) = badge {
         // (left of the check mark of the chosen row)
         let bw = ui.width(b, 10.0, Weight::Bold) + 10.0;
         ui.badge(Vec2::new(r.right() - 48.0 - bw, r.y + 23.0), b, c);
         tw -= bw + 12.0;
     }
-    ui.text_in(title, Rect::new(tx, r.y + 9.0, tw, 22.0), 15.5, Weight::Bold, TEXT, Align::Left);
+    ui.text_in(title, Rect::new(tx, r.y + 9.0, tw, 22.0), 15.5, Weight::Bold, if disabled { TEXT_FAINT } else { TEXT }, Align::Left);
     if !sub.is_empty() {
         ui.text_in(sub, Rect::new(tx, r.y + 32.0, r.w - 60.0, 18.0), 12.0, Weight::Regular, TEXT_DIM, Align::Left);
     }
@@ -798,6 +807,7 @@ fn duty_sheet(l: &mut Launcher, r: Rect) -> bool {
 }
 
 fn tour_sheet(l: &mut Launcher, r: Rect) -> bool {
+    super::drive::refresh_tour_status(l);
     let Some(line) = l.state.line().cloned() else {
         l.ui.text_in("Choose a line first.", Rect::new(r.x + 16.0, r.y, r.w, 40.0), 14.0, Weight::Regular, TEXT_DIM, Align::Left);
         return false;
@@ -813,11 +823,16 @@ fn tour_sheet(l: &mut Launcher, r: Rect) -> bool {
         })
         .collect();
     let chosen = l.state.choice.tour.clone();
+    let availability: Vec<_> = items.iter().map(|t| super::drive::selected_tour_status(l, &line.name, &t.0)).collect();
+    let online = l.state.choice.lan_mode == "join";
     let mut pick = None;
     l.ui.scroll_area("ps-tours", r, &mut |ui, v| {
         for (k, (num, sub, runs, next)) in items.iter().enumerate() {
             let rr = Rect::new(v.x, v.y + k as f32 * (ROW_H + 6.0), v.w - 8.0, ROW_H);
-            if big_row(ui, &format!("pt-{num}"), rr, &format!("Tour {num}"), sub, chosen.as_deref() == Some(num.as_str()), (!runs).then_some(("OTHER DAY", TEXT_FAINT))) {
+            let status = &availability[k];
+            let detail = if status.driver().is_empty() { sub.clone() } else { format!("{} · {sub}", status.driver()) };
+            let badge = if online { Some((status.label(), super::drive::tour_status_color(status))) } else { (!runs).then_some(("OTHER DAY", TEXT_FAINT)) };
+            if big_row_state(ui, &format!("pt-{num}"), rr, &format!("Tour {num}"), &detail, chosen.as_deref() == Some(num.as_str()), badge, !status.selectable(), online.then_some(status)) {
                 pick = Some((num.clone(), *runs, next.clone()));
             }
         }

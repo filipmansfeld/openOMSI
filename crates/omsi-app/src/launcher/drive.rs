@@ -425,6 +425,7 @@ fn step_bus(l: &mut Launcher, r: Rect) {
 }
 
 fn step_route(l: &mut Launcher, r: Rect) {
+    refresh_tour_status(l);
     let mut y = r.y;
     // the map (on a server: the server's, not to be changed)
     if let Some(name) = joined_server_name(l) {
@@ -551,16 +552,20 @@ fn step_route_rest(l: &mut Launcher, r: Rect, mut y: f32) {
         )
     }).collect();
     let chosen_t = l.state.choice.tour.clone();
+    let availability: Vec<_> = tours.iter().map(|t| selected_tour_status(l, &line.name, &t.0)).collect();
+    let online = l.state.choice.lan_mode == "join";
     let mut pick = None;
     l.ui.scroll_area("tour-list", Rect::new(right.x - 4.0, right.y + 30.0, right.w + 8.0, right.h - 30.0), &mut |ui, v| {
-        let rh = 84.0;
+        let rh = if online { 108.0 } else { 84.0 };
         for (k, (num, trips, days, runs, next, trip_time, from, terminus)) in tours.iter().enumerate() {
             let rr = Rect::new(v.x + 4.0, v.y + k as f32 * rh, v.w - 12.0, rh - 4.0);
             let on = chosen_t.as_deref() == Some(num.as_str());
-            if ui.row(&format!("tour-{num}"), rr, on) {
+            let status = &availability[k];
+            if status.selectable() && ui.row(&format!("tour-{num}"), rr, on) {
                 pick = Some((num.clone(), *runs, next.clone()));
             }
-            let c = if *runs { TEXT } else { TEXT_FAINT };
+            if !status.selectable() { ui.p().rounded(rr, 6.0, Color::rgba(38, 29, 29, 1.0)); }
+            let c = if *runs && status.selectable() { TEXT } else { TEXT_FAINT };
             // (the tour's name as the map writes it and OMSI lists it: "1", "Mo-Fr 1")
             let name = num.clone();
             ui.text_in(&name, Rect::new(rr.x + 10.0, rr.y + 5.0, rr.w - 110.0, 18.0), 13.5, Weight::Bold, c, Align::Left);
@@ -580,6 +585,12 @@ fn step_route_rest(l: &mut Launcher, r: Rect, mut y: f32) {
                 }
             };
             ui.text_in(&sub, Rect::new(rr.x + 10.0, rr.y + 61.0, rr.w - 20.0, 16.0), 11.0, Weight::Regular, TEXT_DIM, Align::Left);
+            if online {
+                let bw = tour_status_badge(ui, Vec2::new(rr.x + 10.0, rr.y + 80.0), status);
+                if !status.driver().is_empty() {
+                    ui.text_in(status.driver(), Rect::new(rr.x + 10.0 + bw, rr.y + 80.0, (rr.w - bw - 24.0).max(0.0), 22.0), 11.5, Weight::Medium, TEXT_SOFT, Align::Left);
+                }
+            }
         }
         tours.len() as f32 * rh + 4.0
     });
@@ -595,6 +606,42 @@ fn step_route_rest(l: &mut Launcher, r: Rect, mut y: f32) {
         l.state.choice.tour = Some(num);
         l.state.touched();
     }
+}
+
+pub(super) fn refresh_tour_status(l: &mut Launcher) {
+    if l.state.choice.lan_mode == "join" {
+        let address = l.state.joined_server.clone().unwrap_or_else(|| l.state.choice.lan_addr.clone());
+        if !address.is_empty() { l.state.ask_server(&address, 2.0); }
+    }
+}
+
+pub(super) fn selected_tour_status(l: &Launcher, line: &str, tour: &str) -> crate::game_lists::TourChoiceState {
+    use crate::game_lists::{tour_choice_state, TourChoiceState};
+    if l.state.choice.lan_mode != "join" { return TourChoiceState::Offline; }
+    let address = l.state.joined_server.as_ref().unwrap_or(&l.state.choice.lan_addr);
+    match l.state.server_info.get(address).and_then(|(_, value)| value.as_ref().ok()) {
+        Some(info) => tour_choice_state(info.exclusive_tours, info.tour_status_fresh(), &info.occupied_tours, line, tour, None),
+        None => TourChoiceState::Unknown { blocking: true },
+    }
+}
+
+pub(super) fn tour_status_color(status: &crate::game_lists::TourChoiceState) -> Color {
+    use crate::game_lists::TourChoiceState;
+    match status {
+        TourChoiceState::Free => OK, TourChoiceState::Mine => ACCENT_2,
+        TourChoiceState::Occupied(_) => DANGER,
+        TourChoiceState::Unknown { .. } | TourChoiceState::Unrestricted => WARN,
+        TourChoiceState::Offline => TEXT_DIM,
+    }
+}
+
+pub(super) fn tour_status_badge(ui: &mut super::ui::Ui, at: Vec2, status: &crate::game_lists::TourChoiceState) -> f32 {
+    let color = tour_status_color(status);
+    let width = ui.width(status.label(), 11.5, Weight::Bold) + 16.0;
+    let rect = Rect::new(at.x, at.y, width, 22.0);
+    ui.p().rounded(rect, 4.0, color.alpha(0.22));
+    ui.text_in(status.label(), rect, 11.5, Weight::Bold, color, Align::Center);
+    width + 8.0
 }
 
 pub(super) fn natural(s: &str) -> (u64, String) {
@@ -1129,6 +1176,7 @@ pub(super) fn start_from_phone(l: &mut Launcher) {
 }
 
 fn start(l: &mut Launcher) {
+    refresh_tour_status(l);
     if l.state.bus().is_none() || l.state.map().is_none() {
         l.state.set_status("Choose a bus and a map first.", true);
         return;
@@ -1137,6 +1185,20 @@ fn start(l: &mut Launcher) {
         let t = l.state.join.1.clone();
         l.state.set_status(format!("LAN: {t}"), true);
         return;
+    }
+    if !l.state.choice.free {
+        if let (Some(line), Some(tour)) = (&l.state.choice.line, &l.state.choice.tour) {
+            let status = selected_tour_status(l, line, tour);
+            if !status.selectable() {
+                let message = if status.driver().is_empty() {
+                    "Ověřuju obsazenost pořadí. Počkejte na odpověď serveru.".to_string()
+                } else {
+                    format!("Pořadí {line}/{tour} je obsazené: {}. Vyberte jiné.", status.driver())
+                };
+                l.state.set_status(message, true);
+                return;
+            }
+        }
     }
     let running = l.state.instances.iter().filter(|i| i.running).count();
     // a second game on one computer is for testing LAN play, not something to do by

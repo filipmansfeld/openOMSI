@@ -484,7 +484,10 @@ impl State {
         }
         self.server_asked.insert(address.to_string(), Instant::now());
         let a = address.to_string();
-        self.spawn(move || Msg::Server { info: omsi_net::ws::query(&a, true), address: a });
+        self.spawn(move || Msg::Server {
+            info: if omsi_net::looks_like_code(&a) { host_status(&a) } else { omsi_net::ws::query(&a, true) },
+            address: a,
+        });
     }
 
     /// The Drive page joins `address`: the server's map is the map, the session is joined.
@@ -493,11 +496,15 @@ impl State {
             self.set_status("The server has not answered yet (is its address right? is it running?)", true);
             return;
         };
-        if !self.maps.is_empty() && !self.maps.iter().any(|m| m.file.eq_ignore_ascii_case(&info.map)) {
+        let theirs = info.map.trim().replace('\\', "/");
+        let file = self.maps.iter().find(|m| m.file.eq_ignore_ascii_case(&theirs)).map(|m| m.file.clone());
+        if !self.maps.is_empty() && file.is_none() {
             self.set_status(format!("The server plays {}, which is not installed here: install that map first.", info.map), true);
             return;
         }
-        self.choice.map = info.map.clone();
+        // Changing the world also invalidates its timetable and entry point. Merely
+        // assigning the map kept the previous map's lines on the locked server page.
+        self.select_map(&file.unwrap_or(theirs));
         self.choice.lan_mode = "join".into();
         // (a server added by its bare address is joined where it answered: its web gateway)
         let bare = omsi_net::ws::ws_url(address).is_none() && !omsi_net::official::is_alias(address);
@@ -761,12 +768,8 @@ impl State {
                     if let Ok(i) = &info {
                         let theirs = i.map.trim().replace('\\', "/");
                         if let Some((file, name)) = self.maps.iter().find(|m| m.file.eq_ignore_ascii_case(&theirs)).map(|m| (m.file.clone(), m.name.clone())) {
-                            if !self.choice.map.eq_ignore_ascii_case(&file) {
-                                self.choice.map = file;
-                                self.choice.line = None;
-                                self.choice.tour = None;
-                                self.choice.entry = 0;
-                                self.touched();
+                            if self.choice.map != file || self.lines_for != (file.clone(), self.choice.date.clone()) {
+                                self.select_map(&file);
                                 self.set_status(format!("The host drives on {name}: that map is chosen"), false);
                             }
                         }
@@ -840,11 +843,13 @@ impl State {
                 }
             }
             Msg::Lines { map, date, lines } => {
+                // A request may finish after another map or date was chosen, including
+                // a server join. Never attach its timetable to the current choice.
+                if map != self.lines_for.0 || date != self.lines_for.1 || map != self.choice.map || date != self.choice.date {
+                    return;
+                }
                 if let Ok(ls) = lines.as_ref() {
                     crate::mt::protect(ls.iter().flat_map(|l| l.termini.iter().map(|t| t.as_str()).chain([l.name.as_str()])).chain(ls.iter().flat_map(|l| l.tours.iter().map(|t| t.number.as_str()))));
-                }
-                if (map, date) != self.lines_for {
-                    return;
                 }
                 self.loading_lines = false;
                 match lines {
@@ -857,6 +862,7 @@ impl State {
                                     note = format!(" - line {line} does not run on {}", self.choice.date);
                                     self.choice.line = None;
                                     self.choice.tour = None;
+                                    self.choice.start_trip = None;
                                 }
                                 Some(l) => {
                                     if let Some(t) = &self.choice.tour {
@@ -1069,13 +1075,14 @@ impl State {
     }
 
     pub fn select_map(&mut self, file: &str) {
-        if self.choice.map == file {
+        if self.choice.map == file && self.lines_for == (file.to_string(), self.choice.date.clone()) {
             return;
         }
         self.choice.map = file.to_string();
         self.choice.entry = -1;
         self.choice.line = None;
         self.choice.tour = None;
+        self.choice.start_trip = None;
         self.choice.hof = self.default_hof();
         self.lines.clear();
         self.load_lines();
@@ -1231,6 +1238,225 @@ mod choice_tests {
         c.plate = "B-AB 1234".into();
         let back: super::Choice = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back.plate, "B-AB 1234");
+    }
+}
+
+#[cfg(test)]
+mod map_switch_tests {
+    use super::*;
+
+    const BRNO: &str = "maps/Brno Lisen/global.cfg";
+    const PRAHA: &str = "maps/Praha 200/global.cfg";
+    const DATE: &str = "2026-10-06";
+    const SERVER: &str = "http://127.0.0.1:27025";
+
+    fn map(file: &str, name: &str) -> core::MapInfo {
+        core::MapInfo { name: name.into(), friendly: name.into(), file: file.into(), description: String::new(), entry_points: Vec::new(), hof: name.into(), installed: false }
+    }
+
+    fn line(name: &str) -> core::LineInfo {
+        core::LineInfo { name: name.into(), user_allowed: true, termini: Vec::new(), tours: Vec::new() }
+    }
+
+    // No State::new(): avoid initialization, network polling and the profile save
+    // timer. Exercise the transitions directly and deliver their replies explicitly.
+    fn state_on_brno() -> State {
+        let (tx, rx) = channel();
+        State {
+            config: core::Config { root: "__launcher_map_regression_no_content__".into(), ..Default::default() },
+            maps: vec![map(BRNO, "Brno"), map(PRAHA, "Praha")],
+            vehicles: Vec::new(),
+            weathers: Vec::new(),
+            lines: vec![line("78 Modrice-Zidenice")],
+            lines_for: (BRNO.into(), DATE.into()),
+            loading_content: false,
+            content_first: false,
+            reload_content: false,
+            loading_lines: false,
+            choice: Choice { map: BRNO.into(), date: DATE.into(), line: Some("78 Modrice-Zidenice".into()), tour: Some("Po-Ne 2".into()), entry: 7, start_trip: Some(("78 Modrice-Zidenice".into(), "Po-Ne 2".into(), 3, 540)), ..Default::default() },
+            choice_dirty: 0.0,
+            last_sit: None,
+            save_pick: 0,
+            profiles: Vec::new(),
+            profile: None,
+            settings: serde_json::Value::Null,
+            settings_dirty: 0.0,
+            settings_file: None,
+            keybindings: serde_json::Value::Null,
+            keybindings_error: String::new(),
+            instances: Vec::new(),
+            queued_launch: None,
+            launch_hold: None,
+            launched_pid: None,
+            crash: None,
+            jobs: Vec::new(),
+            mods: None,
+            mods_asked: false,
+            mod_info: None,
+            mod_path: String::new(),
+            mod_mode: 0,
+            ibis: None,
+            cmdline: String::new(),
+            join: (true, String::new()),
+            join_checked: String::new(),
+            logs: Default::default(),
+            open_logs: Default::default(),
+            stopping: Default::default(),
+            fresh: Default::default(),
+            status: (String::new(), false, Instant::now()),
+            stamp: None,
+            poll_t: 0.0,
+            polling: false,
+            second_armed: None,
+            servers: Vec::new(),
+            server_info: Default::default(),
+            server_asked: Default::default(),
+            joined_server: None,
+            tx,
+            rx,
+        }
+    }
+
+    fn server_info(file: &str) -> omsi_net::ws::ServerInfo {
+        omsi_net::ws::ServerInfo { map: file.into(), name: "Praha Tangenta".into(), ..Default::default() }
+    }
+
+    fn add_server(s: &mut State, file: &str) {
+        s.server_info.insert(SERVER.into(), (Instant::now(), Ok(server_info(file))));
+    }
+
+    fn assert_praha_loading(s: &State) {
+        assert_eq!(s.choice.map, PRAHA);
+        assert!(s.choice.line.is_none());
+        assert!(s.choice.tour.is_none());
+        assert!(s.choice.start_trip.is_none());
+        assert_eq!(s.choice.entry, -1);
+        assert_eq!(s.choice.hof, "Praha");
+        assert!(s.lines.is_empty(), "Brno lines must disappear immediately, before the async reply");
+        assert_eq!(s.lines_for, (PRAHA.into(), DATE.into()));
+        assert!(s.loading_lines);
+    }
+
+    #[test]
+    fn joining_praha_discards_brno_duty_and_requests_its_timetable() {
+        let mut s = state_on_brno();
+        add_server(&mut s, PRAHA);
+        s.join_server(SERVER);
+        assert_praha_loading(&s);
+        assert_eq!(s.joined_server.as_deref(), Some(SERVER));
+        assert_eq!(s.choice.lan_mode, "join");
+    }
+
+    #[test]
+    fn server_map_uses_the_installed_filename_case_and_slashes() {
+        let mut s = state_on_brno();
+        add_server(&mut s, "  MAPS\\pRaHa 200\\GLOBAL.CFG  ");
+        s.join_server(SERVER);
+        assert_praha_loading(&s);
+        assert!(s.map().is_some(), "map lookup must use the installed canonical filename");
+    }
+
+    #[test]
+    fn joining_an_uninstalled_map_keeps_the_current_duty_and_lines() {
+        let mut s = state_on_brno();
+        let before = serde_json::to_value(&s.choice).unwrap();
+        add_server(&mut s, "maps/Missing/global.cfg");
+        s.join_server(SERVER);
+        assert_eq!(serde_json::to_value(&s.choice).unwrap(), before);
+        assert_eq!(s.lines[0].name, "78 Modrice-Zidenice");
+        assert_eq!(s.lines_for, (BRNO.into(), DATE.into()));
+        assert!(s.joined_server.is_none());
+        assert!(!s.loading_lines);
+        assert!(s.status.1);
+    }
+
+    #[test]
+    fn joining_the_same_map_repairs_a_timetable_left_on_another_map() {
+        let mut s = state_on_brno();
+        s.choice.map = PRAHA.into();
+        add_server(&mut s, PRAHA);
+        s.join_server(SERVER);
+        assert_praha_loading(&s);
+    }
+
+    #[test]
+    fn choosing_the_same_map_reloads_a_timetable_for_a_previous_date() {
+        let mut s = state_on_brno();
+        s.choice.date = "2026-10-07".into();
+        s.select_map(BRNO);
+        assert_eq!(s.lines_for, (BRNO.into(), "2026-10-07".into()));
+        assert!(s.lines.is_empty());
+        assert!(s.choice.line.is_none());
+        assert!(s.loading_lines);
+    }
+
+    #[test]
+    fn rejoining_with_a_current_timetable_preserves_the_selected_duty() {
+        let mut s = state_on_brno();
+        s.choice.map = PRAHA.into();
+        s.choice.line = Some("102".into());
+        s.choice.tour = Some("1".into());
+        s.lines_for = (PRAHA.into(), DATE.into());
+        s.lines = vec![line("102")];
+        add_server(&mut s, PRAHA);
+        s.join_server(SERVER);
+        assert_eq!(s.choice.line.as_deref(), Some("102"));
+        assert_eq!(s.choice.tour.as_deref(), Some("1"));
+        assert_eq!(s.choice.entry, 7);
+        assert_eq!(s.lines[0].name, "102");
+        assert!(!s.loading_lines);
+    }
+
+    #[test]
+    fn a_typed_join_address_uses_the_same_map_transition() {
+        let mut s = state_on_brno();
+        s.choice.lan_mode = "join".into();
+        s.choice.lan_addr = SERVER.into();
+        s.handle(Msg::Server { address: SERVER.into(), info: Ok(server_info("MAPS\\PRAHA 200\\GLOBAL.CFG")) });
+        assert_praha_loading(&s);
+    }
+
+    #[test]
+    fn a_brno_reply_finishing_after_the_join_cannot_replace_praha_lines() {
+        let mut s = state_on_brno();
+        add_server(&mut s, PRAHA);
+        s.join_server(SERVER);
+        s.handle(Msg::Lines { map: BRNO.into(), date: DATE.into(), lines: Ok(vec![line("78 Modrice-Zidenice")]) });
+        assert_praha_loading(&s);
+        s.handle(Msg::Lines { map: PRAHA.into(), date: DATE.into(), lines: Ok(vec![line("102")]) });
+        assert_eq!(s.lines[0].name, "102");
+        assert!(!s.loading_lines);
+    }
+
+    #[test]
+    fn a_reply_matching_the_old_request_but_not_the_current_choice_is_rejected() {
+        let mut s = state_on_brno();
+        s.choice.map = PRAHA.into();
+        s.lines.clear();
+        s.loading_lines = true;
+        s.handle(Msg::Lines { map: BRNO.into(), date: DATE.into(), lines: Ok(vec![line("78 Modrice-Zidenice")]) });
+        assert!(s.lines.is_empty());
+        assert!(s.loading_lines);
+        s.choice.map = BRNO.into();
+        s.choice.date = "2026-10-07".into();
+        s.handle(Msg::Lines { map: BRNO.into(), date: DATE.into(), lines: Ok(vec![line("78 Modrice-Zidenice")]) });
+        assert!(s.lines.is_empty());
+        assert!(s.loading_lines);
+    }
+
+    #[test]
+    fn a_persisted_praha_choice_cannot_keep_a_foreign_line_after_its_timetable_loads() {
+        let mut s = state_on_brno();
+        s.choice.map = PRAHA.into();
+        s.lines.clear();
+        s.load_lines();
+        assert_eq!(s.lines_for, (PRAHA.into(), DATE.into()));
+        s.handle(Msg::Lines { map: PRAHA.into(), date: DATE.into(), lines: Ok(vec![line("102")]) });
+        assert!(s.choice.line.is_none());
+        assert!(s.choice.tour.is_none());
+        assert!(s.choice.start_trip.is_none());
+        assert_eq!(s.lines[0].name, "102");
+        assert!(!s.loading_lines);
     }
 }
 

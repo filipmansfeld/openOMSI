@@ -605,6 +605,7 @@ impl App {
         for (from, text) in cmds {
             self.lan_command(from, &text);
         }
+        crate::game_lists::refresh_tour_list(self);
     }
 
     /// A command another player's game sent ours (`LanSession::command`).
@@ -661,6 +662,26 @@ impl App {
             lan::WorldUpdate::Tours(tours) => {
                 if let Some(s) = self.schedule.as_mut() {
                     s.set_lan_tours(tours);
+                }
+            }
+            lan::WorldUpdate::PolicyRejected(reply) => {
+                let current = self.duty.as_ref().map(|d| format!("{}/{}", d.line, d.tour)).unwrap_or_default();
+                let current_bus = self.player.as_ref().map(|p| crate::lan::content_relative(&p.vehicle.ty.def.path, &self.args.root)).unwrap_or_default();
+                let bus_matches = current_bus.replace('\\', "/").eq_ignore_ascii_case(&reply.bus.replace('\\', "/"));
+                if (reply.vehicle && bus_matches) || (!reply.vehicle && omsi_net::policy::same_tour(&current, &reply.tour)) {
+                    self.duty = None;
+                    self.args.line = None;
+                    self.args.tour = None;
+                    self.args.trip = None;
+                    if let Some(s) = self.schedule.as_mut() { s.release_player_tour(); }
+                    if let Some(p) = self.player.as_mut() {
+                        let h = &mut p.vehicle.host;
+                        h.tt_line.clear(); h.tt_stops.clear(); h.tt_stop_ids.clear();
+                        h.tt_busstop_index = -1; h.tt_terminus_index = -1; h.tt_delay = 0.0;
+                    }
+                    if reply.vehicle { self.remove_driven_vehicle(); }
+                    self.service_msg = Some((reply.reason.clone(), 10.0));
+                    log::warn!("LAN: {}", reply.reason);
                 }
             }
         }

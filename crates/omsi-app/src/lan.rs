@@ -541,6 +541,8 @@ pub enum WorldUpdate {
     Weather(Option<String>),
     /// Host: the timetable tours the other players drive (line, tour; lower case).
     Tours(hashbrown::HashSet<(String, String)>),
+    /// The host refused this particular request, not a more recently selected duty.
+    PolicyRejected(omsi_net::PolicyReply),
 }
 
 /// What the game keeps about a session besides the transport: the other players' buses,
@@ -837,6 +839,18 @@ pub fn update_server_players(list: Vec<omsi_net::ws::PlayerInfo>) {
     }
 }
 
+fn update_server_tours(session: &LanSession) {
+    if let Ok(w) = WS_PATH.lock() {
+        if let Some(g) = w.as_ref().and_then(|w| w.gateway.as_ref()) {
+            if let Ok(mut i) = g.info.lock() {
+                i.exclusive_tours = session.exclusive_tours();
+                i.occupied_tours = session.occupied_tours();
+                i.tour_status_at = Some(Instant::now());
+            }
+        }
+    }
+}
+
 /// A server run: the admin commands that came to the web gateway's `POST /admin`.
 pub fn take_local_admin() -> Vec<String> {
     if let Ok(w) = WS_PATH.lock() {
@@ -907,6 +921,10 @@ pub fn start(args: &Args) -> Option<LanSession> {
         _ => None,
     };
     let mut session = session?;
+    if session.role == Role::Host && args.server.is_some() {
+        session.set_server_policy(crate::server::SERVER_VEHICLES.get().map(Vec::as_slice).unwrap_or(&[]),
+            crate::server::SERVER_EXCLUSIVE_TOURS.get().copied().unwrap_or(false));
+    }
     if let Some(c) = session.code() {
         log::info!(
             "LAN: other players join with the code {}  (or by an address: {})",
@@ -1507,7 +1525,7 @@ pub fn name_tags(game: &LanGame, cam: &omsi_render::Camera, width: f32, height: 
 
 /// A vehicle file as the other players' games find it: relative to whichever content root
 /// holds it (the original installation or the mods folder).
-fn content_relative(path: &Path, root: &Path) -> String {
+pub(crate) fn content_relative(path: &Path, root: &Path) -> String {
     let mut roots = omsi_cfg::content_roots();
     roots.push(root.to_path_buf());
     for r in roots {
@@ -2844,6 +2862,8 @@ pub fn tick(
         }
     }
     let gone = lan.tick(dt, &mine);
+    if lan.role == Role::Host { update_server_tours(lan); }
+    updates.extend(lan.take_policy_rejections().into_iter().map(WorldUpdate::PolicyRejected));
     game.world.tick(
         lan,
         dt,

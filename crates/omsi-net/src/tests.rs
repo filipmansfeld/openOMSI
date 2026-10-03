@@ -1006,6 +1006,7 @@ fn a_client_listens_to_its_host_only() {
 
 #[test]
 fn a_client_takes_a_limited_number_of_players() {
+    assert_eq!(MAX_PEERS, 64);
     let host = raw();
     let mut c = LanSession::join_addr(vec![host.local_addr().unwrap()], None, "c", world("m")).unwrap();
     host.send_to(welcome_msg(2).as_bytes(), to_client(&c))
@@ -1020,6 +1021,85 @@ fn a_client_takes_a_limited_number_of_players() {
     }
     assert!(c.connected);
     assert_eq!(c.peer_count(), MAX_PEERS);
+}
+
+fn raw_hello(nonce: u64) -> String {
+    format!("HELLO|{PROTOCOL}|-|p{nonce}|Vehicles/x.bus|{}|{nonce:016X}", world("m").fields())
+}
+
+/// Join through the actual UDP transport, then send a state so loading admission stays bounded.
+fn admit_raw_player(host: &mut LanSession, nonce: u64) -> (UdpSocket, u32, usize) {
+    let socket = raw();
+    let at = SocketAddr::from((Ipv4Addr::LOCALHOST, host.local_addr().unwrap().port()));
+    socket.send_to(raw_hello(nonce).as_bytes(), at).unwrap();
+    let mut buf = [0u8; MAX_DATAGRAM];
+    let mut welcome = None;
+    for _ in 0..30 {
+        host.tick(0.01, &Pose::default());
+        if let Ok((n, _)) = socket.recv_from(&mut buf) {
+            let text = String::from_utf8_lossy(&buf[..n]);
+            let parts: Vec<_> = text.split('|').collect();
+            if parts[0] == "WELCOME" {
+                welcome = Some((field(&parts, 2).parse::<u32>().unwrap(), field(&parts, 10).parse::<usize>().unwrap()));
+                break;
+            }
+        }
+    }
+    let (id, players) = welcome.unwrap_or_else(|| panic!("player {nonce} welcomed"));
+    socket.send_to(&state_of(id, nonce as f64), at).unwrap();
+    host.tick(0.01, &Pose::default());
+    (socket, id, players)
+}
+
+#[test]
+fn a_dedicated_fifty_player_session_enforces_capacity_and_allows_reconnect() {
+    let mut host = LanSession::host(0, "server", world("m"), false).unwrap();
+    assert_eq!(host.player_count(), 1, "ordinary hosting still counts the host");
+    host.configure_dedicated(50);
+    assert_eq!(host.player_count(), 0, "the dedicated host occupies no slot");
+    let players: Vec<_> = (100..150).map(|nonce| {
+        let player = admit_raw_player(&mut host, nonce);
+        assert_eq!(player.2, (nonce - 99) as usize, "WELCOME counts real players only");
+        player
+    }).collect();
+    assert_eq!(host.peer_count(), 50);
+    assert!(host.peers().all(|p| p.has_pose), "loading players were admitted in turn");
+
+    let late = raw();
+    let at = SocketAddr::from((Ipv4Addr::LOCALHOST, host.local_addr().unwrap().port()));
+    late.send_to(raw_hello(1000).as_bytes(), at).unwrap();
+    let mut buf = [0u8; MAX_DATAGRAM];
+    let mut rejection = String::new();
+    for _ in 0..30 {
+        host.tick(0.01, &Pose::default());
+        if let Ok((n, _)) = late.recv_from(&mut buf) {
+            rejection = String::from_utf8_lossy(&buf[..n]).to_string();
+            if rejection.starts_with("REJECT|") { break; }
+        }
+    }
+    assert!(rejection.starts_with("REJECT|") && rejection.contains("full (50 players)"), "{rejection}");
+    assert_eq!(host.peer_count(), 50, "player 51 was not admitted");
+
+    let returned = admit_raw_player(&mut host, 100);
+    assert_eq!(returned.1, players[0].1, "a reconnect keeps its player id even when full");
+    assert_eq!(returned.2, 50);
+    assert_eq!(host.peer_count(), 50, "a new address for the same nonce is not a new player");
+    assert_eq!(host.peers.get(&returned.1).unwrap().addr, Some(returned.0.local_addr().unwrap()));
+
+    late.send_to(format!("DISCOVER|{PROTOCOL}").as_bytes(), at).unwrap();
+    host.tick(0.01, &Pose::default());
+    let (n, _) = late.recv_from(&mut buf).expect("discovery reply");
+    let discovery = String::from_utf8_lossy(&buf[..n]);
+    assert!(discovery.starts_with("HERE|") && discovery.ends_with("|50"), "{discovery}");
+}
+
+#[test]
+fn configured_admission_never_exceeds_the_transport_safety_cap() {
+    let mut host = LanSession::host(0, "server", world("m"), false).unwrap();
+    host.configure_dedicated(usize::MAX);
+    assert_eq!(host.max_remote_peers, 64);
+    host.set_max_remote_peers(0);
+    assert_eq!(host.max_remote_peers, 0);
 }
 
 #[test]

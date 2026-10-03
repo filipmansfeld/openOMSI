@@ -6,6 +6,87 @@
 
 use crate::App;
 
+/// Selection state from a complete, recent host snapshot; never infer freedom from silence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TourChoiceState {
+    Offline,
+    Unrestricted,
+    Unknown { blocking: bool },
+    Free,
+    Mine,
+    Occupied(String),
+}
+
+impl TourChoiceState {
+    pub(crate) fn selectable(&self) -> bool {
+        !matches!(self, Self::Occupied(_) | Self::Unknown { blocking: true })
+    }
+
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Offline => "",
+            Self::Unrestricted => "BEZ REZERVACE",
+            Self::Unknown { .. } => "OVĚŘUJU STAV",
+            Self::Free => "VOLNÉ",
+            Self::Mine => "VAŠE POŘADÍ",
+            Self::Occupied(_) => "OBSAZENÉ",
+        }
+    }
+
+    pub(crate) fn driver(&self) -> &str {
+        match self { Self::Occupied(name) => name, _ => "" }
+    }
+
+    fn code(&self) -> char {
+        match self {
+            Self::Offline => 'n', Self::Unrestricted => 'a',
+            Self::Unknown { blocking: true } => 'u', Self::Unknown { blocking: false } => 'a',
+            Self::Free => 'f', Self::Mine => 'm', Self::Occupied(_) => 'o',
+        }
+    }
+}
+
+pub(crate) fn tour_choice_state(
+    exclusive: bool, fresh: bool, occupied: &[omsi_net::ws::TourOccupancy],
+    line: &str, tour: &str, own_id: Option<u32>,
+) -> TourChoiceState {
+    if !fresh { return TourChoiceState::Unknown { blocking: exclusive }; }
+    if !exclusive { return TourChoiceState::Unrestricted; }
+    match occupied.iter().find(|p| p.line.trim().eq_ignore_ascii_case(line.trim()) && p.tour.trim().eq_ignore_ascii_case(tour.trim())) {
+        Some(p) if own_id == Some(p.player_id) => TourChoiceState::Mine,
+        Some(p) => TourChoiceState::Occupied(p.player_name.clone()),
+        None => TourChoiceState::Free,
+    }
+}
+
+fn app_tour_choice(app: &App, line: &str, tour: &str) -> TourChoiceState {
+    let Some(lan) = app.lan.as_ref() else { return TourChoiceState::Offline; };
+    tour_choice_state(lan.exclusive_tours(), lan.tour_status_fresh(), &lan.occupied_tours(), line, tour, Some(lan.my_id))
+}
+
+/// Refresh open duty menus without moving the keyboard selection to a different duty.
+pub(crate) fn refresh_tour_list(app: &mut App) {
+    let Some(kind) = app.list_kind.clone().filter(|k| matches!(k, ListKind::Lines | ListKind::Tours(_, _))) else { return; };
+    if app.chooser.is_none() || app.tour_menu_refreshed.is_some_and(|t| t.elapsed().as_millis() < 500) { return; }
+    app.tour_menu_refreshed = Some(std::time::Instant::now());
+    let selected = app.chooser.and_then(|k| app.admin_list.as_ref()?.get(k)).map(|p| p.1.clone());
+    let list = items(app, &kind);
+    let index = selected.and_then(|a| list.iter().position(|p| p.1 == a));
+    app.chooser = Some(index.unwrap_or_else(|| app.chooser.unwrap_or(0).min(list.len().saturating_sub(1))));
+    app.admin_list = Some(list);
+}
+
+fn duty_available(app: &mut App, line: &str, tour: &str) -> bool {
+    let state = app_tour_choice(app, line, tour);
+    if state.selectable() { return true; }
+    let message = match state {
+        TourChoiceState::Occupied(name) => format!("Pořadí {line}/{tour} je obsazené: {name}. Vyberte jiné."),
+        _ => "Ověřuju obsazenost pořadí. Počkejte na odpověď serveru.".to_string(),
+    };
+    app.service_msg = Some((message, 8.0));
+    false
+}
+
 /// Which list the chooser shows.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ListKind {
@@ -207,7 +288,12 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
             if let Some(l) = app.schedule.as_ref().and_then(|s| s.data.lines.iter().find(|l| l.name == *line)) {
                 for t in sorted_tours(l).into_iter().filter(|t| app.schedule.as_ref().is_some_and(|s| tour_listed(s, line, t, app.clock.time))) {
                     // (the tours in order of the time they start)
-                    out.push((format!("{} {}", tr("Tour"), t.number.trim()), format!("tour {}\u{1}{}", line, t.number)));
+                    let status = app_tour_choice(app, line, &t.number);
+                    let mut label = format!("{} {}", tr("Tour"), t.number.trim());
+                    if status != TourChoiceState::Offline {
+                        label.push_str(&format!("\u{1f}{}\u{1f}{}\u{1f}{}", status.code(), status.label(), status.driver()));
+                    }
+                    out.push((label, format!("tour {}\u{1}{}", line, t.number)));
                 }
             }
         }
@@ -2253,6 +2339,8 @@ pub(crate) fn tour_choice(app: &App, k: usize) -> Option<(usize, usize, usize, u
 /// Start the tour at stop number `chosen` of trip number `trip` of the tour (the trip chosen
 /// by its time): the duty goes on from that stop, the bus stays where it is.
 pub(crate) fn start_duty_at(app: &mut App, line: &str, tour: &str, trip: usize, chosen: usize) {
+    if !duty_available(app, line, tour) { return; }
+    let confirmed = app.lan.as_ref().is_none_or(|lan| lan.tour_claim_confirmed(&format!("{line}/{tour}")));
     let now = app.clock.time;
     let at = tour_start_of(app, line, tour);
     let Some((k, j)) = app.schedule.as_ref().and_then(|s| s.tour_trip_stops(line, tour, trip).get(chosen).map(|x| (x.0, x.1))) else {
@@ -2269,14 +2357,23 @@ pub(crate) fn start_duty_at(app: &mut App, line: &str, tour: &str, trip: usize, 
     // (no teleport: the stop chosen is the one the bus drives to next)
     d.start_at_here(k, j);
     if let Some(p) = app.player.as_mut() {
-        d.update(&mut p.vehicle, now);
-        let (trip, stop) = d.trip_for_ibis();
-        p.set_duty_destination(trip, stop);
-        if let Some(w) = app.world.as_ref() {
-            let mut fonts = w.fonts.lock();
-            if let Err(e) = crate::schedule_paper::update_vehicle(&mut p.vehicle, &d, &mut fonts) {
-                log::warn!("driver timetable paper: {e:#}");
+        let active = if confirmed { 1.0 } else { 0.0 };
+        p.vehicle.host.schedule_active = active;
+        p.vehicle.set_var("schedule_active", active);
+        if confirmed {
+            d.update(&mut p.vehicle, now);
+            let (trip, stop) = d.trip_for_ibis();
+            p.set_duty_destination(trip, stop);
+            if let Some(w) = app.world.as_ref() {
+                let mut fonts = w.fonts.lock();
+                if let Err(e) = crate::schedule_paper::update_vehicle(&mut p.vehicle, &d, &mut fonts) {
+                    log::warn!("driver timetable paper: {e:#}");
+                }
             }
+        } else {
+            let h = &mut p.vehicle.host;
+            h.tt_line.clear(); h.tt_stops.clear(); h.tt_stop_ids.clear();
+            h.tt_busstop_index = -1; h.tt_terminus_index = -1; h.tt_delay = 0.0;
         }
     }
     app.args.line = Some(line.to_string());
@@ -2286,21 +2383,32 @@ pub(crate) fn start_duty_at(app: &mut App, line: &str, tour: &str, trip: usize, 
 }
 
 fn start_duty(app: &mut App, line: &str, tour: &str) {
+    if !duty_available(app, line, tour) { return; }
+    let confirmed = app.lan.as_ref().is_none_or(|lan| lan.tour_claim_confirmed(&format!("{line}/{tour}")));
     let (Some(w), Some(sch)) = (app.world.clone(), app.schedule.as_mut()) else { return };
     let now = app.clock.time;
     match sch.player_duty(&w, line, tour, now, None, false) {
         Ok(mut d) => {
             if let Some(p) = app.player.as_mut() {
-                d.update(&mut p.vehicle, now);
-                let (trip, stop) = d.trip_for_ibis();
-                p.set_duty_destination(trip, stop);
-                let mut fonts = w.fonts.lock();
-                if let Err(e) = crate::schedule_paper::update_vehicle(
-                    &mut p.vehicle,
-                    &d,
-                    &mut fonts,
-                ) {
-                    log::warn!("driver timetable paper: {e:#}");
+                let active = if confirmed { 1.0 } else { 0.0 };
+                p.vehicle.host.schedule_active = active;
+                p.vehicle.set_var("schedule_active", active);
+                if confirmed {
+                    d.update(&mut p.vehicle, now);
+                    let (trip, stop) = d.trip_for_ibis();
+                    p.set_duty_destination(trip, stop);
+                    let mut fonts = w.fonts.lock();
+                    if let Err(e) = crate::schedule_paper::update_vehicle(
+                        &mut p.vehicle,
+                        &d,
+                        &mut fonts,
+                    ) {
+                        log::warn!("driver timetable paper: {e:#}");
+                    }
+                } else {
+                    let h = &mut p.vehicle.host;
+                    h.tt_line.clear(); h.tt_stops.clear(); h.tt_stop_ids.clear();
+                    h.tt_busstop_index = -1; h.tt_terminus_index = -1; h.tt_delay = 0.0;
                 }
             }
             app.args.line = Some(line.to_string());
@@ -2314,6 +2422,51 @@ fn start_duty(app: &mut App, line: &str, tour: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::{tour_choice_state, TourChoiceState};
+
+    fn occupied(line: &str, tour: &str, id: u32, name: &str) -> omsi_net::ws::TourOccupancy {
+        omsi_net::ws::TourOccupancy {
+            line: line.into(), tour: tour.into(), player_id: id, player_name: name.into(),
+        }
+    }
+
+    #[test]
+    fn an_empty_incomplete_or_expired_snapshot_never_advertises_a_free_duty() {
+        let state = tour_choice_state(true, false, &[], "143", "1", None);
+        assert_eq!(state, TourChoiceState::Unknown { blocking: true });
+        assert!(!state.selectable());
+        assert_ne!(state.label(), TourChoiceState::Free.label());
+        assert_eq!(tour_choice_state(true, true, &[], "143", "1", None), TourChoiceState::Free);
+    }
+
+    #[test]
+    fn occupancy_is_for_a_line_and_tour_and_names_its_actual_owner() {
+        let rows = [occupied("143", "1", 7, "Řidič A")];
+        let state = tour_choice_state(true, true, &rows, " 143 ", "1", Some(8));
+        assert_eq!(state, TourChoiceState::Occupied("Řidič A".into()));
+        assert!(!state.selectable());
+        assert_eq!(state.driver(), "Řidič A");
+        assert_eq!(tour_choice_state(true, true, &rows, "200", "1", Some(8)), TourChoiceState::Free);
+        assert_eq!(tour_choice_state(true, true, &rows, "143", "2", Some(8)), TourChoiceState::Free);
+    }
+
+    #[test]
+    fn an_existing_owner_can_keep_its_duty_but_a_duplicate_name_cannot_claim_it() {
+        let rows = [occupied("N1", "Mo-Fr 1", 7, "Same name")];
+        let mine = tour_choice_state(true, true, &rows, "n1", "mo-fr 1", Some(7));
+        assert_eq!(mine, TourChoiceState::Mine);
+        assert!(mine.selectable());
+        assert!(!tour_choice_state(true, true, &rows, "N1", "Mo-Fr 1", Some(8)).selectable());
+    }
+
+    #[test]
+    fn ordinary_single_player_and_legacy_servers_keep_their_existing_selection_behavior() {
+        assert!(TourChoiceState::Offline.selectable());
+        assert!(tour_choice_state(false, false, &[], "143", "1", None).selectable());
+        assert_ne!(tour_choice_state(false, false, &[], "143", "1", None), TourChoiceState::Free);
+        assert_eq!(tour_choice_state(false, true, &[], "143", "1", None), TourChoiceState::Unrestricted);
+    }
+
     #[test]
     fn steps_wrap_round() {
         assert_eq!(super::next_step(&super::SPEEDS, 1.0), 2.0);

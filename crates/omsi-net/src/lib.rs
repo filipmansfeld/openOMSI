@@ -82,6 +82,18 @@ pub mod world;
 pub mod ws;
 pub mod tunnel;
 pub mod official;
+pub mod policy;
+pub use policy::TourOccupancy;
+
+/// A host's refusal of the current bus/duty request. The game must end the rejected
+/// duty, and remove a rejected driven vehicle; it must not disconnect an ordinary player.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicyReply {
+    pub bus: String,
+    pub tour: String,
+    pub vehicle: bool,
+    pub reason: String,
+}
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -131,7 +143,7 @@ pub const INFO_MIN_GAP: f32 = 0.25;
 /// Seconds between two CLOCK messages of the host.
 pub const CLOCK_EVERY: f32 = 5.0;
 /// At most this many other players: a host turns away the next one, a client ignores more.
-pub const MAX_PEERS: usize = 32;
+pub const MAX_PEERS: usize = 64;
 /// At most this many players may be loading at the same time (joined, no state yet).
 pub const MAX_JOINING: usize = 8;
 /// How far around the requested spawn a host lists the vehicles standing there (m).
@@ -934,6 +946,11 @@ impl Pose {
     }
 
     fn encode_info(&self) -> String {
+        self.encode_info_reserved(0)
+    }
+
+    fn encode_info_reserved(&self, reserve: usize) -> String {
+        let max_datagram = MAX_DATAGRAM.saturating_sub(reserve);
         let head = format!(
             "INFO|{}|{}|{}|{}|{}|{}|{:.2}|{:.2}|{:.2}|{:08X}|{}|",
             self.id,
@@ -952,11 +969,11 @@ impl Pose {
         // the display texts get what room is left in one datagram (long vehicle and figure
         // paths and a destination in another alphabet made an INFO too long to be taken in:
         // the others never learnt which bus the player drove)
-        let room = MAX_DATAGRAM.saturating_sub(head.len() + figure.len() + 1);
+        let room = max_datagram.saturating_sub(head.len() + figure.len() + 1);
         let info = format!("{head}{}|{figure}", encode_texts(&self.texts, MAX_TEXTS, MAX_TEXT_LEN, room));
         // the `[matl_freetex]` pictures last, in what room is left (an older game reads the
         // fields it knows and passes this one by)
-        let room = MAX_DATAGRAM.saturating_sub(info.len() + 1);
+        let room = max_datagram.saturating_sub(info.len() + 1);
         format!("{info}|{}", encode_texts(&self.freetex, MAX_FREETEX, MAX_FREETEX_LEN, room))
     }
 
@@ -1259,6 +1276,8 @@ pub struct Peer {
     pub has_pose: bool,
     /// An INFO has arrived: `pose.bus` and the rest are known.
     pub has_info: bool,
+    policy_request: Option<(u32, String, String)>,
+    policy_denial: Option<policy::PolicyDenial>,
     last_seq: u16,
     state_at: Instant,
     states: Bucket,
@@ -1282,6 +1301,8 @@ impl Peer {
             last_seen: now,
             has_pose: false,
             has_info: false,
+            policy_request: None,
+            policy_denial: None,
             last_seq: 0,
             state_at: now,
             states: Bucket::new(STATE_RATE.1),
@@ -1344,6 +1365,10 @@ pub struct LanSession {
     /// keeps its time up to date with `set_clock`).
     pub world: WorldInfo,
     peers: HashMap<u32, Peer>,
+    /// Admission limit for remote players, bounded by `MAX_PEERS`.
+    max_remote_peers: usize,
+    /// A dedicated host simulates the world but does not occupy a player slot.
+    host_is_player: bool,
     next_id: u32,
     send_acc: f32,
     hello_acc: f32,
@@ -1420,6 +1445,18 @@ pub struct LanSession {
     banned: Vec<u64>,
     /// Commands for this game (`command`): (from, text).
     commands: Vec<(u32, String)>,
+    host_policy: policy::HostPolicy,
+    policy_acc: f32,
+    policy_sequence: u32,
+    policy_revision: u32,
+    policy_requested: (String, String),
+    policy_confirmed: Option<(u32, String, String)>,
+    policy_reply_revision: Option<u32>,
+    policy_rejections: Vec<PolicyReply>,
+    exclusive_tours: bool,
+    occupied_tours: Vec<TourOccupancy>,
+    tour_status_at: Option<Instant>,
+    tour_assembly: policy::SnapshotAssembly,
     /// How fast the session's clock runs (the host's time speed; a client: the host's as
     /// its clock messages say).
     pub clock_speed: f64,
@@ -1460,6 +1497,20 @@ impl LanSession {
             session_required: false,
             world,
             peers: HashMap::new(),
+            max_remote_peers: MAX_PEERS,
+            host_is_player: true,
+            host_policy: policy::HostPolicy::default(),
+            policy_acc: 1.0,
+            policy_sequence: 0,
+            policy_revision: 0,
+            policy_requested: Default::default(),
+            policy_confirmed: None,
+            policy_reply_revision: None,
+            policy_rejections: Vec::new(),
+            exclusive_tours: false,
+            occupied_tours: Vec::new(),
+            tour_status_at: None,
+            tour_assembly: Default::default(),
             next_id: 2,
             send_acc: 0.0,
             hello_acc: 1.0,
@@ -1700,6 +1751,102 @@ impl LanSession {
         self.peers.len()
     }
 
+    /// Limit new remote players without evicting players who are already connected.
+    pub fn set_max_remote_peers(&mut self, limit: usize) {
+        self.max_remote_peers = limit.min(MAX_PEERS);
+    }
+
+    /// Configure an unattended host, whose logical host is not a player.
+    pub fn configure_dedicated(&mut self, max_players: usize) {
+        self.set_max_remote_peers(max_players);
+        self.host_is_player = false;
+    }
+
+    /// Players known to a host, including players who are still loading their map.
+    pub fn player_count(&self) -> usize {
+        self.peers.len() + usize::from(self.role == Role::Host && self.host_is_player)
+    }
+
+    /// Configure a dedicated host before accepting any joins. Ordinary LAN sessions
+    /// keep their unrestricted defaults. A nonempty list uses exact normalized paths.
+    pub fn set_server_policy(&mut self, vehicles: &[String], exclusive_tours: bool) {
+        if self.role == Role::Host {
+            self.host_policy = policy::HostPolicy::new(vehicles, exclusive_tours);
+        }
+    }
+
+    pub fn exclusive_tours(&self) -> bool {
+        if self.role == Role::Host { self.host_policy.exclusive_tours } else { self.exclusive_tours }
+    }
+
+    /// An incomplete newer snapshot immediately invalidates the previous snapshot.
+    pub fn tour_status_fresh(&self) -> bool {
+        self.role == Role::Host || (self.connected && self.tour_status_at
+            .is_some_and(|at| at.elapsed() <= Duration::from_secs(5)))
+    }
+
+    pub fn occupied_tours(&self) -> Vec<TourOccupancy> {
+        if self.role == Role::Host { self.host_policy.occupancy() } else { self.occupied_tours.clone() }
+    }
+
+    pub fn tour_claim_confirmed(&self, tour: &str) -> bool {
+        self.role == Role::Host || (self.connected && (!self.exclusive_tours() ||
+            (self.tour_status_fresh() && self.policy_confirmed.as_ref().is_some_and(|(revision, _, accepted)|
+                *revision == self.policy_revision && policy::same_tour(accepted, tour)))))
+    }
+
+    pub fn take_policy_rejections(&mut self) -> Vec<PolicyReply> {
+        std::mem::take(&mut self.policy_rejections)
+    }
+
+    fn send_policy_snapshot(&mut self, only: Option<SocketAddr>) {
+        if !self.host_policy.active() { return; }
+        self.policy_sequence = self.policy_sequence.wrapping_add(1);
+        let text = policy::encode_occupancy(&self.host_policy.occupancy());
+        let chunks: Vec<&[u8]> = if text.is_empty() { vec![b""] } else { text.as_bytes().chunks(1000).collect() };
+        if chunks.len() > 64 { return; }
+        for (index, chunk) in chunks.iter().enumerate() {
+            let msg = format!("TOURS|{}|{}|{}|{}|{}|{}", session_hex(self.session), self.policy_sequence,
+                u8::from(self.host_policy.exclusive_tours), index, chunks.len(), std::str::from_utf8(chunk).unwrap());
+            match only { Some(addr) => self.send(msg.as_bytes(), addr), None => self.broadcast(msg.as_bytes(), None) }
+        }
+    }
+
+    fn on_tours(&mut self, parts: &[&str], from: SocketAddr) {
+        if self.role != Role::Client || !self.connected || Some(from) != self.host ||
+            parse_session_hex(field(parts, 1)) != Some(self.session) { return; }
+        let (Ok(sequence), Ok(index), Ok(count)) = (field(parts, 2).parse(), field(parts, 4).parse(), field(parts, 5).parse()) else { return; };
+        let exclusive = match field(parts, 3) { "0" => false, "1" => true, _ => return };
+        if count == 0 || count > 64 || index >= count { return; }
+        if self.tour_assembly.pieces.is_empty() || policy::newer(sequence, self.tour_assembly.sequence) {
+            self.tour_status_at = None;
+        }
+        if !self.tour_assembly.pieces.is_empty() && sequence != self.tour_assembly.sequence &&
+            !policy::newer(sequence, self.tour_assembly.sequence) { return; }
+        self.exclusive_tours = exclusive;
+        if let Some(tours) = self.tour_assembly.add(sequence, exclusive, index, count, field(parts, 6)) {
+            self.occupied_tours = tours;
+            self.tour_status_at = Some(Instant::now());
+        }
+    }
+
+    fn on_policy_reply(&mut self, parts: &[&str], from: SocketAddr) {
+        if self.role != Role::Client || !self.connected || Some(from) != self.host ||
+            parse_session_hex(field(parts, 1)) != Some(self.session) ||
+            field(parts, 2).parse::<u32>().ok() != Some(self.my_id) { return; }
+        let Some(revision) = field(parts, 3).parse::<u32>().ok().filter(|r| *r == self.policy_revision) else { return; };
+        let Some(reason) = policy::unhex(field(parts, 5)) else { return; };
+        if reason.len() > 1024 { return; }
+        let (bus, tour) = self.policy_requested.clone();
+        if reason.is_empty() {
+            self.policy_confirmed = Some((revision, bus, tour));
+        } else if self.policy_reply_revision != Some(revision) {
+            self.policy_confirmed = None;
+            self.policy_rejections.push(PolicyReply { bus, tour, vehicle: field(parts, 4) == "1", reason });
+        }
+        self.policy_reply_revision = Some(revision);
+    }
+
     /// Bytes sent so far.
     pub fn sent(&self) -> u64 {
         self.sent.get()
@@ -1853,6 +2000,7 @@ impl LanSession {
             return;
         }
         let Some(p) = self.peers.remove(&id) else { return };
+        self.host_policy.release(id);
         if let Some(a) = p.addr {
             self.send(format!("KICK|{}", clean_text(reason, 200)).as_bytes(), a);
         }
@@ -2116,7 +2264,7 @@ impl LanSession {
             "-".to_string()
         };
         let msg = format!(
-            "HELLO|{PROTOCOL}|{session}|{}|{}|{}|{:016X}",
+            "HELLO|{PROTOCOL}|{session}|{}|{}|{}|{:016X}|P1",
             self.my_name,
             vehicle_path(&mine.bus).unwrap_or_default(),
             self.world.fields(),
@@ -2129,11 +2277,12 @@ impl LanSession {
 
     fn send_welcome(&self, id: u32, to: SocketAddr) {
         let msg = format!(
-            "WELCOME|{PROTOCOL}|{id}|{}|{}|{}|{}",
+            "WELCOME|{PROTOCOL}|{id}|{}|{}|{}|{}|P1:{}",
             session_hex(self.session),
             self.my_name,
             self.world.fields(),
-            self.peers.len() + 1
+            self.player_count(),
+            u8::from(self.host_policy.exclusive_tours)
         );
         self.send(msg.as_bytes(), to);
     }
@@ -2218,6 +2367,7 @@ impl LanSession {
         self.hello_acc += dt;
         self.info_acc += dt;
         self.clock_acc += dt;
+        self.policy_acc += dt;
         self.place_acc += dt;
         if self.role == Role::Client && !self.connected && self.rejected.is_none() {
             self.trying += dt.min(0.5);
@@ -2237,6 +2387,10 @@ impl LanSession {
             self.send_own(dt, mine);
         }
         self.receive(&mut gone);
+        if self.role == Role::Host && self.policy_acc >= 1.0 {
+            self.policy_acc = 0.0;
+            self.send_policy_snapshot(None);
+        }
         // time out the silent: a player who has sent no state yet is still loading
         let now = Instant::now();
         let silent: Vec<u32> = self
@@ -2256,6 +2410,7 @@ impl LanSession {
             let Some(p) = self.peers.remove(&id) else {
                 continue;
             };
+            self.host_policy.release(id);
             log::info!("LAN: player {id} timed out");
             gone.push(id);
             self.gone_lately.push((p.nonce, p.pose.name.clone(), id, now));
@@ -2363,7 +2518,16 @@ impl LanSession {
                 }
             }
         }
-        let info = p.encode_info();
+        let info = if self.role == Role::Client {
+            let requested = (p.bus.clone(), p.tour.clone());
+            if requested != self.policy_requested {
+                self.policy_revision = self.policy_revision.wrapping_add(1);
+                self.policy_requested = requested;
+                self.policy_confirmed = None;
+            }
+            let suffix = format!("|P1:{}", self.policy_revision);
+            format!("{}{}", p.encode_info_reserved(suffix.len()), suffix)
+        } else { p.encode_info() };
         // Sent when it changes, but no more often than INFO_MIN_GAP: a roller blind turning
         // through its numbers or a pilot screen changes the `[matl_freetex]` pictures many
         // times a second, and the host took ten messages a second and dropped the rest.
@@ -2493,7 +2657,7 @@ impl LanSession {
                         self.my_name,
                         session_hex(self.session),
                         clean_text(&self.world.map, 260),
-                        self.peers.len() + 1
+                        self.player_count()
                     );
                     self.send(msg.as_bytes(), from);
                 }
@@ -2521,6 +2685,8 @@ impl LanSession {
                     self.connected = false;
                 }
                 ("INFO", _) => self.on_info(&parts, from),
+                ("TOURS", Role::Client) => self.on_tours(&parts, from),
+                ("POLICY", Role::Client) => self.on_policy_reply(&parts, from),
                 ("PLACE", Role::Host) => self.on_place(&parts, from),
                 ("NEAR", Role::Client) => {
                     if field(&parts, 1).parse::<u32>().ok() == Some(self.my_id)
@@ -2732,7 +2898,7 @@ impl LanSession {
     }
 
     fn on_info(&mut self, parts: &[&str], from: SocketAddr) {
-        let Some(info) = Pose::decode_info(parts) else {
+        let Some(mut info) = Pose::decode_info(parts) else {
             return;
         };
         let id = info.id;
@@ -2740,13 +2906,45 @@ impl LanSession {
             return;
         }
         let host = self.role == Role::Host;
+        if host {
+            // Authenticate before touching either the owner's claim or another driver's.
+            if self.checked_peer(id, from, MESSAGE_RATE, false).is_none() { return; }
+            if info.name.is_empty() {
+                info.name = self.peers[&id].pose.name.clone();
+            }
+            if self.host_policy.active() {
+                let Some(revision) = parts.get(15).and_then(|p| p.strip_prefix("P1:")).and_then(|v| v.parse::<u32>().ok()) else { return; };
+                let previous = self.peers.get(&id).and_then(|p| p.policy_request.clone());
+                if let Some((old, bus, tour)) = previous.as_ref() {
+                    if revision != *old && !policy::newer(revision, *old) { return; }
+                    if revision == *old && (bus != &info.bus || tour != &info.tour) { return; }
+                }
+                let denial = if previous.as_ref().is_some_and(|p| p.0 == revision) {
+                    self.peers.get(&id).and_then(|p| p.policy_denial.clone())
+                } else {
+                    if !field(parts, 3).trim().is_empty() && vehicle_path(field(parts, 3)).is_none() {
+                        self.host_policy.release(id);
+                        Some(policy::PolicyDenial { vehicle: true, reason: "The vehicle path is invalid. Choose one of this server's offered buses.".into() })
+                    } else { self.host_policy.update(id, &info.name, &info.bus, &info.tour).err() }
+                };
+                if let Some(p) = self.peers.get_mut(&id) {
+                    p.policy_request = Some((revision, info.bus.clone(), info.tour.clone()));
+                    p.policy_denial = denial.clone();
+                }
+                let reply = format!("POLICY|{}|{id}|{revision}|{}|{}", session_hex(self.session),
+                    u8::from(denial.as_ref().is_some_and(|d| d.vehicle)),
+                    policy::hex(denial.as_ref().map(|d| d.reason.as_str()).unwrap_or("")));
+                self.send(reply.as_bytes(), from);
+                if let Some(d) = denial {
+                    if d.vehicle { info.bus.clear(); }
+                    info.tour.clear();
+                }
+            }
+        }
         let relay;
         {
             let peer = match self.role {
-                Role::Host => match self.checked_peer(id, from, MESSAGE_RATE, false) {
-                    Some(p) => p,
-                    None => return,
-                },
+                Role::Host => self.peers.get_mut(&id).unwrap(),
                 Role::Client => {
                     if !self.peers.contains_key(&id) && self.peers.len() >= MAX_PEERS {
                         return;
@@ -2850,6 +3048,7 @@ impl LanSession {
             return;
         }
         if let Some(p) = self.peers.remove(&id) {
+            self.host_policy.release(id);
             log::info!("LAN: player {id} '{}' left", p.pose.name);
             gone.push(id);
             self.gone_lately.push((p.nonce, p.pose.name.clone(), id, Instant::now()));
@@ -2889,6 +3088,18 @@ impl LanSession {
             return;
         }
         let bus = vehicle_path(field(parts, 4)).unwrap_or_default();
+        if self.host_policy.active() && !field(parts, 4).trim().is_empty() && vehicle_path(field(parts, 4)).is_none() {
+            self.reject(from, "The vehicle path is invalid. Choose one of this server's offered buses.");
+            return;
+        }
+        if self.host_policy.active() && field(parts, 11) != "P1" {
+            self.reject(from, "This server requires the updated client with bus and duty restrictions.");
+            return;
+        }
+        if !self.host_policy.allows_vehicle(&bus) {
+            self.reject(from, "This bus is not allowed on this server. Choose one of its offered buses.");
+            return;
+        }
         let world = WorldInfo::from_fields(parts, 5);
         let nonce = u64::from_str_radix(field(parts, 10), 16).ok();
         // a returning client keeps its id; so does one that tried several of our addresses
@@ -2905,11 +3116,11 @@ impl LanSession {
                 }
                 (id, None)
             }
-            None if self.peers.len() >= MAX_PEERS => {
-                log::warn!("LAN: '{name}' at {from} wants to join, but {MAX_PEERS} players are here already; turned away");
+            None if self.peers.len() >= self.max_remote_peers => {
+                log::warn!("LAN: '{name}' at {from} wants to join, but {} player slots are occupied already; turned away", self.player_count());
                 self.reject(
                     from,
-                    &format!("the session is full ({} players)", MAX_PEERS + 1),
+                    &format!("the session is full ({} players)", self.player_count()),
                 );
                 return;
             }
@@ -2949,11 +3160,15 @@ impl LanSession {
                     .nth(3)
                     .map(vehicle_label)
                     .filter(|b| !b.is_empty());
-                let mut here: Vec<String> = vec![format!(
-                    "{} (host{})",
-                    self.my_name,
-                    my_bus.map(|b| format!(", {b}")).unwrap_or_default()
-                )];
+                let mut here: Vec<String> = if self.host_is_player {
+                    vec![format!(
+                        "{} (host{})",
+                        self.my_name,
+                        my_bus.map(|b| format!(", {b}")).unwrap_or_default()
+                    )]
+                } else {
+                    Vec::new()
+                };
                 let mut others: Vec<(u32, String)> = self
                     .peers
                     .iter()
@@ -2996,6 +3211,7 @@ impl LanSession {
             p.last_seen = Instant::now();
         }
         self.send_welcome(id, from);
+        self.send_policy_snapshot(Some(from));
         if let Some(here) = here {
             self.send(
                 format!("NOTE|In this session: {}", clean_text(&here, 200)).as_bytes(),
@@ -3050,6 +3266,14 @@ impl LanSession {
             .unwrap_or(1)
             .min(MAX_PEERS + 1);
         let first = !self.connected;
+        // WELCOME declares restrictions even if all following fragmented snapshots
+        // are delayed or lost. A legacy welcome explicitly keeps ordinary LAN behavior.
+        self.exclusive_tours = field(parts, 11) == "P1:1";
+        if first || self.session != session {
+            self.tour_status_at = None;
+            self.tour_assembly = Default::default();
+            self.policy_confirmed = None;
+        }
         if self.host != Some(from) {
             self.host = Some(from);
             if self.candidates.len() > 1 {
@@ -3116,3 +3340,5 @@ impl Drop for LanSession {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod policy_tests;

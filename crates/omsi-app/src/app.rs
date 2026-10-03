@@ -215,6 +215,8 @@ pub(crate) struct App {
     pub(crate) admin_list: Option<Vec<(String, String)>>,
     /// Which of the game menu's lists `admin_list` holds (see `game_lists`).
     pub(crate) list_kind: Option<crate::game_lists::ListKind>,
+    /// Last refresh of the visible multiplayer duty list.
+    pub(crate) tour_menu_refreshed: Option<std::time::Instant>,
     /// OMSI 2's route arrows over the road (the `nav_arrows` setting).
     pub(crate) route_arrows: crate::route_arrows::RouteArrows,
     /// OMSI's global key actions from `Inputs/keyboard.cfg` ([game]).
@@ -693,12 +695,15 @@ impl App {
                             // --autostart in the window puts the duty on the IBIS as well
                             // (it only ever did offscreen: the duty did not exist yet when
                             // the start-up began, and the displays stayed dark)
-                            if let (true, Some(d)) = (self.args.autostart, self.duty.as_mut()) {
+                            let duty_confirmed = self.duty.as_ref().is_some_and(|d| self.lan.as_ref()
+                                .is_none_or(|l| l.tour_claim_confirmed(&format!("{}/{}", d.line, d.tour))));
+                            if !duty_confirmed { p.vehicle.host.schedule_active = 0.0; }
+                            if let (true, Some(d)) = (self.args.autostart && duty_confirmed, self.duty.as_mut()) {
                                 d.update(&mut p.vehicle, parse_time(&self.args.time));
                                 let (trip, stop) = d.trip_for_ibis();
                                 p.set_duty_destination(trip, stop);
                             }
-                            if let Some(d) = self.duty.as_ref() {
+                            if let Some(d) = self.duty.as_ref().filter(|_| duty_confirmed) {
                                 let mut fonts = w.fonts.lock();
                                 if let Err(e) = crate::schedule_paper::update_vehicle(
                                     &mut p.vehicle,

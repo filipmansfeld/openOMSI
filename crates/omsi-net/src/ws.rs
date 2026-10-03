@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket};
+pub use crate::policy::TourOccupancy;
 
 /// What a server tells about itself (`GET /status`, and the launcher's list).
 #[derive(Debug, Clone, Default)]
@@ -43,6 +44,11 @@ pub struct ServerInfo {
     /// The buses that may be driven there (vehicle files, `Vehicles/…/….bus`): what the
     /// host has installed, or a server's own list. Empty: not said (an older game).
     pub vehicles: Vec<String>,
+    pub exclusive_tours: bool,
+    pub occupied_tours: Vec<TourOccupancy>,
+    /// When a complete authoritative duty snapshot was last obtained. Missing for
+    /// old servers, incomplete responses and servers whose simulation stopped.
+    pub tour_status_at: Option<Instant>,
     /// Where it answered (`http(s)://…`), set by `query`: a server added by its bare
     /// address (`1.2.3.4`, `host:27025`) is joined there.
     pub reached_at: String,
@@ -115,9 +121,12 @@ pub fn players_json(players: &[PlayerInfo]) -> String {
 }
 
 impl ServerInfo {
+    pub fn tour_status_fresh(&self) -> bool {
+        self.tour_status_at.is_some_and(|at| at.elapsed() <= Duration::from_secs(5))
+    }
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"name\":{},\"motd\":{},\"map\":{},\"players\":{},\"max_players\":{},\"version\":{},\"icon\":{},\"time\":{},\"weather\":{},\"password\":{},\"protocol\":{},\"vehicles\":{}}}",
+            "{{\"name\":{},\"motd\":{},\"map\":{},\"players\":{},\"max_players\":{},\"version\":{},\"icon\":{},\"time\":{},\"weather\":{},\"password\":{},\"protocol\":{},\"vehicles\":{},\"exclusive_tours\":{},\"tour_status_known\":{},\"occupied_tours\":[{}]}}",
             json_str(&self.name),
             json_str(&self.motd),
             json_str(&self.map),
@@ -129,7 +138,11 @@ impl ServerInfo {
             json_str(&self.weather),
             self.password,
             crate::PROTOCOL,
-            json_str(&self.vehicles.join(";"))
+            json_str(&self.vehicles.join(";")),
+            self.exclusive_tours,
+            self.tour_status_fresh(),
+            self.occupied_tours.iter().map(|t| format!("{{\"line\":{},\"tour\":{},\"player_id\":{},\"player_name\":{}}}",
+                json_str(&t.line), json_str(&t.tour), t.player_id, json_str(&t.player_name))).collect::<Vec<_>>().join(",")
         )
     }
 
@@ -137,6 +150,9 @@ impl ServerInfo {
     pub fn from_json(s: &str) -> Option<ServerInfo> {
         let text = |k: &str| json_value(s, k).map(|v| v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(&v).to_string().replace("\\\"", "\"").replace("\\\\", "\\").replace("\\n", "\n"));
         let num = |k: &str| json_value(s, k).and_then(|v| v.trim().parse::<usize>().ok());
+        let occupancy = json_value(s, "occupied_tours").and_then(|v| parse_occupancy(&v));
+        let status_known = json_value(s, "tour_status_known").is_some_and(|v| v == "true") && occupancy.is_some()
+            && matches!(json_value(s, "exclusive_tours").as_deref(), Some("true" | "false"));
         Some(ServerInfo {
             name: text("name")?,
             motd: text("motd").unwrap_or_default(),
@@ -149,6 +165,9 @@ impl ServerInfo {
             weather: text("weather").unwrap_or_default(),
             password: json_value(s, "password").map(|v| v.trim() == "true").unwrap_or(false),
             vehicles: text("vehicles").map(|v| v.split(';').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default(),
+            exclusive_tours: json_value(s, "exclusive_tours").is_some_and(|v| v == "true"),
+            occupied_tours: occupancy.unwrap_or_default(),
+            tour_status_at: status_known.then(Instant::now),
             reached_at: String::new(),
             ..Default::default()
         })
@@ -194,9 +213,54 @@ fn json_value(s: &str, key: &str) -> Option<String> {
             }
         }
         None
+    } else if rest.starts_with('[') || rest.starts_with('{') {
+        let mut depth = 0;
+        let mut string = false;
+        let mut escaped = false;
+        for (i, c) in rest.char_indices() {
+            if string {
+                if escaped { escaped = false; }
+                else if c == '\\' { escaped = true; }
+                else if c == '"' { string = false; }
+            } else {
+                match c {
+                    '"' => string = true,
+                    '[' | '{' => depth += 1,
+                    ']' | '}' => { depth -= 1; if depth == 0 { return Some(rest[..i + 1].into()); } },
+                    _ => {}
+                }
+            }
+        }
+        None
     } else {
         let end = rest.find([',', '}']).unwrap_or(rest.len());
         Some(rest[..end].to_string())
+    }
+}
+
+fn parse_occupancy(json: &str) -> Option<Vec<TourOccupancy>> {
+    let inside = json.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inside.is_empty() { return Some(Vec::new()); }
+    let mut rest = inside;
+    let mut out = Vec::new();
+    loop {
+        if !rest.starts_with('{') || out.len() >= 64 { return None; }
+        // Reuse the balanced value reader, including strings containing braces/quotes.
+        let wrapped = format!("\"item\":{rest}");
+        let object = json_value(&wrapped, "item")?;
+        let text = |k: &str| json_value(&object, k).and_then(|v| v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).map(|v|
+            v.replace("\\\"", "\"").replace("\\\\", "\\")));
+        let item = TourOccupancy { line: text("line")?, tour: text("tour")?, player_name: text("player_name")?,
+            player_id: json_value(&object, "player_id")?.parse().ok()? };
+        if item.player_id == 0 || item.line.is_empty() || item.tour.is_empty() ||
+            item.line.len() > 256 || item.tour.len() > 256 || item.player_name.len() > 160 ||
+            out.iter().any(|p: &TourOccupancy| p.player_id == item.player_id ||
+                (p.line.eq_ignore_ascii_case(&item.line) && p.tour.eq_ignore_ascii_case(&item.tour))) { return None; }
+        out.push(item);
+        rest = rest.get(object.len()..)?.trim();
+        if rest.is_empty() { return Some(out); }
+        rest = rest.strip_prefix(',')?.trim_start();
+        if rest.is_empty() { return None; }
     }
 }
 
@@ -308,8 +372,9 @@ pub fn query(target: &str, with_icon: bool) -> Result<ServerInfo, String> {
     Ok(info)
 }
 
-/// Connections the gateway serves at once (players, status requests, mod streams).
-const MAX_CONNECTIONS: usize = 64;
+/// Connections served at once: headroom beyond 64 players for mod streams and status requests.
+/// Each has a thread, so this remains bounded even while the session is full.
+const MAX_CONNECTIONS: usize = 128;
 
 /// The host's or server's side (see the module).
 pub struct WsGateway {

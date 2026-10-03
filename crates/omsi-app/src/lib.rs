@@ -524,6 +524,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         placing: None,
         admin_list: None,
         list_kind: None,
+        tour_menu_refreshed: None,
         route_arrows: Default::default(),
         game_keys: omsi_content::KeyboardCfg::load(&crate::startup::keyboard_cfg(&args_root_for_keys)).unwrap_or_default().with_game_defaults().with_vr_defaults().game,
         own_keys: crate::startup::own_keys(&args_root_for_keys),

@@ -13,6 +13,10 @@
 use super::*;
 use std::path::Path;
 
+#[path = "server_tick.rs"]
+mod tick;
+pub(crate) use tick::TickMetrics;
+
 /// What `server.cfg` says (see `DEFAULT_CFG`).
 #[derive(Debug, Clone)]
 pub(crate) struct ServerCfg {
@@ -46,6 +50,8 @@ pub(crate) struct ServerCfg {
     /// Only these buses may be driven on the server (vehicle files, empty: every bus the
     /// server has installed).
     pub vehicles: Vec<String>,
+    /// The host grants each (line, tour) to at most one player. Off for other servers.
+    pub exclusive_tours: bool,
     /// `GET /players` on the web port tells who drives what and where (for a web map).
     pub share_positions: bool,
 }
@@ -103,6 +109,7 @@ metar_station =
 # the buses players may drive, separated by ; (vehicle files such as
 # Vehicles/MAN_SD200/MAN_SD77.bus; empty: every bus installed on the server)
 vehicles =
+exclusive_tours = 0
 
 # tell anyone who asks the web port (GET /players) the players' names, buses, lines and
 # positions - for a live map of the server on a website; tell your players when it is on
@@ -143,7 +150,7 @@ impl ServerCfg {
             passengers: flag("passengers", true),
             port: num("port", 27015).clamp(1, 65535) as u16,
             web_port: num("web_port", 27025).clamp(1, 65535) as u16,
-            max_players: num("max_players", 16).clamp(1, 64) as usize,
+            max_players: num("max_players", 16).clamp(1, omsi_net::MAX_PEERS as i64) as usize,
             tunnel: flag("tunnel", true),
             radius: num("radius", 0) as i32,
             icon,
@@ -153,6 +160,7 @@ impl ServerCfg {
             metar_sync: flag("metar_sync", false),
             metar_station: kv.get("metar_station").map(|v| v.chars().filter(|c| c.is_ascii_alphabetic()).take(4).collect::<String>().to_ascii_uppercase()).unwrap_or_default(),
             vehicles: kv.get("vehicles").map(|v| v.split(';').map(|x| x.trim().replace('\\', "/")).filter(|x| !x.is_empty()).collect()).unwrap_or_default(),
+            exclusive_tours: flag("exclusive_tours", false),
             share_positions: flag("share_positions", false),
         })
     }
@@ -172,6 +180,7 @@ pub(crate) fn info_of(cfg: &ServerCfg) -> omsi_net::ws::ServerInfo {
         weather: cfg.weather.clone().unwrap_or_default(),
         password: false,
         vehicles: cfg.vehicles.clone(),
+        exclusive_tours: cfg.exclusive_tours,
         reached_at: String::new(),
         players_public: cfg.share_positions,
         player_list: Vec::new(),
@@ -186,8 +195,10 @@ pub(crate) fn prepare(args: &mut Args, path: &Path) -> Result<ServerCfg> {
     let cfg = ServerCfg::load(path)?;
     SERVER_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = SERVER_ADMIN.set((cfg.admin_password.clone(), if cfg.real_time { 1.0 } else { cfg.time_speed }));
+    let _ = SERVER_MAX_PLAYERS.set(cfg.max_players);
     crate::real_time::set_server_real(cfg.real_time);
     let _ = SERVER_VEHICLES.set(cfg.vehicles.clone());
+    let _ = SERVER_EXCLUSIVE_TOURS.set(cfg.exclusive_tours);
     args.map = cfg.map.clone();
     args.time = cfg.time.clone();
     if let Some(d) = &cfg.date {
@@ -228,9 +239,13 @@ pub(crate) static SERVER_METAR: std::sync::OnceLock<Option<String>> = std::sync:
 
 /// The buses a dedicated server allows (`vehicles`; empty: every bus it has).
 pub(crate) static SERVER_VEHICLES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+pub(crate) static SERVER_EXCLUSIVE_TOURS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// A dedicated server's admin password and clock speed (for the host loop).
 pub(crate) static SERVER_ADMIN: std::sync::OnceLock<(String, f64)> = std::sync::OnceLock::new();
+
+/// Admission limit from `server.cfg`, applied before the host starts answering joins.
+pub(crate) static SERVER_MAX_PLAYERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// A dedicated server run: graphics without a device, the whole world by interest.
 pub(crate) static SERVER_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -238,7 +253,7 @@ pub(crate) static SERVER_MODE: std::sync::atomic::AtomicBool = std::sync::atomic
 /// Every second of a server run: what the status page says (players, time, weather) and
 /// who is where (`GET /players`, when `share_positions` is on).
 pub(crate) fn tick_status(lan: &omsi_net::LanSession, time: f64, weather: &str) {
-    let players = lan.peers().filter(|p| p.has_info).count();
+    let players = lan.player_count();
     // (the admin's clock shift may take the time below 0 or past midnight: 23:08 had come
     // out as "00:-52")
     crate::lan::update_server_info(players, &crate::schedule::hhmm(time.rem_euclid(86400.0)), weather);

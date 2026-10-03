@@ -1243,11 +1243,17 @@ impl Ui {
             }
         }
         for (k, &(id, label)) in items[..nl].iter().enumerate().skip(start).take(rows) {
+            let mut tour_fields = label.split('\u{1f}');
+            let tour_label = tour_fields.next().unwrap_or(label);
+            let tour_state = if kind == MenuKind::Tours { tour_fields.next().unwrap_or("") } else { "" };
+            let tour_status = tour_fields.next().unwrap_or("");
+            let tour_driver = tour_fields.next().unwrap_or("");
             let ry = y + header_h + row_h * (k - start) as f32;
             let gap = 4.0 * s;
             let rect = [x + pad, ry, right, ry + row_h - gap];
             // (a greyed-out line is never lit: not by the mouse, not by the keyboard)
-            let off = kind == MenuKind::Game && f.menu_disabled.contains(&id);
+            let off = (kind == MenuKind::Game && f.menu_disabled.contains(&id))
+                || (kind == MenuKind::Tours && matches!(tour_state, "o" | "u"));
             let lit = !off && (over(rect) || (k == sel && f.menu_kbd && !any_hovered));
             let danger = id == "quit";
             let is_back = id == "back" && label == back_txt.as_str();
@@ -1266,7 +1272,7 @@ impl Ui {
             // (the light of the line eases in and out)
             let glow = self.easeq((7, id, k), if lit { 1.0 } else { 0.0 }, 1.0 / FADE_SECS);
             // (the tour chosen stays marked, whatever the mouse is over)
-            let active = kind == MenuKind::Tours && k == sel && !is_back;
+            let active = kind == MenuKind::Tours && k == sel && !is_back && !off;
             let a_act = self.easeq((14, id, k), if active { 1.0 } else { 0.0 }, 1.0 / FADE_SECS);
             let bar = self.easeq((8, id, k), if lit || active { 1.0 } else { 0.0 }, 1.0 / BAR_SECS);
             if a_act > 0.0 {
@@ -1316,10 +1322,21 @@ impl Ui {
                 }
                 // a tour: its name (the time is chosen beside the list)
                 MenuKind::Tours => {
-                    if let Some(rest) = label.strip_prefix(tour_pre.as_str()) {
+                    if let Some(rest) = tour_label.strip_prefix(tour_pre.as_str()) {
                         let num = rest.split_once("  ").map(|(n, _)| n).unwrap_or(rest).trim();
-                        let name = clip_to(&self.text, &format!("{tour_pre}{num}"), px as f32, rx - lx);
-                        self.put(r, scene, &name, px, ink, lx, cy);
+                        let edge = if tour_status.is_empty() { rx } else {
+                            let bg = match tour_state {
+                                "o" => [136, 44, 40, 255], "f" => [42, 98, 56, 255],
+                                "m" => [42, 78, 126, 255], _ => [92, 74, 36, 255],
+                            };
+                            self.chip(r, scene, tour_status, (11.0 * s) as u32, WHITE, bg, true, rx, cy, s) - 10.0 * s
+                        };
+                        let name = clip_to(&self.text, &format!("{tour_pre}{num}"), px as f32, edge - lx);
+                        self.put(r, scene, &name, px, ink, lx, cy - if tour_driver.is_empty() { 0.0 } else { 6.0 * s });
+                        if !tour_driver.is_empty() {
+                            let driver = clip_to(&self.text, tour_driver, 11.0 * s, edge - lx);
+                            self.put(r, scene, &driver, (11.0 * s) as u32, SOFT, lx, cy + 9.0 * s);
+                        }
                         done = true;
                     }
                 }
