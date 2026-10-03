@@ -701,7 +701,11 @@ pub fn open_public_gateway(session: &LanSession, info: omsi_net::ws::ServerInfo,
     let Some(udp) = session.local_addr() else { return };
     let target = SocketAddr::from(([127, 0, 0, 1], udp.port()));
     let port = if web_port == 0 { udp.port().saturating_add(10) } else { web_port };
-    let gateway = match omsi_net::ws::WsGateway::start(SocketAddr::from(([0, 0, 0, 0], port)), target, info.clone()).or_else(|_| omsi_net::ws::WsGateway::start(SocketAddr::from(([0, 0, 0, 0], 0)), target, info)) {
+    let private = udp.ip().is_loopback();
+    let bind = if private { [127, 0, 0, 1] } else { [0, 0, 0, 0] };
+    let gateway = match omsi_net::ws::WsGateway::start(SocketAddr::from((bind, port)), target, info.clone()).or_else(|e| {
+        if private { Err(e) } else { omsi_net::ws::WsGateway::start(SocketAddr::from((bind, 0)), target, info) }
+    }) {
         Ok(g) => g,
         Err(e) => {
             log::warn!("LAN: no WebSocket gateway: {e}");
@@ -711,7 +715,7 @@ pub fn open_public_gateway(session: &LanSession, info: omsi_net::ws::ServerInfo,
     if let Ok(mut w) = WS_PATH.lock() {
         *w = Some(WsPath { gateway: Some(gateway), tunnel: None, _client: None, url: None });
     }
-    if !want_tunnel || omsi_cfg::env::var_os("OMSI_NO_TUNNEL").is_some() || omsi_cfg::env::var_os("OMSI_NO_BRIDGE").is_some() {
+    if private || !want_tunnel || omsi_cfg::env::var_os("OMSI_NO_TUNNEL").is_some() || omsi_cfg::env::var_os("OMSI_NO_BRIDGE").is_some() {
         return;
     }
     // (in the background: cloudflared is fetched first when it is not installed)
@@ -887,7 +891,12 @@ pub fn start(args: &Args) -> Option<LanSession> {
             } else {
                 (*port, false)
             };
-            match LanSession::host(p, &player_name(args), world, try_next) {
+            let bind = if args.server.is_some() && crate::server::SERVER_GATEWAY_ONLY.get().copied().unwrap_or(false) {
+                std::net::Ipv4Addr::LOCALHOST
+            } else {
+                std::net::Ipv4Addr::UNSPECIFIED
+            };
+            match LanSession::host_bound(bind, p, &player_name(args), world, try_next) {
                 Ok(s) => Some(s),
                 Err(e) => {
                     log::warn!("LAN: cannot host on port {p}: {e}");
@@ -1000,8 +1009,8 @@ pub fn start(args: &Args) -> Option<LanSession> {
 pub fn share_mods(args: &mut Args, lan: &mut LanSession) {
     match lan.role {
         Role::Host => {
-            if let Some(port) = lan.local_addr().map(|a| a.port()) {
-                crate::lan_mods::serve(port, lan.session, args);
+            if let Some(listen) = lan.local_addr() {
+                crate::lan_mods::serve(listen, lan.session, args);
             }
         }
         Role::Client => {

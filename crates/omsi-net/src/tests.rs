@@ -2,6 +2,24 @@
 
 use super::*;
 
+#[test]
+fn access_gateway_backend_is_loopback_only_and_not_discoverable() {
+    let mut host = LanSession::host_bound(Ipv4Addr::LOCALHOST, 0, "restricted", world("m"), false).unwrap();
+    host.configure_dedicated(50);
+    assert!(host.local_addr().unwrap().ip().is_loopback());
+    assert!(host.bridge.is_none(), "no STUN/rendezvous route may bypass the access gateway");
+    assert!(host.code().is_none(), "a private backend must not advertise a public session code");
+    let socket = raw();
+    socket.send_to(format!("DISCOVER|{PROTOCOL}").as_bytes(), host.local_addr().unwrap()).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    host.tick(0.01, &Pose::default());
+    let mut buf = [0u8; MAX_DATAGRAM];
+    assert!(socket.recv_from(&mut buf).is_err(), "private backend does not answer discovery");
+    let (_socket, _id, players) = admit_raw_player(&mut host, 9159);
+    assert_eq!(players, 1, "trusted gateway can still deliver the ordinary LAN protocol");
+    assert_eq!(host.player_count(), 1);
+}
+
 fn pose(x: f64) -> Pose {
     Pose {
         name: "p".into(),

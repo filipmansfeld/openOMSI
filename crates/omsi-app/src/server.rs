@@ -31,6 +31,9 @@ pub(crate) struct ServerCfg {
     pub passengers: bool,
     pub port: u16,
     pub web_port: u16,
+    /// All backend transports are loopback-only; an authenticated HTTPS gateway
+    /// must expose the game and downloads. Never publish an alternate tunnel.
+    pub gateway_only: bool,
     pub max_players: usize,
     pub tunnel: bool,
     pub radius: i32,
@@ -81,6 +84,10 @@ passengers = 1
 port = 27015
 web_port = 27025
 max_players = 16
+
+# restrict UDP, HTTP/WebSocket and file TCP to 127.0.0.1, with no discovery or tunnel
+# (requires an authenticated HTTPS gateway on the same machine; 0 keeps ordinary LAN)
+gateway_only = 0
 
 # start a free Cloudflare quick tunnel (needs cloudflared) and print its https address
 tunnel = 1
@@ -136,6 +143,13 @@ impl ServerCfg {
         let get = |k: &str, d: &str| kv.get(k).cloned().filter(|v| !v.is_empty()).unwrap_or_else(|| d.to_string());
         let flag = |k: &str, d: bool| kv.get(k).map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")).unwrap_or(d);
         let num = |k: &str, d: i64| kv.get(k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(d);
+        // An access-control typo must fail closed instead of exposing the backend.
+        let gateway_only = match kv.get("gateway_only").map(|v| v.to_ascii_lowercase()) {
+            None => false,
+            Some(v) if matches!(v.as_str(), "1" | "true" | "yes" | "on") => true,
+            Some(v) if matches!(v.as_str(), "0" | "false" | "no" | "off") => false,
+            Some(_) => anyhow::bail!("gateway_only must be 0 or 1"),
+        };
         let dir = path.parent().unwrap_or(Path::new("."));
         let icon = std::fs::read(dir.join("server-icon.png")).ok().filter(|b| b.starts_with(b"\x89PNG") && b.len() < 256 * 1024).unwrap_or_default();
         Ok(ServerCfg {
@@ -150,8 +164,9 @@ impl ServerCfg {
             passengers: flag("passengers", true),
             port: num("port", 27015).clamp(1, 65535) as u16,
             web_port: num("web_port", 27025).clamp(1, 65535) as u16,
+            gateway_only,
             max_players: num("max_players", 16).clamp(1, omsi_net::MAX_PEERS as i64) as usize,
-            tunnel: flag("tunnel", true),
+            tunnel: flag("tunnel", true) && !gateway_only,
             radius: num("radius", 0) as i32,
             icon,
             admin_password: kv.get("admin_password").cloned().unwrap_or_default(),
@@ -199,6 +214,7 @@ pub(crate) fn prepare(args: &mut Args, path: &Path) -> Result<ServerCfg> {
     crate::real_time::set_server_real(cfg.real_time);
     let _ = SERVER_VEHICLES.set(cfg.vehicles.clone());
     let _ = SERVER_EXCLUSIVE_TOURS.set(cfg.exclusive_tours);
+    let _ = SERVER_GATEWAY_ONLY.set(cfg.gateway_only);
     args.map = cfg.map.clone();
     args.time = cfg.time.clone();
     if let Some(d) = &cfg.date {
@@ -240,6 +256,7 @@ pub(crate) static SERVER_METAR: std::sync::OnceLock<Option<String>> = std::sync:
 /// The buses a dedicated server allows (`vehicles`; empty: every bus it has).
 pub(crate) static SERVER_VEHICLES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 pub(crate) static SERVER_EXCLUSIVE_TOURS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+pub(crate) static SERVER_GATEWAY_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// A dedicated server's admin password and clock speed (for the host loop).
 pub(crate) static SERVER_ADMIN: std::sync::OnceLock<(String, f64)> = std::sync::OnceLock::new();
@@ -293,6 +310,40 @@ pub(crate) fn player_info<'a>(q: &omsi_net::Pose, pose_of: impl Fn(u32) -> Optio
         aboard,
         lat_lon: omsi_map::world_to_lat_lon(x, y),
     })
+}
+
+#[cfg(test)]
+mod access_config_tests {
+    use super::*;
+
+    fn config(text: &str) -> Result<ServerCfg> {
+        let dir = std::env::temp_dir().join(format!("openomsi-access-config-{}-{}", std::process::id(), omsi_net::random_session_id()));
+        std::fs::create_dir(&dir)?;
+        let path = dir.join("server.cfg");
+        std::fs::write(&path, text)?;
+        let cfg = ServerCfg::load(&path);
+        std::fs::remove_dir_all(&dir)?;
+        cfg
+    }
+
+    #[test]
+    fn access_gateway_config_suppresses_all_tunnels() {
+        let cfg = config("gateway_only = 1\ntunnel = 1\n").unwrap();
+        assert!(cfg.gateway_only);
+        assert!(!cfg.tunnel, "a quick tunnel would bypass Discord authentication");
+        assert!(!config("gateway_only = true\n").unwrap().tunnel);
+        let ordinary = config("tunnel = 1\n").unwrap();
+        assert!(!ordinary.gateway_only);
+        assert!(ordinary.tunnel, "ordinary hosts preserve their prior behavior");
+    }
+
+    #[test]
+    fn access_gateway_config_rejects_access_control_typos() {
+        for typo in ["treu", "2", "", "offf"] {
+            assert!(config(&format!("gateway_only = {typo}\n")).is_err());
+        }
+        assert!(!config("gateway_only = 0\n").unwrap().gateway_only);
+    }
 }
 
 #[cfg(test)]

@@ -1569,17 +1569,31 @@ impl LanSession {
         world: WorldInfo,
         try_next: bool,
     ) -> std::io::Result<LanSession> {
+        Self::host_bound(Ipv4Addr::UNSPECIFIED, port, name, world, try_next)
+    }
+
+    /// Host on an explicit interface. A loopback-only backend is reached exclusively
+    /// through a trusted, authenticated WebSocket gateway on the same machine.
+    pub fn host_bound(
+        bind: Ipv4Addr,
+        port: u16,
+        name: &str,
+        world: WorldInfo,
+        try_next: bool,
+    ) -> std::io::Result<LanSession> {
         let mut last_err = None;
         let tries = if try_next { PORT_RANGE } else { 1 };
         for p in port..port.saturating_add(tries) {
-            match UdpSocket::bind(("0.0.0.0", p)) {
+            match UdpSocket::bind((bind, p)) {
                 Ok(socket) => {
                     socket.set_nonblocking(true)?;
-                    socket.set_broadcast(true)?;
+                    socket.set_broadcast(!bind.is_loopback())?;
                     let mut s = LanSession::new(socket, Role::Host, name, world);
                     s.session = random_session_id();
-                    s.bridge = bridge::Bridge::start(true, s.session, local_addrs(p), p);
-                    log::info!("LAN: hosting session {} on port {p} as '{name}' (protocol {PROTOCOL}), code {}", session_hex(s.session), s.code().map(|c| c.encode()).unwrap_or_default());
+                    if !bind.is_loopback() {
+                        s.bridge = bridge::Bridge::start(true, s.session, local_addrs(p), p);
+                    }
+                    log::info!("LAN: hosting session {} on {} as '{name}' (protocol {PROTOCOL}), code {}", session_hex(s.session), s.local_addr().map(|a| a.to_string()).unwrap_or_default(), s.code().map(|c| c.encode()).unwrap_or_default());
                     if p != port {
                         log::info!("LAN: port {port} is taken (another session on this machine?), using {p}");
                     }
@@ -1724,7 +1738,11 @@ impl LanSession {
         if self.role != Role::Host {
             return None;
         }
-        let port = self.local_addr()?.port();
+        let local = self.local_addr()?;
+        if local.ip().is_loopback() {
+            return None;
+        }
+        let port = local.port();
         // the address the internet sees first (when the router kept the port: forwarded, or
         // mapped to the same one), then this machine's own
         let mut ips = code_ipv4s();
@@ -2652,6 +2670,9 @@ impl LanSession {
             let parts: Vec<&str> = text.split('|').collect();
             match (parts[0], self.role) {
                 ("DISCOVER", Role::Host) => {
+                    if self.local_addr().is_some_and(|a| a.ip().is_loopback()) {
+                        continue;
+                    }
                     let msg = format!(
                         "HERE|{PROTOCOL}|{}|{}|{}|{}",
                         self.my_name,

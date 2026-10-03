@@ -230,6 +230,15 @@ fn collect(args: &Args) -> (Manifest, Vec<PathBuf>) {
             want_folder(f, &mut files, &mut text_todo);
         }
     }
+    // A dedicated server does not drive a bus itself. Its allowed vehicles still
+    // belong to the session's download closure when a separate mod root is shared.
+    if args.server.is_some() {
+        for bus in crate::server::SERVER_VEHICLES.get().into_iter().flatten() {
+            if let Some(folder) = owner_folder(&norm(bus)) {
+                want_folder(folder, &mut files, &mut text_todo);
+            }
+        }
+    }
     if let Some(w) = args.weather.as_deref() {
         let w = norm(w);
         if let Some((root, path)) = omsi_cfg::find_in_roots(&w) {
@@ -378,11 +387,14 @@ fn collect(args: &Args) -> (Manifest, Vec<PathBuf>) {
 }
 
 /// Serve the session's mods on TCP `port` (a thread; the list is made in the background).
-pub fn serve(port: u16, session: u64, args: &Args) {
+pub fn serve(listen: SocketAddr, session: u64, args: &Args) {
     if omsi_cfg::env::var_os("OMSI_NO_LAN_MODS").is_some() {
         return;
     }
-    let listener = match TcpListener::bind(("0.0.0.0", port)) {
+    // Match the game transport's interface: a restricted host must never expose a
+    // raw file server that bypasses its authenticated WebSocket gateway.
+    let port = listen.port();
+    let listener = match TcpListener::bind(listen) {
         Ok(l) => l,
         Err(e) => {
             log::warn!("LAN mods: cannot serve on TCP port {port}: {e} (joining players need the host's mods installed)");

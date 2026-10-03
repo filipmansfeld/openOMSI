@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket};
+use tungstenite::client::IntoClientRequest;
 pub use crate::policy::TourOccupancy;
 
 /// What a server tells about itself (`GET /status`, and the launcher's list).
@@ -332,6 +333,92 @@ pub fn web_bases(target: &str) -> Vec<String> {
     out
 }
 
+/// Canonical HTTP/WebSocket origin. Credentials are tied to an explicit origin,
+/// never to whichever server discovery happens to answer first.
+fn access_origin(url: &str) -> Option<(bool, String, bool)> {
+    let (scheme, rest) = url.trim().split_once("://")?;
+    let secure = match scheme.to_ascii_lowercase().as_str() {
+        "https" | "wss" => true,
+        "http" | "ws" => false,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') || !authority.is_ascii() {
+        return None;
+    }
+    let default = if secure { 443 } else { 80 };
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, tail) = bracketed.split_once(']')?;
+        let ip = host.parse::<std::net::Ipv6Addr>().ok()?;
+        let port = if tail.is_empty() { default } else { tail.strip_prefix(':')?.parse::<u16>().ok()? };
+        (format!("[{ip}]"), port)
+    } else {
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => (host, port.parse::<u16>().ok()?),
+            None => (authority, default),
+        };
+        if host.is_empty() || !host.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-')) {
+            return None;
+        }
+        (host.to_ascii_lowercase(), port)
+    };
+    if port == 0 { return None; }
+    let loopback = host == "[::1]" || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback());
+    Some((secure, format!("{host}:{port}"), loopback))
+}
+
+fn scoped_access_header(url: &str, origin: Option<&str>, token: Option<&str>) -> Result<Option<String>, String> {
+    let Some(token) = token.filter(|t| !t.is_empty()) else { return Ok(None) };
+    let configured = origin.and_then(access_origin).ok_or("access origin is not configured")?;
+    let Some(requested) = access_origin(url) else { return Ok(None) };
+    if (configured.0, &configured.1) != (requested.0, &requested.1) {
+        return Ok(None);
+    }
+    if !requested.0 && !requested.2 {
+        return Err("access credentials require HTTPS or WSS".into());
+    }
+    // Bound both header size and accepted characters. Errors never echo the secret.
+    if token.len() > 4096 || !token.bytes().all(|c| c.is_ascii_graphic()) {
+        return Err("invalid access credential".into());
+    }
+    Ok(Some(format!("Bearer {token}")))
+}
+
+fn access_header(url: &str) -> Result<Option<String>, String> {
+    let token = std::env::var("OMSI_ACCESS_TOKEN").ok();
+    let origin = std::env::var("OMSI_ACCESS_ORIGIN").ok();
+    scoped_access_header(url, origin.as_deref(), token.as_deref())
+}
+
+fn ws_request(url: &str, authorization: Option<&str>) -> Result<tungstenite::handshake::client::Request, String> {
+    let mut request = url.into_client_request().map_err(|e| e.to_string())?;
+    if let Some(authorization) = authorization {
+        let value = tungstenite::http::HeaderValue::from_str(authorization).map_err(|_| "invalid access credential")?;
+        request.headers_mut().insert(tungstenite::http::header::AUTHORIZATION, value);
+    }
+    Ok(request)
+}
+
+fn get_with_access(agent: &ureq::Agent, url: &str) -> Result<ureq::Response, String> {
+    let authorization = access_header(url)?;
+    get_authorized(agent, url, authorization.as_deref())
+}
+
+fn get_authorized(agent: &ureq::Agent, url: &str, authorization: Option<&str>) -> Result<ureq::Response, String> {
+    let mut request = agent.get(url);
+    if let Some(authorization) = authorization {
+        request = request.set("Authorization", authorization);
+    }
+    request.call().map_err(|e| e.to_string())
+}
+
+/// Fetch private metadata from the configured access origin. Redirects are disabled:
+/// a server must not redirect the player's credential to another origin.
+pub fn access_get(url: &str) -> Result<ureq::Response, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(6)).redirects(0).user_agent("openOMSI").build();
+    get_with_access(&agent, url)
+}
+
 /// Ask a server (by its address as typed) about itself: its status and its icon.
 pub fn query(target: &str, with_icon: bool) -> Result<ServerInfo, String> {
     let target = &crate::official::resolve_target(target)?;
@@ -339,11 +426,11 @@ pub fn query(target: &str, with_icon: bool) -> Result<ServerInfo, String> {
     if bases.is_empty() {
         return Err("no address given".into());
     }
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(6)).user_agent("openOMSI").build();
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(6)).redirects(0).user_agent("openOMSI").build();
     let mut err = String::new();
     let mut found = None;
     for base in bases {
-        match agent.get(&format!("{base}/status")).call().map_err(|e| e.to_string()).and_then(|r| r.into_string().map_err(|e| e.to_string())) {
+        match get_with_access(&agent, &format!("{base}/status")).and_then(|r| r.into_string().map_err(|e| e.to_string())) {
             Ok(body) => match ServerInfo::from_json(&body) {
                 Some(i) => {
                     found = Some((base, i));
@@ -362,7 +449,7 @@ pub fn query(target: &str, with_icon: bool) -> Result<ServerInfo, String> {
     info.reached_at = base.clone();
     if with_icon && !info.icon.is_empty() {
         info.icon.clear();
-        if let Ok(r) = agent.get(&format!("{base}/icon.png")).call() {
+        if let Ok(r) = get_with_access(&agent, &format!("{base}/icon.png")) {
             let mut buf = Vec::new();
             if r.into_reader().take(512 * 1024).read_to_end(&mut buf).is_ok() && buf.starts_with(b"\x89PNG") {
                 info.icon = buf;
@@ -568,10 +655,19 @@ fn serve(stream: TcpStream, target: SocketAddr, info: &Mutex<ServerInfo>, stop: 
     }
     let mut ws = tungstenite::accept(stream).map_err(|e| e.to_string())?;
     let udp = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    // Only the actual backend may send WELCOME (and therefore identify the peer
+    // released when this authenticated connection is revoked or goes away).
+    udp.connect(target).map_err(|e| e.to_string())?;
     udp.set_nonblocking(true).map_err(|e| e.to_string())?;
     ws.get_mut().set_read_timeout(Some(Duration::from_millis(5))).map_err(|e| e.to_string())?;
     connected.fetch_add(1, Ordering::Relaxed);
-    let r = pump(&mut ws, &udp, |u, d| u.send_to(d, target).map(|_| ()), stop);
+    let mut admitted_id = None;
+    let r = pump(&mut ws, &udp, |u, d| u.send_to(d, target).map(|_| ()), stop, &mut admitted_id);
+    if let Some(id) = admitted_id {
+        // Same source socket as the player's HELLO: the backend's normal address
+        // check authenticates this BYE and immediately releases their claimed tour.
+        let _ = udp.send(format!("BYE|{id}").as_bytes());
+    }
     connected.fetch_sub(1, Ordering::Relaxed);
     r
 }
@@ -582,7 +678,7 @@ fn html(s: &str) -> String {
 
 /// Carry datagrams both ways between a WebSocket and a UDP socket until either side goes.
 /// `send` hands a message from the WebSocket to the UDP side.
-fn pump<S: Read + Write>(ws: &mut WebSocket<S>, udp: &UdpSocket, mut send: impl FnMut(&UdpSocket, &[u8]) -> std::io::Result<()>, stop: &AtomicBool) -> Result<(), String> {
+fn pump<S: Read + Write>(ws: &mut WebSocket<S>, udp: &UdpSocket, mut send: impl FnMut(&UdpSocket, &[u8]) -> std::io::Result<()>, stop: &AtomicBool, admitted_id: &mut Option<u32>) -> Result<(), String> {
     let mut buf = vec![0u8; 2048];
     let mut last_in = Instant::now();
     let mut last_ping = Instant::now();
@@ -607,6 +703,14 @@ fn pump<S: Read + Write>(ws: &mut WebSocket<S>, udp: &UdpSocket, mut send: impl 
         loop {
             match udp.recv_from(&mut buf) {
                 Ok((n, _)) => {
+                    if let Ok(text) = std::str::from_utf8(&buf[..n]) {
+                        let mut parts = text.split('|');
+                        if parts.next() == Some("WELCOME") && parts.next().and_then(|p| p.parse::<u32>().ok()) == Some(crate::PROTOCOL) {
+                            if let Some(id) = parts.next().and_then(|p| p.parse::<u32>().ok()).filter(|id| *id >= 2) {
+                                *admitted_id = Some(id);
+                            }
+                        }
+                    }
                     idle = false;
                     if let Err(e) = ws.send(Message::Binary(buf[..n].to_vec().into())) {
                         if !matches!(&e, tungstenite::Error::Io(io) if io.kind() == ErrorKind::WouldBlock) {
@@ -692,15 +796,23 @@ fn pump_tcp<S: Read + Write>(ws: &mut WebSocket<S>, mut tcp: TcpStream, stop: &A
 /// A local TCP port whose connections go over WebSockets to `url` (`wss://…/tcp`): the
 /// host's mods fetched through its tunnel.
 pub fn tcp_forward(url: &str) -> std::io::Result<SocketAddr> {
+    let authorization = access_header(url).map_err(std::io::Error::other)?;
+    tcp_forward_authorized(url, authorization)
+}
+
+fn tcp_forward_authorized(url: &str, authorization: Option<String>) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
     let url = url.to_string();
     std::thread::Builder::new().name("ws tcp forward".into()).spawn(move || {
         for conn in listener.incoming().flatten() {
             let url = url.clone();
+            let authorization = authorization.clone();
             std::thread::spawn(move || {
                 let r = (|| -> Result<(), String> {
-                    let (mut ws, _) = tungstenite::connect(&url).map_err(|e| format!("{url}: {e}"))?;
+                    let request = ws_request(&url, authorization.as_deref())?;
+                    let redirects = if authorization.is_some() { 0 } else { 3 };
+                    let (mut ws, _) = tungstenite::client::connect_with_config(request, None, redirects).map_err(|e| format!("{url}: {e}"))?;
                     match ws.get_mut() {
                         tungstenite::stream::MaybeTlsStream::Plain(s) => s.set_read_timeout(Some(Duration::from_millis(5))),
                         tungstenite::stream::MaybeTlsStream::Rustls(s) => s.get_mut().set_read_timeout(Some(Duration::from_millis(5))),
@@ -735,11 +847,17 @@ impl Drop for WsClient {
 impl WsClient {
     /// Connect to `url` (`wss://…/ws`) and give the local address to join.
     pub fn connect(url: &str) -> Result<WsClient, String> {
+        Self::connect_authorized(url, access_header(url)?)
+    }
+
+    fn connect_authorized(url: &str, authorization: Option<String>) -> Result<WsClient, String> {
+        let request = ws_request(url, authorization.as_deref())?;
+        let redirects = if authorization.is_some() { 0 } else { 3 };
         // (a dead tunnel must not hold the game's start for ever)
         let (tx, rx) = std::sync::mpsc::channel();
         let u = url.to_string();
         std::thread::spawn(move || {
-            let _ = tx.send(tungstenite::connect(&u).map(|x| x.0).map_err(|e| format!("{u}: {e}")));
+            let _ = tx.send(tungstenite::client::connect_with_config(request, None, redirects).map(|x| x.0).map_err(|e| format!("{u}: {e}")));
         });
         let mut ws = rx.recv_timeout(Duration::from_secs(12)).map_err(|_| format!("{url}: no answer within 12 s"))??;
         match ws.get_mut() {
@@ -831,6 +949,157 @@ impl WsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_credentials_are_scoped_to_one_secure_origin() {
+        let origin = Some("https://tangenta.example");
+        let token = Some("short-lived-test-ticket");
+        for url in ["wss://tangenta.example/ws", "https://TANGENTA.example:443/players", "https://tangenta.example/status"] {
+            assert_eq!(scoped_access_header(url, origin, token).unwrap().as_deref(), Some("Bearer short-lived-test-ticket"));
+        }
+        for url in ["wss://other.example/ws", "https://tangenta.example.evil/status", "https://tangenta.example:8443/status", "http://tangenta.example/status", "wss://tangenta.example@evil.example/ws"] {
+            assert!(scoped_access_header(url, origin, token).unwrap().is_none(), "credential must not leave its origin: {url}");
+        }
+        assert!(scoped_access_header("http://public.example/status", Some("http://public.example"), token).is_err());
+        assert!(scoped_access_header("ws://127.0.0.1:27026/ws", Some("http://127.0.0.1:27026"), token).unwrap().is_some());
+        assert!(scoped_access_header("ws://[::1]:27026/ws", Some("http://[::1]:27026"), token).unwrap().is_some());
+        assert!(scoped_access_header("wss://tangenta.example/ws", None, token).is_err());
+        let error = scoped_access_header("https://tangenta.example/status", origin, Some("SECRET\r\nInjected: yes")).unwrap_err();
+        assert!(!error.contains("SECRET"), "validation errors must not echo credentials");
+    }
+
+    #[test]
+    fn access_http_metadata_does_not_follow_credential_redirects() {
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let address = origin.local_addr().unwrap();
+        let other = destination.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = origin.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert_eq!(header(&request, "authorization"), Some("Bearer short-lived-test-ticket"));
+            stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{other}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+        });
+        let url = format!("http://{address}/players");
+        let origin = format!("http://{address}");
+        let authorization = scoped_access_header(&url, Some(&origin), Some("short-lived-test-ticket")).unwrap();
+        let agent = ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(3)).build();
+        let _ = get_authorized(&agent, &url, authorization.as_deref());
+        worker.join().unwrap();
+        assert!(matches!(destination.accept(), Err(e) if e.kind() == ErrorKind::WouldBlock), "no request, and no credential, reaches the redirect destination");
+    }
+
+    /// A stand-in authenticated gateway, which checks the actual WebSocket header.
+    fn access_echo_gateway(path: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}{path}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut ws = tungstenite::accept_hdr(stream, |request: &tungstenite::handshake::server::Request, response| {
+                assert_eq!(request.uri().path(), path);
+                assert_eq!(request.headers().get("Authorization").and_then(|h| h.to_str().ok()), Some("Bearer short-lived-test-ticket"));
+                Ok(response)
+            }).unwrap();
+            let data = loop {
+                if let Message::Binary(data) = ws.read().unwrap() { break data; }
+            };
+            ws.send(Message::Binary(data)).unwrap();
+            let _ = ws.close(None);
+        });
+        (url, worker)
+    }
+
+    #[test]
+    fn access_game_and_file_connections_send_bearer_headers() {
+        let (url, worker) = access_echo_gateway("/ws");
+        let origin = url.strip_suffix("/ws").unwrap();
+        let authorization = scoped_access_header(&url, Some(origin), Some("short-lived-test-ticket")).unwrap();
+        let client = WsClient::connect_authorized(&url, authorization).unwrap();
+        let game = UdpSocket::bind("127.0.0.1:0").unwrap();
+        game.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        game.send_to(b"HELLO", client.local).unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _) = game.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"HELLO");
+        worker.join().unwrap();
+
+        let (url, worker) = access_echo_gateway("/tcp");
+        let origin = url.strip_suffix("/tcp").unwrap();
+        let authorization = scoped_access_header(&url, Some(origin), Some("short-lived-test-ticket")).unwrap();
+        let local = tcp_forward_authorized(&url, authorization).unwrap();
+        let mut transfer = TcpStream::connect(local).unwrap();
+        transfer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        transfer.write_all(b"OMSIMODS/1 ABC\nLIST\n").unwrap();
+        let mut got = [0u8; 20];
+        transfer.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"OMSIMODS/1 ABC\nLIST\n");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn access_game_and_file_connections_do_not_redirect_credentials() {
+        for path in ["/ws", "/tcp"] {
+            let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+            let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+            destination.set_nonblocking(true).unwrap();
+            let url = format!("ws://{}{path}", origin.local_addr().unwrap());
+            let other = destination.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut stream, _) = origin.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]);
+                assert_eq!(header(&request, "authorization"), Some("Bearer short-lived-test-ticket"));
+                stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: ws://{other}{path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+            });
+            let authorization = Some("Bearer short-lived-test-ticket".to_string());
+            if path == "/ws" {
+                assert!(WsClient::connect_authorized(&url, authorization).is_err());
+            } else {
+                let local = tcp_forward_authorized(&url, authorization).unwrap();
+                let mut stream = TcpStream::connect(local).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut buf = [0u8; 1];
+                assert!(matches!(stream.read(&mut buf), Ok(0) | Err(_)));
+            }
+            worker.join().unwrap();
+            assert!(matches!(destination.accept(), Err(e) if e.kind() == ErrorKind::WouldBlock), "the {path} credential never reaches a redirected origin");
+        }
+    }
+
+    #[test]
+    fn access_gateway_disconnect_immediately_releases_player_and_tour() {
+        let mut host = crate::LanSession::host_bound(std::net::Ipv4Addr::LOCALHOST, 0, "restricted", crate::WorldInfo::default(), false).unwrap();
+        host.configure_dedicated(50);
+        host.set_server_policy(&["Vehicles/ok.bus".into()], true);
+        let gateway = WsGateway::start("127.0.0.1:0".parse().unwrap(), host.local_addr().unwrap(), ServerInfo::default()).unwrap();
+        let transport = WsClient::connect_authorized(&format!("ws://{}/ws", gateway.addr), None).unwrap();
+        let mut game = crate::LanSession::join_addr(vec![transport.local], None, "subscriber", crate::WorldInfo::default()).unwrap();
+        let pose = crate::Pose { bus: "Vehicles/ok.bus".into(), tour: "195/1".into(), flags: crate::FLAG_VEHICLE, ..Default::default() };
+        let until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < until && (host.player_count() != 1 || host.occupied_tours().len() != 1) {
+            game.info_acc = crate::INFO_EVERY;
+            game.tick(0.02, &pose);
+            host.tick(0.02, &crate::Pose::default());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(host.player_count(), 1, "ordinary private protocol remains compatible");
+        assert_eq!(host.occupied_tours().len(), 1, "whitelist and exclusive tour enforcement remain active");
+        drop(transport); // a gateway's role revocation closes exactly this stream
+        let until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < until && host.player_count() != 0 {
+            host.tick(0.02, &crate::Pose::default());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(host.player_count(), 0, "WSS close sends BYE instead of waiting for the loading timeout");
+        assert!(host.occupied_tours().is_empty(), "a revoked subscription cannot retain a duty claim");
+    }
 
     #[test]
     fn urls() {
