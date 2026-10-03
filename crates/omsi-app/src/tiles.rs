@@ -280,6 +280,14 @@ impl MapIndex {
         for (part, _, _) in parts.iter_mut().flatten() {
             index.splines.extend(std::mem::take(&mut part.splines));
         }
+        parts.par_iter_mut().flatten().for_each(|(part, rows, _)| {
+            for (tile, spline, attachment) in std::mem::take(&mut rows.2) {
+                let origin = DVec2::new(tile.0 as f64 * tile_size(), tile.1 as f64 * tile_size());
+                let Some(first) = row_start(&attachment, &spline, Some(&index))
+                    .and_then(|start| place_on(&attachment, &spline, origin, Some(&index), start).into_iter().next()) else { continue };
+                part.objects.entry(attachment.id).or_insert((tile, first.pose.pos, [first.pose.heading(), 0.0, 0.0]));
+            }
+        });
         let named: HashSet<i64> = parts.iter().flatten().flat_map(|p| p.2 .0.iter().copied()).collect();
         let mut programs: HashMap<String, bool> = HashMap::new();
         for (_, ids, names) in parts.iter().flatten().map(|p| &p.2) {
@@ -301,13 +309,7 @@ impl MapIndex {
         }
         for p in parts {
             match p {
-                Some((mut p, (r, q, objects), _)) => {
-                    for (tile, spline, attachment) in objects {
-                        let origin = DVec2::new(tile.0 as f64 * tile_size(), tile.1 as f64 * tile_size());
-                        let Some(first) = row_start(&attachment, &spline, Some(&index))
-                            .and_then(|start| place_on(&attachment, &spline, origin, Some(&index), start).into_iter().next()) else { continue };
-                        p.objects.entry(attachment.id).or_insert((tile, first.pose.pos, [first.pose.heading(), 0.0, 0.0]));
-                    }
+                Some((p, (r, q, _), _)) => {
                     for (id, v) in p.objects {
                         if let Some(prev) = index.objects.get(&id).filter(|prev| prev.0 != v.0) {
                             index.duplicates.insert((prev.0, id), (prev.1, prev.2));
