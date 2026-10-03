@@ -599,3 +599,128 @@ fn height_normals_preserve_both_physical_axes_and_legacy_normal_conventions() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires a graphics adapter; verifies the saved parallax renderer option"]
+fn disabling_height_parallax_retains_normals_and_original_colour_uv() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let mut renderer = pollster::block_on(Renderer::new_with(
+        &instance,
+        None,
+        Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+        RenderOptions {
+            height_parallax: false,
+            msaa: 1,
+            ssao: false,
+            shadow_size: 1024,
+            fxaa: false,
+            render_scale: 1.0,
+            ..Default::default()
+        },
+    ))
+    .expect("test renderer");
+    let mut rgba = Vec::new();
+    for y in 0..32 {
+        for _ in 0..32 {
+            let value = (128.0 + 95.0 * (y as f32 / 32.0 * std::f32::consts::TAU * 4.0).sin())
+                .round() as u8;
+            rgba.extend_from_slice(&[value, 100, 100, 255]);
+        }
+    }
+    let texture = omsi_texture::Image {
+        width: 32,
+        height: 32,
+        rgba,
+        has_alpha: false,
+    };
+    let mut scene = renderer.new_scene();
+    let mut materials = Vec::new();
+    for kind in ["height", "normal", "plain"] {
+        let diffuse = renderer.add_texture(&mut scene, &texture, true);
+        if kind != "plain" {
+            renderer.add_pbr_maps(
+                &mut scene,
+                diffuse,
+                &omsi_texture::pbr::PbrImages {
+                    normal: Some(image([64, 128, 238, 128])),
+                    height_scale: if kind == "height" { 0.4 } else { 0.0 },
+                    orm: None,
+                    flags: [3.0, 0.0, 0.0, 0.0],
+                },
+            );
+        }
+        materials.push(renderer.add_material(
+            &mut scene,
+            Some(diffuse),
+            AlphaMode::Opaque,
+            [1.0; 4],
+            false,
+        ));
+    }
+    let mesh = renderer.add_mesh(
+        &mut scene,
+        &MeshData {
+            positions: vec![
+                Vec3::new(-4.0, -4.0, 0.0),
+                Vec3::new(4.0, -4.0, 0.0),
+                Vec3::new(4.0, 4.0, 0.0),
+                Vec3::new(-4.0, 4.0, 0.0),
+            ],
+            normals: vec![Vec3::Z; 4],
+            uvs: vec![
+                glam::Vec2::ZERO,
+            glam::Vec2::X,
+                glam::Vec2::ONE,
+                glam::Vec2::Y,
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            ranges: vec![(0, 6, 0)],
+            one_sided: false,
+        },
+    );
+    let id = renderer.add_instance(
+        &mut scene,
+        mesh,
+        DVec3::ZERO,
+        Mat4::IDENTITY,
+        vec![materials[0]],
+    );
+    let camera = Camera {
+        position: DVec3::new(0.0, -3.0, 3.0),
+        yaw: 0.0,
+        pitch: -45.0,
+        roll: 0.0,
+        fov_deg: 50.0,
+        near: 0.1,
+        far: 100.0,
+    };
+    let lighting = Lighting {
+        enhanced: true,
+        sun_dir: Vec3::new(0.866, 0.0, 0.5),
+        sun_intensity: 1.0,
+        shadows: false,
+        detail: false,
+        fog_density: 0.0,
+        ..Default::default()
+    };
+    let height = renderer
+        .render_to_image(&mut scene, 64, 64, &camera, &lighting)
+        .unwrap();
+    scene.instances[id].materials = vec![materials[1]];
+    let normal = renderer
+        .render_to_image(&mut scene, 64, 64, &camera, &lighting)
+        .unwrap();
+    scene.instances[id].materials = vec![materials[2]];
+    let plain = renderer
+        .render_to_image(&mut scene, 64, 64, &camera, &lighting)
+        .unwrap();
+    assert!(
+        height.iter().zip(&normal).all(|(a, b)| a.abs_diff(*b) <= 3),
+        "disabled parallax still moved colour"
+    );
+    let at = (32 * 64 + 32) * 4;
+    assert!(
+        (0..3).any(|i| height[at + i].abs_diff(plain[at + i]) >= 8),
+        "disabling parallax removed the height normal"
+    );
+}
