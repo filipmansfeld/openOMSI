@@ -233,6 +233,17 @@ pub(crate) struct Args {
     pub(crate) content_zip: Vec<PathBuf>,
 }
 
+impl Args {
+    /// Warm the local random fleet only when this run supplies its own traffic. A
+    /// requested LAN client loads the host's vehicles on demand instead; warming every
+    /// local type and paint scheme would keep unused GPU resources for the whole session.
+    /// Hosting takes precedence over joining, including dedicated servers.
+    pub(crate) fn precache_random_traffic(&self) -> bool {
+        self.traffic > 0
+            && (self.server.is_some() || self.lan_host.is_some() || self.lan_join.is_none())
+    }
+}
+
 pub(crate) fn parse_time(s: &str) -> f64 {
     let mut it = s.split(':');
     let h: f64 = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(9.0);
@@ -285,4 +296,49 @@ pub(crate) struct SituationOther {
     pub paint: Option<String>,
     pub vars: Vec<(String, f32)>,
     pub strvars: Vec<(String, String)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_traffic_precache_follows_the_requested_session_role() {
+        let cases: &[(&[&str], bool)] = &[
+            (&["--traffic", "31"], true),
+            (&["--traffic", "0"], false),
+            (&["--traffic", "31", "--lan-join", "auto"], false),
+            (
+                &["--traffic", "31", "--lan-join", "192.168.1.21:27015"],
+                false,
+            ),
+            (
+                &["--traffic", "31", "--lan-join", "https://example.org"],
+                false,
+            ),
+            (&["--traffic", "31", "--lan-host", "0"], true),
+            (
+                &["--traffic", "31", "--lan-host", "0", "--lan-join", "auto"],
+                true,
+            ),
+            (
+                &[
+                    "--traffic",
+                    "31",
+                    "--server",
+                    "server.cfg",
+                    "--lan-join",
+                    "auto",
+                ],
+                true,
+            ),
+            (&["--traffic", "0", "--lan-host", "0"], false),
+            (&["--traffic", "0", "--server", "server.cfg"], false),
+        ];
+        for (arguments, expected) in cases {
+            let args =
+                Args::parse_from(std::iter::once("openomsi").chain(arguments.iter().copied()));
+            assert_eq!(args.precache_random_traffic(), *expected, "{arguments:?}");
+        }
+    }
 }

@@ -653,7 +653,7 @@ impl App {
                             if let Some(lan) = self.lan.as_ref() {
                                 t.set_lan_seed(lan::population_seed(lan));
                             }
-                            if self.args.traffic > 0 {
+                            if self.args.precache_random_traffic() {
                                 t.precache_random(&w, &renderer, &mut scene);
                             }
                             t.day_time = parse_time(&self.args.time);

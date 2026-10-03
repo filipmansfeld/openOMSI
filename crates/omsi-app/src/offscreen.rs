@@ -48,7 +48,7 @@ pub(crate) fn run_offscreen(
         if let Some(seed) = lan_seed {
             t.set_lan_seed(seed);
         }
-        if args.traffic > 0 {
+        if args.precache_random_traffic() {
             t.precache_random(&world, &renderer, &mut scene);
         }
         Some(t)
