@@ -225,14 +225,16 @@ fn height_normals_preserve_both_physical_axes_and_legacy_normal_conventions() {
         fog_density: 0.0,
         ..Default::default()
     };
-    for (flag, axis) in [
-        (1.0, 0),
-        (1.0, 1),
-        (2.0, 0),
-        (2.0, 1),
-        (3.0, 0),
-        (3.0, 1),
-        (3.0, 2),
+    for (flag, axis, mirror) in [
+        (1.0, 0, 0),
+        (1.0, 1, 0),
+        (2.0, 0, 0),
+        (2.0, 1, 0),
+        (3.0, 0, 0),
+        (3.0, 1, 0),
+        (3.0, 2, 0),
+        (3.0, 0, 1),
+        (3.0, 1, 2),
     ] {
         let mut scene = renderer.new_scene();
         let plain = renderer.add_texture(&mut scene, &image([100, 100, 100, 255]), false);
@@ -261,7 +263,19 @@ fn height_normals_preserve_both_physical_axes_and_legacy_normal_conventions() {
         let mut expected =
             Vec3::new(rgba[0] as f32, rgba[1] as f32, rgba[2] as f32) / 255.0 * 2.0 - Vec3::ONE;
         if flag < 2.5 {
-            expected.y *= if flag > 1.5 { -0.5 } else { 0.5 };
+            // Preserve the existing DX/GL convention. With this downward camera the
+            // legacy cofactors point along -X/-Y, and the shared scale halves V.
+            expected.x = -expected.x;
+            expected.y *= if flag > 1.5 { 0.5 } else { -0.5 };
+        } else {
+            // Physical slopes follow increasing U/V in the surface, independent of
+            // screen orientation. Mirroring one UV axis reverses only that direction.
+            if mirror == 1 {
+                expected.x = -expected.x;
+            }
+            if mirror == 2 {
+                expected.y = -expected.y;
+            }
         }
         expected = if axis == 2 {
             Vec3::Z
@@ -285,12 +299,19 @@ fn height_normals_preserve_both_physical_axes_and_legacy_normal_conventions() {
                     glam::Vec2::ZERO,
                 ]
             } else {
-                vec![
+                [
                     glam::Vec2::ZERO,
                     glam::Vec2::X,
                     glam::Vec2::ONE,
                     glam::Vec2::Y,
                 ]
+                .into_iter()
+                .map(|uv| match mirror {
+                    1 => glam::Vec2::new(1.0 - uv.x, uv.y),
+                    2 => glam::Vec2::new(uv.x, 1.0 - uv.y),
+                    _ => uv,
+                })
+                .collect()
             },
             indices: vec![0, 1, 2, 0, 2, 3],
             ranges: vec![(0, 6, 0)],
@@ -318,7 +339,7 @@ fn height_normals_preserve_both_physical_axes_and_legacy_normal_conventions() {
         let (a, b) = (&actual[offset..offset + 3], &reference[offset..offset + 3]);
         assert!(
             (0..3).all(|i| a[i].abs_diff(b[i]) <= 3),
-            "flag {flag}, axis {axis}: {a:?} != analytic {b:?}"
+            "flag {flag}, axis {axis}, mirror {mirror}: {a:?} != analytic {b:?}"
         );
     }
 }

@@ -272,10 +272,14 @@ fn perturb_normal(n: vec3<f32>, p: vec3<f32>, uv: vec2<f32>, tn: vec3<f32>, phys
         let tt = dot(t, t);
         let bb = dot(b, b);
         let det = duv1.x * duv2.y - duv1.y * duv2.x;
-        if (min(tt, bb) < 1e-20 || det == 0.0) {
+        let orientation = dot(cross(dp1, dp2), n);
+        if (min(tt, bb) < 1e-20 || det == 0.0 || orientation == 0.0) {
             return n;
         }
-        return safe_normal(t * inverseSqrt(tt) * tn.x + b * inverseSqrt(bb) * tn.y + n * max(tn.z, 0.05));
+        // The cofactors also carry the screen-space surface orientation. Remove that
+        // sign, not the UV determinant's: mirrored UVs must retain their own direction.
+        let direction = sign(orientation);
+        return safe_normal(t * (direction * inverseSqrt(tt)) * tn.x + b * (direction * inverseSqrt(bb)) * tn.y + n * max(tn.z, 0.05));
     }
     let k = inverseSqrt(m);
     return safe_normal(t * k * tn.x + b * k * tn.y + n * max(tn.z, 0.05));
