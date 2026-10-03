@@ -4866,7 +4866,8 @@ impl Renderer {
     /// Terrain material: uv is tile space, the ground texture repeats `repeats` times per
     /// tile, its detail texture `detail` times, and the optional mask (alpha 0 = cut) is
     /// sampled in tile space.
-    /// `nightmap`: the tile's `.map.LM.bmp` (street lamp light pools), added at night.
+    /// `nightmap`: the tile's `.map.LM.bmp` (street lamp light pools), used as diffuse
+    /// lighting at night. Vanilla+ and Enhanced keep it as a fallback for live lamp pools.
     /// `moisture`: 1 when this layer's `<texture>.cfg` sidecar carries `[moisture]` or
     /// `[puddles]` (the map's base ground layer wets in the rain just like a painted one).
     #[allow(clippy::too_many_arguments)]
@@ -11102,6 +11103,178 @@ mod tests {
             b[0] > b[1] + 30 && b[0] > b[2] + 30,
             "foliage cutout must reveal red: {b:?}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; renders night terrain, splines and lightmaps"]
+    fn night_terrain_lightmaps_preserve_albedo_without_double_lighting() {
+        fn texture(renderer: &Renderer, scene: &mut Scene, rgb: [u8; 3]) -> TextureId {
+            renderer.add_texture(
+                scene,
+                &omsi_texture::Image {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![rgb[0], rgb[1], rgb[2], 255],
+                    has_alpha: false,
+                },
+                false,
+            )
+        }
+        fn quad(renderer: &Renderer, scene: &mut Scene, left: f32, right: f32, material: MaterialId) -> usize {
+            let mesh = renderer.add_mesh(
+                scene,
+                &MeshData {
+                    positions: vec![
+                        Vec3::new(left, -5.0, 0.0),
+                        Vec3::new(right, -5.0, 0.0),
+                        Vec3::new(right, 5.0, 0.0),
+                        Vec3::new(left, 5.0, 0.0),
+                    ],
+                    normals: vec![Vec3::Z; 4],
+                    uvs: vec![glam::Vec2::splat(0.5); 4],
+                    indices: vec![0, 1, 2, 0, 2, 3],
+                    ranges: vec![(0, 6, 0)],
+                    one_sided: false,
+                },
+            );
+            renderer.add_instance(scene, mesh, DVec3::ZERO, Mat4::IDENTITY, vec![material])
+        }
+        fn samples(renderer: &mut Renderer, scene: &mut Scene, camera: &Camera, lighting: &Lighting) -> ([i32; 3], [i32; 3]) {
+            let rgba = renderer.render_to_image(scene, 64, 64, camera, lighting).unwrap();
+            let sample = |x: usize| {
+                let mut rgb = [0; 3];
+                for y in 31..=33 {
+                    for sx in x - 1..=x + 1 {
+                        for c in 0..3 {
+                            rgb[c] += i32::from(rgba[(y * 64 + sx) * 4 + c]);
+                        }
+                    }
+                }
+                rgb.map(|v| v / 9)
+            };
+            (sample(16), sample(47))
+        }
+        let camera = Camera {
+            position: DVec3::new(0.0, -0.105, 6.0),
+            yaw: 0.0,
+            pitch: -89.0,
+            roll: 0.0,
+            fov_deg: 90.0,
+            near: 0.1,
+            far: 100.0,
+        };
+        for enhanced in [false, true] {
+            let mode = if enhanced { "Enhanced" } else { "VanillaPlus" };
+            let adapter = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let mut renderer = pollster::block_on(Renderer::new_with(
+                &adapter,
+                None,
+                Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                RenderOptions { msaa: 1, ssao: false, shadow_size: 1024, fxaa: false, render_scale: 1.0, ..Default::default() },
+            )).expect("test renderer");
+            let mut scene = renderer.new_scene();
+            let grey = texture(&renderer, &mut scene, [100; 3]);
+            let black = texture(&renderer, &mut scene, [0; 3]);
+            // The baked pool is below the live lamp's diffuse illumination in both paths.
+            let pool = texture(&renderer, &mut scene, [96; 3]);
+            let ground = renderer.add_terrain_material(&mut scene, Some(grey), None, None, 1.0, None, 0.0);
+            let baked = renderer.add_terrain_material(&mut scene, Some(grey), None, None, 1.0, Some(pool), 0.0);
+            let black_ground = renderer.add_terrain_material(&mut scene, Some(black), None, None, 1.0, None, 0.0);
+            let black_baked = renderer.add_terrain_material(&mut scene, Some(black), None, None, 1.0, Some(pool), 0.0);
+            // Match the production spline material, which maps the tile atlas in Classic
+            // but receives live map lamps in VanillaPlus and Enhanced.
+            renderer.light_map_next.set(true);
+            let spline = renderer.add_material(&mut scene, Some(grey), AlphaMode::Opaque, [1.0; 4], false);
+            let glow = renderer.add_material_night(&mut scene, Some(black), AlphaMode::Opaque, [1.0; 4], false, None, Some(pool));
+            let switched_glow = renderer.add_material_extra(
+                &mut scene, Some(black), AlphaMode::Opaque, [1.0; 4], false,
+                None, Some(pool), None, None, [0.0; 3],
+                MaterialExtra { night_switched: true, ..Default::default() },
+            );
+            let left = quad(&renderer, &mut scene, -5.0, -0.5, ground);
+            let right = quad(&renderer, &mut scene, 0.5, 5.0, spline);
+            scene.instances[left].render_phase = RenderPhase::Terrain;
+            scene.instances[right].render_phase = RenderPhase::Spline;
+            scene.instances[right].surface = true;
+            let night = Lighting {
+                enhanced,
+                classic: false,
+                sun_dir: -Vec3::Z,
+                sun_intensity: 0.0,
+                secondary: Vec3::ZERO,
+                ambient: Vec3::ZERO,
+                night: 1.0,
+                night_maps: Some(1.0),
+                shadows: false,
+                detail: false,
+                fog_density: 0.0,
+                ..Default::default()
+            };
+            scene.lights = vec![PointLight {
+                position: DVec3::new(0.0, 0.0, 4.0),
+                radius: 20.0,
+                core: 10.0,
+                ..Default::default()
+            }];
+            let (plain, road) = samples(&mut renderer, &mut scene, &camera, &night);
+            assert!(road.iter().all(|v| *v > 10 && *v < 235), "{mode}: lamp reference must be lit and unclipped: {road:?}");
+            // PBR ground and road have slightly different default specular parameters.
+            assert!(plain.iter().zip(road).all(|(a, b)| (a - b).abs() <= 8), "{mode}: terrain/spline reference differs: {plain:?}/{road:?}");
+            renderer.set_material(&mut scene, left, 0, baked);
+            let (lit_ground, lit_road) = samples(&mut renderer, &mut scene, &camera, &night);
+            assert!(lit_ground.iter().zip(lit_road).all(|(a, b)| (a - b).abs() <= 8), "{mode}: baked and live pools must not light terrain twice: {lit_ground:?}/{lit_road:?}");
+
+            scene.lights.clear();
+            renderer.set_material(&mut scene, right, 0, ground);
+            let (baked_only, dark) = samples(&mut renderer, &mut scene, &camera, &night);
+            assert!(baked_only.iter().zip(dark).all(|(a, b)| a > &(b + 8)), "{mode}: a baked pool without a live lamp must remain lit: {baked_only:?}/{dark:?}");
+            let maps_off = Lighting { night_maps: Some(0.0), ..night.clone() };
+            let (off, dark) = samples(&mut renderer, &mut scene, &camera, &maps_off);
+            assert!(off.iter().zip(dark).all(|(a, b)| (a - b).abs() <= 2), "{mode}: baked pool must switch off with night lighting: {off:?}/{dark:?}");
+
+            renderer.set_material(&mut scene, left, 0, black_baked);
+            renderer.set_material(&mut scene, right, 0, black_ground);
+            let (black_pool, black_plain) = samples(&mut renderer, &mut scene, &camera, &night);
+            assert!(black_pool.iter().zip(black_plain).all(|(a, b)| (a - b).abs() <= 2), "{mode}: baked lamp light must not recolour black albedo: {black_pool:?}/{black_plain:?}");
+
+            // A dim, narrow headlight lands only on the left baked pool. Its irradiance
+            // stays below that pool: taking max(all lamps, bake) would hide the headlight.
+            renderer.set_material(&mut scene, left, 0, baked);
+            renderer.set_material(&mut scene, right, 0, baked);
+            scene.lights = vec![PointLight {
+                position: DVec3::new(-3.0, 0.0, 4.0),
+                radius: 20.0,
+                core: 10.0,
+                direction: -Vec3::Z,
+                cone: [0.98, 0.9],
+                intensity: if enhanced { 0.05 } else { 0.04 },
+                ..Default::default()
+            }];
+            let (headlit, baked_only) = samples(&mut renderer, &mut scene, &camera, &night);
+            assert!(headlit.iter().zip(baked_only).all(|(a, b)| a > &(b + 4)), "{mode}: a headlight must add to the baked pool: {headlit:?}/{baked_only:?}");
+            if !enhanced {
+                // The legacy vehicle point-light marker must likewise stay separate
+                // from SCO map lamps when a terrain tile has a baked pool.
+                scene.lights = vec![PointLight {
+                    position: DVec3::new(-3.0, 0.0, 4.0),
+                    radius: 5.0,
+                    intensity: 3.0,
+                    mode: LightMode::Vanilla,
+                    ..Default::default()
+                }];
+                let (headlit, baked_only) = samples(&mut renderer, &mut scene, &camera, &night);
+                assert!(headlit.iter().zip(baked_only).all(|(a, b)| a > &(b + 4)), "{mode}: a vehicle point light must add to the baked pool: {headlit:?}/{baked_only:?}");
+            }
+
+            scene.lights.clear();
+            renderer.set_material(&mut scene, left, 0, glow);
+            renderer.set_material(&mut scene, right, 0, black_ground);
+            let (emission, dark) = samples(&mut renderer, &mut scene, &camera, &night);
+            assert!(emission.iter().zip(dark).all(|(a, b)| a > &(b + 10)), "{mode}: an object nightmap must still emit without albedo or a lamp: {emission:?}/{dark:?}");
+            renderer.set_material(&mut scene, right, 0, switched_glow);
+            let (off, switched) = samples(&mut renderer, &mut scene, &camera, &maps_off);
+            assert!(switched.iter().zip(off).all(|(a, b)| a > &(b + 10)), "{mode}: ordinary nightmaps switch off, switched displays keep emitting: {off:?}/{switched:?}");
+        }
     }
 
     #[test]

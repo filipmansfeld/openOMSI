@@ -887,12 +887,13 @@ fn sun_shadow(world_in: vec3<f32>, n: vec3<f32>, thin: bool) -> f32 {
 // `map_k`: how much of the map's lamps a surface takes (0 on a light-mapped road in the
 // classic picture, whose lamps are in its light map); a vehicle's own lights (dir.x 1, see
 // lib.rs `gpu_light`) always shine - the headlights lit no road at all in vanilla.
-fn point_lights(p: vec3<f32>, n: vec3<f32>, map_k: f32) -> vec3<f32> {
+fn point_lights(p: vec3<f32>, n: vec3<f32>, map_k: f32, baked: vec3<f32>) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
+    var map_light = vec3<f32>(0.0);
     let cell = camera.light_grid.z;
     let side = u32(camera.light_grid.w);
     if (cell <= 0.0 || side == 0u) {
-        return sum;
+        return baked;
     }
     let f = (p.xy - camera.light_grid.xy) / cell;
     let x = i32(floor(f.x));
@@ -923,10 +924,18 @@ fn point_lights(p: vec3<f32>, n: vec3<f32>, map_k: f32) -> vec3<f32> {
                 let c = dot(-d / max(dist, 0.01), l.dir.xyz);
                 k = smoothstep(l.dir.w, max(l.extra.x, l.dir.w + 1e-3), c);
             }
-            sum = sum + l.color.rgb * l.color.w * att * ndl * k;
+            let lit = l.color.rgb * l.color.w * att * ndl * k;
+            if (l.dir.w < -1.5 && l.dir.x <= 0.5) {
+                map_light = map_light + lit;
+            } else {
+                sum = sum + lit;
+            }
         }
     }
-    return sum;
+    // The tile map and the map's point lights describe the same pools. Keep the map
+    // as a diffuse floor where a lamp is absent, without adding its light twice.
+    // Headlights remain additive; they are not part of the tile's baked lighting.
+    return sum + max(map_light, baked);
 }
 
 // [interiorlight]: the light of a vehicle's saloon lamps on a mesh that names them in its
@@ -1512,7 +1521,19 @@ fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
     // a street lamp, where the lamp's 40 m core lit the crown up yellow-green)
     let tree_unlamped = camera.sky_color.w > 0.5 && material.params.y > 0.1 && material.params.y < 0.2;
     let map_lamps = select(1.0, 0.0, (material.params.y > 0.2 && material.params.y < 0.3) || lm_only || tree_unlamped);
-    let lamp_light = point_lights(in.world, n, map_lamps);
+    let classic = camera.sky_color.w > 0.5;
+    let terrain_night = material.params.y < 0.5
+        && material.extra.x > 0.5
+        && material.extra.w > 0.5
+        && material.extra.w < 1.5;
+    var baked = vec3<f32>(0.0);
+    if (terrain_night && !classic) {
+        // A tile light map is illumination, not emission: multiply it by the ground's
+        // albedo with the other lights, so even a bright pool leaves dark asphalt dark.
+        baked = sample_nightmap(vec2<f32>(in.uv.x, 1.0 - in.uv.y)).rgb
+            * camera.sun_color.w * clamp(in.params2.y, 0.0, 1.0);
+    }
+    let lamp_light = point_lights(in.world, n, map_lamps, baked);
     var light = diffuse + lamp_light;
     // D3D lights the material's diffuse colour with the sun, the light from above and the
     // lamps, and its ambient colour with the ambient light (C). Omsi.exe makes every o3d
@@ -1530,13 +1551,6 @@ fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
     // itself: taken as a power of 2.2, t v^2.2, the curve's linear foot below 0.0031 put a
     // night wall at a quarter of OMSI 2's - a texture of 0.66 under a light of 0.05 came out
     // at 2 of 255 instead of 8.)
-    let classic = camera.sky_color.w > 0.5;
-    // (the terrain's night map is its tile light map: light, not a glow - see below)
-    let terrain_night = classic
-        && material.params.y < 0.5
-        && material.extra.x > 0.5
-        && material.extra.w > 0.5
-        && material.extra.w < 1.5;
     if (classic && material.params.y < 0.5) {
         var v = clamp(material.emissive.rgb + mat_light + material.color.rgb * interior_lamps(in.world, n, in.params2.z), vec3<f32>(0.0), vec3<f32>(1.0));
         if (light_mapped) {

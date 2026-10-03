@@ -157,18 +157,19 @@ struct Surface {
 
 // The point and spot lights of the pixel's grid cell: diffuse and specular.
 // `thin`: foliage, lit from whichever side the lamp is on (see the sun below).
-fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool) -> vec3<f32> {
+fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool, baked: vec3<f32>) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
+    var map_diffuse = vec3<f32>(0.0);
     let cell = camera.light_grid.z;
     let side = u32(camera.light_grid.w);
     if (cell <= 0.0 || side == 0u) {
-        return sum;
+        return baked;
     }
     let f = (p.xy - camera.light_grid.xy) / cell;
     let x = i32(floor(f.x));
     let y = i32(floor(f.y));
     if (x < 0 || y < 0 || x >= i32(side) || y >= i32(side)) {
-        return sum;
+        return baked;
     }
     let a = max(sf.rough * sf.rough, 0.02);
     let nv = max(dot(n, v), 1e-4);
@@ -224,9 +225,17 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool)
         }
         let h = normalize(ld + v);
         let spec = d_ggx(max(dot(n, h), 0.0), a) * v_smith(nv, nl, a) * f_schlick(sf.f0, dot(v, h));
-        sum = sum + irr * nl * (sf.albedo / PI + spec);
+        let diffuse = irr * nl * sf.albedo / PI;
+        if (l.dir.w < -1.5 && l.dir.x <= 0.5) {
+            map_diffuse = map_diffuse + diffuse;
+        } else {
+            sum = sum + diffuse;
+        }
+        sum = sum + irr * nl * spec;
     }
-    return sum;
+    // The baked tile map is a fallback for the same diffuse lamp pools. Specular
+    // highlights and headlights are independent and must remain additive.
+    return sum + max(map_diffuse, baked);
 }
 
 // The light inside a cab relative to the average light outside: a bus's big windows let in
@@ -848,9 +857,20 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         reflection = reflection * 0.75 * (1.0 - 0.85 * own_pane);
     }
     // --- the lamps, the cabin light and what glows by itself
-    // ([nomaplighting] objects are not lit by the map's lamps; light-mapped roads are, with
-    // the tile light map on top)
-    let lamps = lamp_light(in.world, n, v, sf, thin) * select(1.0, 0.0, material.params.y > 0.2 && material.params.y < 0.3);
+    // ([nomaplighting] objects are not lit by the map's lamps.)
+    let terrain_night = terrain && material.extra.w > 0.5 && material.extra.w < 1.5;
+    var baked = vec3<f32>(0.0);
+    if (terrain_night) {
+        let nm = sample_nightmap(vec2<f32>(in.uv.x, 1.0 - in.uv.y)).rgb
+            * camera.sun_color.w * clamp(in.params2.y, 0.0, 1.0);
+        // The tile's light map is irradiance, not a second emitter. Keep authored pools
+        // where no point light reaches, using the same lamp scale without the old 3x gain.
+        baked = sf.albedo / PI * nm * enh.lights.y;
+    }
+    var lamps = baked;
+    if (!(material.params.y > 0.2 && material.params.y < 0.3)) {
+        lamps = lamp_light(in.world, n, v, sf, thin, baked);
+    }
     // [interiorlight]: OMSI adds its lamps' light to the lit meshes whatever the daylight,
     // so a switched-on saloon is brighter by day as well and only stands out more at night.
     // Taken as a lamp against the daylight exposure it vanished by day altogether.
@@ -866,7 +886,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // path's: here the map's lamps light them, tinted from that map, as they light every
     // other surface - added on top it lit the roads twice, with a hard edge where a road
     // met a square that is an object)
-    if (material.extra.w > 0.5) {
+    if (material.extra.w > 0.5 && !terrain_night) {
         let nuv = select(buv, vec2<f32>(in.uv.x, 1.0 - in.uv.y), terrain);
         let switched = material.extra.w > 1.5;
         let night = select(camera.sun_color.w, 1.0, switched);
@@ -874,7 +894,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // lighting, which is 0 by day and left the Procity's pressure screen black)
         let nm = sample_nightmap(nuv).rgb * night * select(clamp(in.params2.y, 0.0, 1.0), 1.0, switched);
         if (terrain) {
-            // the tile's light map: the lamps' light on the ground
+            // A script-switched terrain map keeps its separate material-stage behavior.
             rgb = rgb + sf.albedo / PI * nm * enh.lights.y * 3.0 * pre;
         } else {
             // lit windows and signs; a switched lamp or display holds up against daylight
