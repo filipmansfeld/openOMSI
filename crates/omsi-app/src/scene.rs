@@ -5064,13 +5064,10 @@ impl World {
                     if hole.indices.is_empty() {
                         return;
                     }
+                    // Height clipping can leave an island inside the cut. Rasterize the
+                    // clipped faces themselves: filling each rim as an independent
+                    // outline would fill the outer ring and remove that island again.
                     ts.rasterize_hole(hole, &Mat4::IDENTITY, p.origin, tx, ty);
-                    for rim in omsi_geometry::hole_mesh_rims(hole, &Mat4::IDENTITY, p.origin) {
-                        let ring: Vec<_> = rim.iter().map(|v| v.truncate()).collect();
-                        if !omsi_geometry::outline_crosses_itself(&ring) {
-                            ts.add_outline(&ring, tx, ty);
-                        }
-                    }
                 };
                 // meshes the wheels stand on, and of them low objects they climb
                 let mut wheel_meshes = 0usize;

@@ -235,7 +235,7 @@ pub fn mesh_hole_below_terrain_in_outline(mesh: &MeshData, transform: &Mat4, ori
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_spline_mesh, spline_hole_outlines, SplineCurve};
+    use crate::{build_spline_mesh, spline_hole_outlines, SplineCurve, TileSurface};
     use omsi_scenery::sli::{Spline, SplineProfile, SplineProfilePoint};
 
     fn flat(height: f32) -> Terrain { Terrain { cells: 1, heights: vec![height; 4] } }
@@ -296,6 +296,35 @@ mod tests {
         assert!(covers(&cut, DVec2::splat(side * 0.5)));
         assert!(!covers(&cut, DVec2::splat(side * 0.1)));
         assert_eq!(terrain, before, "queries must not modify original terrain");
+    }
+
+    #[test]
+    fn clipped_hole_mask_keeps_the_low_terrain_island() {
+        let side = tile_size();
+        let terrain = Terrain { cells: 2, heights: vec![10.0, 10.0, 10.0, 10.0, 0.0, 10.0, 10.0, 10.0, 10.0] };
+        let cut = mesh_hole_below_terrain(&quad(5.0, side as f32), &Mat4::IDENTITY, DVec3::ZERO, &terrain, DVec3::ZERO);
+        // The same clipped-mesh path used by the scene must preserve the island in the
+        // final alpha mask and surface queries, not merely omit it from the cutter mesh.
+        for size in [256, 512] {
+            let cell = side as f32 / size as f32;
+            let mut surface = TileSurface::new(size);
+            surface.rasterize_hole(&cut, &Mat4::IDENTITY, DVec3::ZERO, 0, 0);
+            surface.finish();
+            let mask = surface.mask_image(&|x, y| terrain.sample(x, y), 0.12);
+            for (i, j, removed) in [(size / 2, size / 2, false), (size / 8, size / 2, true)] {
+                let (x, y) = ((i as f32 + 0.5) * cell, (j as f32 + 0.5) * cell);
+                let k = j * size + i;
+                assert_eq!(covers(&cut, DVec2::new(x as f64, y as f64)), removed);
+                assert_eq!(surface.hole_height(k).is_some(), removed);
+                assert_eq!(mask[k * 4 + 3], if removed { 0 } else { 255 });
+                assert_eq!(surface.cut_at(x, y, terrain.sample(x, y), 0.12), removed);
+            }
+            // Fractional coverage at the inner rim survives; tracing a filled outer
+            // polygon must not turn this rim or the island into a solid hole.
+            assert!((size / 2 - 4..=size / 2 + 4).any(|j| {
+                (size / 4 - 4..=size / 4 + 4).any(|i| (1..255).contains(&mask[(j * size + i) * 4 + 3]))
+            }), "missing inner-rim antialiasing at raster size {size}");
+        }
     }
 
     #[test]
