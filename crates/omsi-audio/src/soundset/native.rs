@@ -41,7 +41,9 @@ fn params(
     ctx: &Ctx,
 ) -> VoiceParams {
     let evaluated = ctx.eval(s, var, transform);
-    ctx.params(s, &evaluated, s.control == PlaybackControl::Loop, transform)
+    let mut result = ctx.params(s, &evaluated, s.control == PlaybackControl::Loop, transform);
+    result.pitch = result.pitch.clamp(0.001, 64.0);
+    result
 }
 
 pub(super) fn update_controlled(
@@ -251,6 +253,27 @@ mod tests {
             voice.important,
             "manual playback preserves authored mixer priority"
         );
+        // Explicit API pitch keeps its advertised bounds even when the native
+        // loop's frequency and a valid API multiplier together exceed them.
+        for (speed, multiplier, expected) in [(4.0, 32.0, 64.0), (0.05, 0.01, 0.001)] {
+            let mut def = cfg.sounds[0].clone();
+            def.is_loop = true;
+            def.sample_rate = 48000.0;
+            def.pitch_ref = 1.0;
+            def.pitch_variable = "speed".into();
+            sounds.replace_entry(&engine, 0, def, multiplier).unwrap();
+            update_controlled(
+                &engine,
+                &mut sounds.sounds[0],
+                &|_| Some(speed),
+                &Mat4::IDENTITY,
+                &ctx,
+            );
+            assert_eq!(
+                sounds.entry(0, &engine).unwrap().voice.unwrap().0.pitch,
+                expected
+            );
+        }
         sounds.stop_entry(&engine, 0).unwrap();
         assert!(sounds.entry(0, &engine).unwrap().voice.is_none());
         sounds.reset_entry(&engine, 0).unwrap();

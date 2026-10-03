@@ -43,17 +43,18 @@ not itself supply a decoded clip for explicit playback.
 Conditions are `{variable, relation, value}` records using native relation codes
 0 through 5. Volume curves are `{variable, points: [[x,y], ...]}` records with
 strictly increasing x coordinates. Curve variable `"-1"` reads time since
-activation; `"-2"` reads listener-facing direction. Up to 64 conditions, curves
+activation for explicit playback; ordinary triggered entries retain the current
+engine's uptime-based convention. `"-2"` reads listener-facing direction. Up to 64 conditions, curves
 or trigger names are accepted, with at most 128 points per curve. Unknown nested
-fields fail. Volume accepts 0–16; the ordinary mixer volume stage clamps the
-result to 0–1 before master gain. Pitch multipliers accept 0.001–64; the final
-playback pitch is bounded to the same range. Viewpoint accepts native codes 0–7.
+fields fail. Volume accepts 0–16 and follows the engine's DirectSound volume
+quantization and retained-buffer rules. Pitch multipliers accept 0.001–64; the
+final explicit-playback pitch is bounded to the same range. Viewpoint accepts native codes 0–7.
 `loop_sound` selects the authored `[loopsound]` pitch configuration; ordinary
 start/loop behavior still follows the engine's triggers and `no_loop` rule.
 Use `audio.play {looping: true}` for an explicitly looping voice.
 
 Explicit playback bypasses automatic start conditions and view selection while
-retaining volume curves, spatial attenuation and cabin muffling. Ordinary named
+retaining native volume curves, authored spatial attenuation and cabin gain. Ordinary named
 and file triggers cannot override explicit playback or a stopped entry until
 reset. A named trigger enters the shared native vehicle event list, so another
 section declaring that same name may also react. One-shot control does not
@@ -64,6 +65,8 @@ definitions. `audio.play` and `audio.trigger` reject unavailable output before
 starting or queuing playback. A playing voice can still be silent because of
 gain, distance, curves, or listener configuration. `active_seconds` uses the
 runtime's monotonic activation clock, not OMSI's raw `StartTime` representation.
+It is null when the native entry has no per-activation clock; explicit playback
+creates its own activation clock.
 `queued: true` on a definition update describes the next mixer update, while
 the validated definition is committed immediately.
 

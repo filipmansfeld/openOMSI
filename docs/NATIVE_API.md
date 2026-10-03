@@ -1,6 +1,6 @@
 # Native game API (development)
 
-This fork integrates the API with public release **v0.1.968**. The API is a fork
+This fork integrates the API with public release **v0.1.1166**. The API is a fork
 extension, not part of the official release. Vehicle-script and companion bridge
 operations retain their protocol. Passenger operations follow the newer native
 task model described below; clients must not assume the older passenger schema.

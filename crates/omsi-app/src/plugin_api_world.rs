@@ -135,12 +135,13 @@ fn scenery_list(app: &App, args: &Value) -> Result<Value, String> {
     };
     for object in world.scripted.lock().iter() {
         if matches(object.api_id, object.tile, &object.ty.sco.path) {
+            let (controller, light_index) = world.bridge_light_binding(object);
             rows.push((object.api_id, json!({
                 "id":format!("scenery:{}",object.api_id),"kind":"scripted",
                 "map_id":object.map_id.to_string(),"tile_index":tile_index(world, object.tile),
                 "tile":[object.tile.0,object.tile.1],"file_name":object.ty.sco.path.to_string_lossy(),
                 "position":[object.pos.x,object.pos.y,object.pos.z],"has_script":true,
-                "light_controller":object.controller,"light_index":object.light_index,
+                "light_controller":controller,"light_index":light_index,
             })));
         }
     }

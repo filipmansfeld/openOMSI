@@ -56,7 +56,32 @@ fn path_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+fn light_binding(
+    controller: Option<usize>,
+    index: usize,
+    parent: Option<(i64, usize)>,
+    controllers: &HashMap<i64, usize>,
+) -> (Option<usize>, usize) {
+    match (controller, parent) {
+        (Some(controller), _) => (Some(controller), index),
+        (None, Some((parent, index))) => (controllers.get(&parent).copied(), index),
+        _ => (None, index),
+    }
+}
+
 impl World {
+    /// Resolve the same controller the scenery script tick supplies, including a
+    /// crossing on a tile loaded after its child. Keep the authored light index
+    /// when that crossing is not loaded yet; no controller is claimed in that case.
+    pub(crate) fn bridge_light_binding(&self, object: &ScriptedObject) -> (Option<usize>, usize) {
+        light_binding(
+            object.controller,
+            object.light_index,
+            object.light_parent,
+            &self.controller_of_object.lock(),
+        )
+    }
+
     /// Set source-identified scenery variables atomically. Runtime OMSI object-array
     /// indices require a separate translation; they must never be passed as ordinals.
     pub(crate) fn bridge_scenery_set(
@@ -359,6 +384,30 @@ pub(crate) fn bridge_release_script_texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_api_light_binding_resolves_late_parents_without_overriding_own_controller() {
+        let mut controllers = HashMap::new();
+        assert_eq!(
+            light_binding(None, 0, Some((42, 3)), &controllers),
+            (None, 3)
+        );
+        controllers.insert(42, 7);
+        assert_eq!(
+            light_binding(None, 0, Some((42, 3)), &controllers),
+            (Some(7), 3)
+        );
+        assert_eq!(
+            light_binding(Some(9), 2, Some((42, 3)), &controllers),
+            (Some(9), 2)
+        );
+        assert_eq!(light_binding(None, 0, None, &controllers), (None, 0));
+        controllers.remove(&42);
+        assert_eq!(
+            light_binding(None, 0, Some((42, 3)), &controllers),
+            (None, 3)
+        );
+    }
 
     #[test]
     fn source_ordinals_count_attachment_rows_without_guessing_an_instance() {

@@ -150,6 +150,7 @@ mod tests {
             inst,
             controller: None,
             light_index: 0,
+            light_parent: None,
             map_id: 7,
             variants: vec![],
             sounds: None,

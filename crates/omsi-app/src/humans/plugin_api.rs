@@ -821,6 +821,7 @@ mod tests {
                     rot: 0.0,
                     seated: true,
                     height: 0.8,
+                    omsi_seat: 0,
                 },
                 Seat {
                     pos: Vec3::new(0.0, 2.0, 0.8),
@@ -828,6 +829,7 @@ mod tests {
                     rot: 0.0,
                     seated: true,
                     height: 0.8,
+                    omsi_seat: 1,
                 },
             ],
             parts: vec![],
