@@ -7,7 +7,9 @@ use omsi_map::{tile_size, MapSpline, Terrain};
 use omsi_scenery::Spline;
 
 mod hole_rims;
+mod terrain_holes;
 mod terrain_walls;
+pub use terrain_holes::{mesh_hole_below_terrain, mesh_hole_below_terrain_in_outline, outline_hole_below_terrain, TERRAIN_HOLE_EPSILON};
 pub use terrain_walls::terrain_hole_walls;
 
 /// A renderable triangle mesh with one texture per material slot.
