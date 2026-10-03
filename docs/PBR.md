@@ -74,15 +74,34 @@ texture represents 25 mm of relief. Missing, repeated, non-finite or out-of-rang
 leave the height map unused, with a diagnostic in the log.
 
 The loader computes tangent-space normals from height differences over that physical
-distance, including across repeat boundaries. Image resolution therefore does not set the
-relief strength. A usable explicit normal map takes precedence; it is never combined with
-the generated one. Height alone does not change roughness: add a roughness or ORM map to
-describe the material's reflection.
+distance, including across repeat boundaries. It also keeps the linear height in the
+generated normal map's alpha for **parallax occlusion mapping** in Enhanced graphics.
+The view ray follows the height field and moves the diffuse colour, normal and ORM lookup
+together, giving close-up gaps and edges a view-dependent depth. White sits at the mesh
+plane; darker heights lie below it by up to `height_scale`. UV ray offsets follow the
+actual world-space UV mapping, including rectangular repeats and mirrored UVs. Image
+resolution therefore does not set the relief strength; low-resolution height maps still
+cannot describe fine stone edges. Height alone does not change roughness: add a roughness
+or ORM map to describe the material's reflection.
 
-This changes **lighting normals only** in Enhanced graphics. It does not displace mesh
-vertices, alter silhouettes or wheel collisions, or provide parallax occlusion. Deep paving
-gaps still need authored geometry if those effects matter. Content without PBR sidecars,
-Vanilla graphics and the existing rain/snow behaviour keep their current paths.
+A usable explicit normal map takes precedence; it is never combined with the generated
+one and does not enable parallax, even if a height sidecar is also present. Its existing
+DirectX/OpenGL normal convention is unchanged. Use authored height without an explicit
+normal sidecar when both generated normals and parallax are wanted.
+
+Parallax uses at most 32 steps plus a linear intersection refinement. It fades out at
+grazing angles, where a pixel covers many height texels, or where the ray would cross more
+than half a texture repeat. It changes **surface lookups only**: mesh vertices, silhouettes,
+depth-buffer values, cast shadows and wheel collisions do not move. Terrain brush masks,
+road cutouts and diffuse alpha coverage keep their original coordinates. Deep paving gaps
+still need authored geometry if those effects matter. Content without PBR sidecars and
+Vanilla graphics keep their current paths.
+
+For an identical-content comparison, launch with `OMSI_PARALLAX=0` to disable parallax
+while retaining the height-derived normals and roughness. Parallax is enabled by default;
+restart the renderer after changing this environment variable. Its cost depends on the
+pixels covered by eligible materials, the view angle and the graphics device; measure
+the same scene, camera and graphics settings when comparing performance.
 
 ## Tips for modders
 

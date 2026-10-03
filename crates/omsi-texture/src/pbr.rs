@@ -62,6 +62,9 @@ impl PbrFiles {
 /// The PBR maps as they go to the GPU.
 pub struct PbrImages {
     pub normal: Option<Image>,
+    /// Black-to-white height range in metres. Only height-derived normals carry
+    /// linear height in alpha; explicit DX/GL normal maps leave this zero.
+    pub height_scale: f32,
     /// Occlusion, roughness, metalness in red, green, blue.
     pub orm: Option<Image>,
     /// Normal kind (1: DirectX, 2: OpenGL, 3: physical height slopes), then
@@ -269,6 +272,7 @@ pub fn load_set(files: &PbrFiles) -> Option<PbrImages> {
     }
     // the first candidate that is a normal map
     let mut normal_kind = 0.0;
+    let mut height_scale = 0.0;
     let normal = files
         .normals
         .iter()
@@ -295,8 +299,9 @@ pub fn load_set(files: &PbrFiles) -> Option<PbrImages> {
                 return None;
             };
             height::load(path, config)
-                .map(|image| {
+                .map(|(image, range)| {
                     normal_kind = 3.0;
+                    height_scale = range;
                     image
                 })
                 .map_err(|e| log::warn!("PBR height {}: {e}; left alone", path.display()))
@@ -389,7 +394,12 @@ pub fn load_set(files: &PbrFiles) -> Option<PbrImages> {
     if normal.is_none() && orm.is_none() {
         return None;
     }
-    Some(PbrImages { normal, orm, flags })
+    Some(PbrImages {
+        normal,
+        height_scale,
+        orm,
+        flags,
+    })
 }
 
 #[cfg(test)]
@@ -443,9 +453,11 @@ mod tests {
         let valid = HeightFixture::new(Some("[height_scale]\n0.025\n[texture_size]\n2\n2"), false);
         let loaded = load_set(&valid.files()).unwrap();
         assert_eq!(loaded.flags, [3.0, 0.0, 0.0, 0.0]);
+        assert_eq!(loaded.height_scale, 0.025);
         assert!(loaded.orm.is_none());
         let normal = loaded.normal.unwrap();
         assert_eq!((normal.width, normal.height), (8, 8));
+        assert_eq!(normal.rgba[(3 * 8 + 3) * 4 + 3], 90);
         assert!(
             normal.rgba[(3 * 8 + 3) * 4] < 128,
             "a rising U height tilts the normal toward -U"
@@ -457,14 +469,13 @@ mod tests {
         let fixture = HeightFixture::new(Some("[height_scale]\nNaN"), true);
         let loaded = load_set(&fixture.files()).unwrap();
         assert_eq!(loaded.flags, [2.0, 0.0, 0.0, 0.0]);
-        assert!(
-            loaded
-                .normal
-                .unwrap()
-                .rgba
-                .chunks_exact(4)
-                .all(|p| p == [128, 128, 255, 255])
-        );
+        assert_eq!(loaded.height_scale, 0.0);
+        assert!(loaded
+            .normal
+            .unwrap()
+            .rgba
+            .chunks_exact(4)
+            .all(|p| p == [128, 128, 255, 255]));
     }
 
     #[test]

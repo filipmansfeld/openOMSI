@@ -52,7 +52,9 @@ fn authored_pbr_shades_roads_and_terrain_without_changing_vanilla_or_coverage() 
                 &mut scene,
                 authored,
                 &omsi_texture::pbr::PbrImages {
-                    normal: (map != "roughness").then(|| image([64, 128, 238, 255])),
+                    normal: (map != "roughness")
+                        .then(|| image([64, 128, 238, if map == "height" { 128 } else { 255 }])),
+                    height_scale: if map == "height" { 0.04 } else { 0.0 },
                     orm: (map == "roughness").then(|| image([255, 15, 0, 255])),
                     flags: if map != "roughness" {
                         [if map == "height" { 3.0 } else { 1.0 }, 0.0, 0.0, 0.0]
@@ -190,6 +192,262 @@ fn authored_pbr_shades_roads_and_terrain_without_changing_vanilla_or_coverage() 
 }
 
 #[test]
+#[ignore = "requires a graphics adapter; compares parallax with an analytic recessed plane"]
+fn height_parallax_matches_recessed_geometry_at_oblique_and_mirrored_views() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let mut renderer = pollster::block_on(Renderer::new_with(
+        &instance,
+        None,
+        Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+        RenderOptions {
+            msaa: 1,
+            ssao: false,
+            shadow_size: 1024,
+            fxaa: false,
+            render_scale: 1.0,
+            ..Default::default()
+        },
+    ))
+    .expect("test renderer");
+    // Smooth repeated colour features avoid edge/mipmap tolerances. A constant
+    // height field has an analytic intersection: a plane recessed by this depth.
+    // Comparing real geometry tests the complete physical UV projection, alpha
+    // upload and view-angle response without reproducing the shader's march.
+    let size = 128usize;
+    let mut rgba = Vec::with_capacity(size * size * 4);
+    for y in 0..size {
+        for x in 0..size {
+            let wave = |v: usize| {
+                (128.0 + 95.0 * (v as f32 / size as f32 * std::f32::consts::TAU * 4.0).sin())
+                    .round() as u8
+            };
+            rgba.extend_from_slice(&[wave(x), wave(y), 80, 255]);
+        }
+    }
+    let texture = omsi_texture::Image {
+        width: size as u32,
+        height: size as u32,
+        rgba,
+        has_alpha: false,
+    };
+    let range = 0.4f32;
+    let depth = range * (1.0 - 128.0 / 255.0);
+    let lighting = Lighting {
+        enhanced: true,
+        sun_dir: Vec3::new(0.3, -0.4, 0.866).normalize(),
+        sun_intensity: 1.0,
+        shadows: false,
+        detail: false,
+        fog_density: 0.0,
+        ..Default::default()
+    };
+    for (yaw, pitch, position, mirror) in [
+        (0.0, -89.0, DVec3::new(0.0, -0.0524, 3.0), 0),
+        (0.0, -45.0, DVec3::new(0.0, -3.0, 3.0), 0),
+        (90.0, -45.0, DVec3::new(-3.0, 0.0, 3.0), 0),
+        (0.0, -45.0, DVec3::new(0.0, -3.0, 3.0), 2),
+        (90.0, -45.0, DVec3::new(-3.0, 0.0, 3.0), 1),
+    ] {
+        let camera = Camera {
+            position,
+            yaw,
+            pitch,
+            roll: 0.0,
+            fov_deg: 50.0,
+            near: 0.1,
+            far: 100.0,
+        };
+        let mut scene = renderer.new_scene();
+        let diffuse = renderer.add_texture(&mut scene, &texture, true);
+        let reference_diffuse = renderer.add_texture(&mut scene, &texture, true);
+        renderer.add_pbr_maps(
+            &mut scene,
+            diffuse,
+            &omsi_texture::pbr::PbrImages {
+                normal: Some(image([128, 128, 255, 128])),
+                height_scale: range,
+                orm: None,
+                flags: [3.0, 0.0, 0.0, 0.0],
+            },
+        );
+        let mapped = renderer.add_material(
+            &mut scene,
+            Some(diffuse),
+            AlphaMode::Opaque,
+            [1.0; 4],
+            false,
+        );
+        let plain = renderer.add_material(
+            &mut scene,
+            Some(reference_diffuse),
+            AlphaMode::Opaque,
+            [1.0; 4],
+            false,
+        );
+        let data = |z| MeshData {
+            positions: vec![
+                Vec3::new(-4.0, -8.0, z),
+                Vec3::new(4.0, -8.0, z),
+                Vec3::new(4.0, 8.0, z),
+                Vec3::new(-4.0, 8.0, z),
+            ],
+            normals: vec![Vec3::Z; 4],
+            uvs: [
+                glam::Vec2::ZERO,
+                glam::Vec2::new(4.0, 0.0),
+                glam::Vec2::splat(4.0),
+                glam::Vec2::new(0.0, 4.0),
+            ]
+            .into_iter()
+            .map(|uv| match mirror {
+                1 => glam::Vec2::new(4.0 - uv.x, uv.y),
+                2 => glam::Vec2::new(uv.x, 4.0 - uv.y),
+                _ => uv,
+            })
+            .collect(),
+            indices: vec![0, 1, 2, 0, 2, 3],
+            ranges: vec![(0, 6, 0)],
+            one_sided: false,
+        };
+        let surface = renderer.add_mesh(&mut scene, &data(0.0));
+        let recessed = renderer.add_mesh(&mut scene, &data(-depth));
+        let id = renderer.add_instance(
+            &mut scene,
+            surface,
+            DVec3::ZERO,
+            Mat4::IDENTITY,
+            vec![mapped],
+        );
+        scene.instances[id].render_phase = RenderPhase::Spline;
+        let actual = renderer
+            .render_to_image(&mut scene, 96, 96, &camera, &lighting)
+            .unwrap();
+        scene.instances[id].materials = vec![plain];
+        let negative = renderer
+            .render_to_image(&mut scene, 96, 96, &camera, &lighting)
+            .unwrap();
+        scene.instances[id].mesh = recessed;
+        let reference = renderer
+            .render_to_image(&mut scene, 96, 96, &camera, &lighting)
+            .unwrap();
+        let mut error = 0u64;
+        let mut effect = 0u64;
+        let mut count = 0u64;
+        for y in 36..60 {
+            for x in 36..60 {
+                for channel in 0..3 {
+                    let at = (y * 96 + x) * 4 + channel;
+                    error += actual[at].abs_diff(reference[at]) as u64;
+                    effect += actual[at].abs_diff(negative[at]) as u64;
+                    count += 1;
+                }
+            }
+        }
+        let error = error as f64 / count as f64;
+        let effect = effect as f64 / count as f64;
+        assert!(
+            error <= 4.0,
+            "yaw {yaw}, pitch {pitch}, mirror {mirror}: mean error {error} from recessed geometry"
+        );
+        if pitch > -80.0 {
+            assert!(effect >= 8.0, "oblique parallax did not move colour: yaw {yaw}, mirror {mirror}, mean difference {effect}");
+        }
+        if pitch > -80.0 && mirror == 0 {
+            let mut mask_rgba = Vec::new();
+            for y in 0..32 {
+                for x in 0..32 {
+                    mask_rgba.extend_from_slice(&[
+                        100,
+                        100,
+                        100,
+                        if (x / 8 + y / 8) % 2 == 0 { 255 } else { 0 },
+                    ]);
+                }
+            }
+            let coverage = omsi_texture::Image {
+                width: 32,
+                height: 32,
+                rgba: mask_rgba,
+                has_alpha: true,
+            };
+            let mask = renderer.add_texture(&mut scene, &coverage, true);
+            for kind in ["cut", "painted", "alpha"] {
+                let mut materials = Vec::new();
+                for height_scale in [0.0, range] {
+                    let diffuse = renderer.add_texture(
+                        &mut scene,
+                        if kind == "alpha" {
+                            &coverage
+                        } else {
+                            &image([100, 100, 100, 255])
+                        },
+                        true,
+                    );
+                    renderer.add_pbr_maps(
+                        &mut scene,
+                        diffuse,
+                        &omsi_texture::pbr::PbrImages {
+                            normal: Some(image([128, 128, 255, 128])),
+                            height_scale,
+                            orm: None,
+                            flags: [3.0, 0.0, 0.0, 0.0],
+                        },
+                    );
+                    materials.push(match kind {
+                        "cut" => renderer.add_terrain_material(
+                            &mut scene,
+                            Some(diffuse),
+                            Some(mask),
+                            None,
+                            1.0,
+                            None,
+                            0.0,
+                        ),
+                        "painted" => renderer.add_terrain_layer_material(
+                            &mut scene,
+                            Some(diffuse),
+                            mask,
+                            None,
+                            1.0,
+                            None,
+                            0.0,
+                        ),
+                        _ => renderer.add_material(
+                            &mut scene,
+                            Some(diffuse),
+                            AlphaMode::Test,
+                            [1.0; 4],
+                            false,
+                        ),
+                    });
+                }
+                scene.instances[id].mesh = surface;
+                scene.instances[id].render_phase = if kind == "alpha" {
+                    RenderPhase::Spline
+                } else {
+                    RenderPhase::Terrain
+                };
+                scene.instances[id].materials = vec![materials[0]];
+                let original = renderer
+                    .render_to_image(&mut scene, 96, 96, &camera, &lighting)
+                    .unwrap();
+                scene.instances[id].materials = vec![materials[1]];
+                let parallax = renderer
+                    .render_to_image(&mut scene, 96, 96, &camera, &lighting)
+                    .unwrap();
+                assert!(
+                    original
+                        .iter()
+                        .zip(&parallax)
+                        .all(|(a, b)| a.abs_diff(*b) <= 3),
+                    "POM moved {kind} coverage at yaw {yaw}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires a graphics adapter; checks physical height normals on rectangular repeats"]
 fn height_normals_preserve_both_physical_axes_and_legacy_normal_conventions() {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -249,6 +507,7 @@ fn height_normals_preserve_both_physical_axes_and_legacy_normal_conventions() {
             authored,
             &omsi_texture::pbr::PbrImages {
                 normal: Some(image(rgba)),
+                height_scale: 0.0,
                 orm: None,
                 flags: [flag, 0.0, 0.0, 0.0],
             },

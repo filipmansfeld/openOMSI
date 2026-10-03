@@ -188,6 +188,8 @@ fn weather_outside_n(world: vec3<f32>, n: vec3<f32>, terrain: bool, surface: f32
 override ALPHA_TEST: bool = true;
 // Multisampled cutout pipelines can turn filtered alpha directly into sample coverage.
 override ALPHA_TO_COVERAGE: bool = false;
+// Optional renderer comparison: OMSI_PARALLAX=0 retains height-derived normals.
+override HEIGHT_PARALLAX: bool = true;
 @group(0) @binding(5) var t_shadow: texture_depth_2d;
 @group(0) @binding(6) var s_shadow: sampler_comparison;
 @group(0) @binding(7) var t_shadow_far: texture_depth_2d;
@@ -307,6 +309,8 @@ struct MaterialParams {
     // the PBR set beside the diffuse texture: x normal map, y occlusion, z roughness,
     // w metalness (1 = the map has it; see t_pbr_normal / t_pbr_orm)
     pbr: vec4<f32>,
+    // x: height range in metres, for linear height packed in normal-map alpha
+    parallax: vec4<f32>,
     // x: one of the bus's own screens (the enhanced glow and FXAA leave it alone)
     flags: vec4<f32>,
     // rgb: the D3D material's ambient colour, which takes the ambient light (C)

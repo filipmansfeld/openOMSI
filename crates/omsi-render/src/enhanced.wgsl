@@ -282,6 +282,65 @@ fn perturb_normal(n: vec3<f32>, p: vec3<f32>, uv: vec2<f32>, tn: vec3<f32>, phys
     return safe_normal(t * k * tn.x + b * k * tn.y + n * max(tn.z, 0.05));
 }
 
+// Follow the eye ray below the mesh's top plane through the authored height field.
+// Solve its UV change from world-space derivatives, rather than assuming square UVs
+// or inventing a strength multiplier. Mirrored UVs reverse the corresponding ray axis.
+// All texture reads have explicit gradients: different pixels finish at different steps.
+fn parallax_uv(uv: vec2<f32>, p: vec3<f32>, n: vec3<f32>, eye: vec3<f32>,
+               dx: vec2<f32>, dy: vec2<f32>, px: vec3<f32>, py: vec3<f32>) -> vec2<f32> {
+    if (!HEIGHT_PARALLAX || material.pbr.x < 2.5 || material.parallax.x <= 0.0) {
+        return uv;
+    }
+    let a = dot(px, px);
+    let b = dot(px, py);
+    let c = dot(py, py);
+    let determinant = a * c - b * b;
+    let uv_determinant = dx.x * dy.y - dx.y * dy.x;
+    if (determinant <= 1e-20 || uv_determinant == 0.0) {
+        return uv;
+    }
+    let view = safe_normal(eye - p);
+    let facing = dot(view, n);
+    if (facing <= 0.08) {
+        return uv;
+    }
+    let vx = dot(view, px);
+    let vy = dot(view, py);
+    let uv_per_metre = dx * ((vx * c - vy * b) / determinant)
+                     + dy * ((vy * a - vx * b) / determinant);
+    let ray = -uv_per_metre * (material.parallax.x / facing);
+    let texels = vec2<f32>(textureDimensions(t_pbr_normal));
+    let footprint = max(length(dx * texels), length(dy * texels));
+    // Near grazing, subpixel height fields and a ray crossing many repeats cannot
+    // be resolved reliably by a bounded march. Fade to the unchanged surface there.
+    let fade = smoothstep(0.08, 0.2, facing) * (1.0 - smoothstep(2.0, 8.0, footprint))
+             * (1.0 - smoothstep(0.25, 0.5, max(abs(ray.x), abs(ray.y))));
+    if (fade <= 0.0) {
+        return uv;
+    }
+    let layers = ceil(mix(32.0, 8.0, clamp(facing, 0.0, 1.0)));
+    let step = 1.0 / layers;
+    var depth = 0.0;
+    var current = uv;
+    var height_depth = 1.0 - textureSampleGrad(t_pbr_normal, s_diffuse, current, dx, dy).a;
+    var previous = current;
+    var previous_delta = -height_depth;
+    var delta = previous_delta;
+    for (var i = 0u; i < 32u; i = i + 1u) {
+        if (delta >= 0.0 || f32(i) >= layers) {
+            break;
+        }
+        previous = current;
+        previous_delta = delta;
+        depth = depth + step;
+        current = uv + ray * depth;
+        height_depth = 1.0 - textureSampleGrad(t_pbr_normal, s_diffuse, current, dx, dy).a;
+        delta = depth - height_depth;
+    }
+    let fraction = clamp(previous_delta / min(previous_delta - delta, -1e-6), 0.0, 1.0);
+    return mix(uv, mix(previous, current, fraction), fade);
+}
+
 // The enhanced pass's two targets: the picture, and the screen mask (r: 1 on the bus's own
 // screens, carried by the coverage of what is drawn over them; g: 1 on an LED panel's own
 // dots, see MASK_FORMAT; b is the reflected-light weight of wet puddles).
@@ -337,6 +396,10 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     if (terrain) {
         duv = in.uv * material.extra.z;
     }
+    let uv_dx = dpdx(duv);
+    let uv_dy = dpdy(duv);
+    let surface_uv = parallax_uv(duv, in.world, safe_normal(in.normal), eye,
+                                 uv_dx, uv_dy, dpdx(in.world), dpdy(in.world));
     // An LED panel is sampled at the level its screen footprint asks for, held at
     // `enh.led.y` (`Led mip strength`): its dots keep their gaps much further out than the
     // full chain allows, and the shimmer is a fraction of a full-resolution sample's. The
@@ -347,6 +410,12 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     let pic_lod = led_lod(duv, vec2<f32>(textureDimensions(t_diffuse)));
     let led_pic = material.emissive.w < -1.5 && enh.led.y < pic_lod;
     var tex = diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv);
+    if (HEIGHT_PARALLAX && material.pbr.x > 2.5 && material.parallax.x > 0.0) {
+        // Parallax moves colour, not coverage. Keep the mesh's diffuse alpha and
+        // all terrain brush/road-cut masks at their original coordinates and depth.
+        let shifted = diffuse_border(textureSampleGrad(t_diffuse, s_diffuse, surface_uv, uv_dx, uv_dy), surface_uv);
+        tex = vec4<f32>(shifted.rgb, tex.a);
+    }
     if (led_pic) {
         tex = diffuse_border(textureSampleLevel(t_diffuse, s_diffuse, duv, enh.led.y), duv);
     }
@@ -541,7 +610,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // Terrain uses the same repeated diffuse UV, while its brush/cutout mask keeps the
     // independent tile UV above. Shading relief must never shift the painted coverage.
     if (material.pbr.x > 0.5) {
-        var tn = textureSample(t_pbr_normal, s_diffuse, duv).xyz * 2.0 - vec3<f32>(1.0);
+        var tn = textureSampleGrad(t_pbr_normal, s_diffuse, surface_uv, uv_dx, uv_dy).xyz * 2.0 - vec3<f32>(1.0);
         // (an OpenGL-style map, green up: `_gl` in its name)
         if (material.pbr.x > 1.5 && material.pbr.x < 2.5) {
             tn.y = -tn.y;
@@ -549,7 +618,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         n = perturb_normal(n, in.world, duv, tn, material.pbr.x > 2.5);
     }
     if (material.pbr.y + material.pbr.z + material.pbr.w > 0.5) {
-        let orm = textureSample(t_pbr_orm, s_diffuse, duv).rgb;
+        let orm = textureSampleGrad(t_pbr_orm, s_diffuse, surface_uv, uv_dx, uv_dy).rgb;
         if (material.pbr.y > 0.5) {
             pbr_ao = orm.r;
         }
