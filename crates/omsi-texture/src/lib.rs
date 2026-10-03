@@ -601,6 +601,10 @@ mod tests {
             let stem = format!("sign_{ext}");
             std::fs::write(local.join(format!("{stem}.{ext}")), b"x").unwrap();
             std::fs::write(local.join(format!("{stem}.DDS")), b"x").unwrap();
+        }
+        // Populate the complete folder before lookups cache its case-folded names.
+        for ext in ["png", "jpg", "tga", "bmp"] {
+            let stem = format!("sign_{ext}");
             let name = format!("{stem}.{ext}");
             let found = find_texture_uncached(&name, &[&local]).unwrap();
             assert_eq!(found.extension().unwrap().to_string_lossy().to_ascii_lowercase(), "dds");
