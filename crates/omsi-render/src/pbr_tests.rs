@@ -371,16 +371,13 @@ fn height_parallax_matches_recessed_geometry_at_oblique_and_mirrored_views() {
                 has_alpha: true,
             };
             let mask = renderer.add_texture(&mut scene, &coverage, true);
+            let solid = image([100, 100, 100, 255]);
             for kind in ["cut", "painted", "alpha"] {
                 let mut materials = Vec::new();
                 for height_scale in [0.0, range] {
                     let diffuse = renderer.add_texture(
                         &mut scene,
-                        if kind == "alpha" {
-                            &coverage
-                        } else {
-                            &image([100, 100, 100, 255])
-                        },
+                        if kind == "alpha" { &coverage } else { &solid },
                         true,
                     );
                     renderer.add_pbr_maps(
