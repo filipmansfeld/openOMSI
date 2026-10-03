@@ -328,6 +328,43 @@ mod tests {
     }
 
     #[test]
+    fn clipped_hole_mask_keeps_an_island_between_texel_centers() {
+        let side = tile_size() as f32;
+        let size = 16;
+        let cell = side / size as f32;
+        let mut terrain = Terrain { cells: 64, heights: vec![10.0; 65 * 65] };
+        // This valley is at texel (8.25, 8.25): none of the surrounding pixel centers
+        // see it, but several of the 4x4 coverage samples do. Its terrain stays below
+        // the cutter, while the ground around it is excavated.
+        terrain.heights[33 * 65 + 33] = -10.0;
+        let cutter = MeshData {
+            positions: vec![Vec3::new(6.0 * cell, 6.0 * cell, 5.0), Vec3::new(11.0 * cell, 6.0 * cell, 5.0), Vec3::new(11.0 * cell, 11.0 * cell, 5.0), Vec3::new(6.0 * cell, 11.0 * cell, 5.0)],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            ..Default::default()
+        };
+        let cut = mesh_hole_below_terrain(&cutter, &Mat4::IDENTITY, DVec3::ZERO, &terrain, DVec3::ZERO);
+        let mut surface = TileSurface::new(size);
+        surface.rasterize_hole(&cut, &Mat4::IDENTITY, DVec3::ZERO, 0, 0);
+        surface.finish();
+        // A center-based 3x3 erosion would mark the entire central texel as removed.
+        for j in 7..=9 {
+            for i in 7..=9 {
+                assert!(surface.hole_height(j * size + i).is_some());
+            }
+        }
+        let kept = (0..16).filter(|q| {
+            let x = (8.0 + ((q % 4) as f32 + 0.5) / 4.0) * cell;
+            let y = (8.0 + ((q / 4) as f32 + 0.5) / 4.0) * cell;
+            !covers(&cut, DVec2::new(x as f64, y as f64))
+        }).count();
+        assert!(kept > 0 && kept < 16, "the fixture must cross the inner rim");
+        let mask = surface.mask_image(&|x, y| terrain.sample(x, y), 0.12);
+        let alpha = mask[(8 * size + 8) * 4 + 3];
+        assert!(alpha as usize >= kept * 255 / 16, "center erosion lost the island's fractional coverage: {alpha}");
+        assert_eq!(mask[(7 * size + 7) * 4 + 3], 0, "the surrounding high ground remains cut");
+    }
+
+    #[test]
     fn object_transform_and_spline_outline_share_large_world_coordinates() {
         let terrain_origin = DVec3::new(7_000_000.25, 9_000_000.5, 250.0);
         let origin = terrain_origin + DVec3::new(30.0, 40.0, 9.0);

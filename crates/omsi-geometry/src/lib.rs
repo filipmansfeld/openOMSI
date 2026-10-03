@@ -2442,8 +2442,9 @@ impl TileSurface {
             for i in 0..n {
                 let k = j * n + i;
                 if self.hole_height(k).is_some() {
-                    // An authored excavation can lie more than a storey below the ground.
-                    cut[k] = true;
+                    // Authored holes use their 4x4 coverage below. A center-only cut
+                    // followed by erosion would erase small islands between centers;
+                    // taking min() with coverage later cannot restore their ground.
                     continue;
                 }
                 if !self.covered(k) {
