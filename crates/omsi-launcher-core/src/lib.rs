@@ -16,6 +16,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+/// Only this private server asks the launcher's explicit Join action for Discord access.
+pub const TANGENTA_ACCESS_ORIGIN: &str = "https://tangenta.35.207.73.202.sslip.io";
+
+pub fn is_tangenta_server(address: &str) -> bool {
+    omsi_net::access::matches_origin(address, TANGENTA_ACCESS_ORIGIN)
+}
+
 // ---------------------------------------------------------------------------------------
 // configuration: where the game and the OMSI content are
 

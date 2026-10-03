@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket};
 use tungstenite::client::IntoClientRequest;
 pub use crate::policy::TourOccupancy;
+#[cfg(test)]
+use crate::access::scoped_access_header;
 
 /// What a server tells about itself (`GET /status`, and the launcher's list).
 #[derive(Debug, Clone, Default)]
@@ -333,61 +335,8 @@ pub fn web_bases(target: &str) -> Vec<String> {
     out
 }
 
-/// Canonical HTTP/WebSocket origin. Credentials are tied to an explicit origin,
-/// never to whichever server discovery happens to answer first.
-fn access_origin(url: &str) -> Option<(bool, String, bool)> {
-    let (scheme, rest) = url.trim().split_once("://")?;
-    let secure = match scheme.to_ascii_lowercase().as_str() {
-        "https" | "wss" => true,
-        "http" | "ws" => false,
-        _ => return None,
-    };
-    let authority = rest.split(['/', '?', '#']).next()?;
-    if authority.is_empty() || authority.contains('@') || !authority.is_ascii() {
-        return None;
-    }
-    let default = if secure { 443 } else { 80 };
-    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
-        let (host, tail) = bracketed.split_once(']')?;
-        let ip = host.parse::<std::net::Ipv6Addr>().ok()?;
-        let port = if tail.is_empty() { default } else { tail.strip_prefix(':')?.parse::<u16>().ok()? };
-        (format!("[{ip}]"), port)
-    } else {
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) => (host, port.parse::<u16>().ok()?),
-            None => (authority, default),
-        };
-        if host.is_empty() || !host.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-')) {
-            return None;
-        }
-        (host.to_ascii_lowercase(), port)
-    };
-    if port == 0 { return None; }
-    let loopback = host == "[::1]" || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback());
-    Some((secure, format!("{host}:{port}"), loopback))
-}
-
-fn scoped_access_header(url: &str, origin: Option<&str>, token: Option<&str>) -> Result<Option<String>, String> {
-    let Some(token) = token.filter(|t| !t.is_empty()) else { return Ok(None) };
-    let configured = origin.and_then(access_origin).ok_or("access origin is not configured")?;
-    let Some(requested) = access_origin(url) else { return Ok(None) };
-    if (configured.0, &configured.1) != (requested.0, &requested.1) {
-        return Ok(None);
-    }
-    if !requested.0 && !requested.2 {
-        return Err("access credentials require HTTPS or WSS".into());
-    }
-    // Bound both header size and accepted characters. Errors never echo the secret.
-    if token.len() > 4096 || !token.bytes().all(|c| c.is_ascii_graphic()) {
-        return Err("invalid access credential".into());
-    }
-    Ok(Some(format!("Bearer {token}")))
-}
-
 fn access_header(url: &str) -> Result<Option<String>, String> {
-    let token = std::env::var("OMSI_ACCESS_TOKEN").ok();
-    let origin = std::env::var("OMSI_ACCESS_ORIGIN").ok();
-    scoped_access_header(url, origin.as_deref(), token.as_deref())
+    crate::access::authorization_for(url)
 }
 
 fn ws_request(url: &str, authorization: Option<&str>) -> Result<tungstenite::handshake::client::Request, String> {

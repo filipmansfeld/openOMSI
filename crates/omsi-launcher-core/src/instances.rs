@@ -268,14 +268,35 @@ pub struct Started {
     pub others: usize,
 }
 
+fn configure_child_access(command: &mut std::process::Command, target: Option<&str>, ticket: Option<String>) {
+    command.env_remove("OMSI_ACCESS_TOKEN").env_remove("OMSI_ACCESS_ORIGIN");
+    if target.is_some_and(crate::is_tangenta_server) {
+        if let Some(ticket) = ticket {
+            command.env("OMSI_ACCESS_TOKEN", ticket).env("OMSI_ACCESS_ORIGIN", crate::TANGENTA_ACCESS_ORIGIN);
+        }
+    }
+}
+
 /// Start the game with `args`; games already running keep running.
 pub fn start(game: &Path, args: &[String], d: &crate::Duty, profile: &str) -> Result<Started> {
+    // A ticket is never part of the duty, arguments, registry or logged command. Each
+    // child receives only the credential for the protected server it explicitly joins.
+    let target = d.lan.as_deref().and_then(|lan| lan.strip_prefix("join:")).map(str::trim);
+    let ticket = if target.is_some_and(crate::is_tangenta_server) {
+        Some(omsi_net::access::token_for(target.unwrap()).map_err(|_| anyhow!("Sign in with Discord using Join on the Tangenta server first."))?
+            .ok_or_else(|| anyhow!("Sign in with Discord using Join on the Tangenta server first."))?)
+    } else {
+        None
+    };
     let running: Vec<Instance> = list().into_iter().filter(|i| i.running).collect();
     let (slot, log) = free_slot(&running);
     let file = std::fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
     let err = file.try_clone()?;
     let id = format!("{}-{}-{}", now_secs(), std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-    let child = std::process::Command::new(game).args(args).env("OMSI_INSTANCE", &id).stdout(file).stderr(err).spawn().with_context(|| format!("starting {}", game.display()))?;
+    let mut command = std::process::Command::new(game);
+    command.args(args).env("OMSI_INSTANCE", &id).stdout(file).stderr(err);
+    configure_child_access(&mut command, target, ticket);
+    let child = command.spawn().with_context(|| format!("starting {}", game.display()))?;
     let pid = child.id();
     let process_started = process_start(pid);
     CHILDREN.lock().unwrap_or_else(|e| e.into_inner()).push((id.clone(), child));
@@ -435,8 +456,34 @@ pub fn log_tail(pid: u32, lines: usize) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::*;
+
+    fn credential_env(command: &std::process::Command, name: &str) -> Option<Option<String>> {
+        command.get_envs().find(|(key, _)| *key == name).map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn protected_join_injects_only_child_scoped_ticket() {
+        let mut command = std::process::Command::new("unused-test-child");
+        command.env("HOME", "isolated-profile").env("OMSI_CONTENT_ZIP", "local-content");
+        configure_child_access(&mut command, Some("wss://TANGENTA.35.207.73.202.sslip.io:443/ws"), Some("A".repeat(43)));
+        assert_eq!(credential_env(&command, "OMSI_ACCESS_TOKEN"), Some(Some("A".repeat(43))));
+        assert_eq!(credential_env(&command, "OMSI_ACCESS_ORIGIN"), Some(Some(crate::TANGENTA_ACCESS_ORIGIN.into())));
+        assert_eq!(credential_env(&command, "HOME"), Some(Some("isolated-profile".into())));
+        assert_eq!(credential_env(&command, "OMSI_CONTENT_ZIP"), Some(Some("local-content".into())));
+        assert_eq!(command.get_args().count(), 0, "ticket is never an argument");
+    }
+
+    #[test]
+    fn solo_host_and_other_server_children_remove_inherited_credentials() {
+        for target in [None, Some(""), Some("OMSI-TEST-CODE"), Some("https://other.example"), Some("http://tangenta.35.207.73.202.sslip.io"), Some("https://tangenta.35.207.73.202.sslip.io:8443"), Some("https://tangenta.35.207.73.202.sslip.io.evil.example")] {
+            let mut command = std::process::Command::new("unused-test-child");
+            command.env("OMSI_ACCESS_TOKEN", "old-ticket").env("OMSI_ACCESS_ORIGIN", crate::TANGENTA_ACCESS_ORIGIN);
+            configure_child_access(&mut command, target, Some("A".repeat(43)));
+            assert_eq!(credential_env(&command, "OMSI_ACCESS_TOKEN"), Some(None));
+            assert_eq!(credential_env(&command, "OMSI_ACCESS_ORIGIN"), Some(None));
+        }
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]

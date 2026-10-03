@@ -12,6 +12,7 @@ pub(crate) mod drive;
 pub mod mobile;
 pub mod phone;
 mod multiplayer;
+mod join_auth;
 mod pages;
 mod showroom;
 mod state;
@@ -401,7 +402,11 @@ impl ApplicationHandler for Launcher {
         match event {
             WindowEvent::CloseRequested => {
                 self.pages.pads.cancel_feedback_test();
-                event_loop.exit();
+                if self.state.shutdown_join_auth() {
+                    event_loop.exit();
+                } else {
+                    self.state.set_status("Cancelling Discord sign-in… Close the window again in a moment.", false);
+                }
             }
             WindowEvent::Touch(t) => self.touch(t, scale),
             WindowEvent::Focused(f) => self.set_focus(f),
@@ -769,6 +774,7 @@ impl Launcher {
 
         self.run_script();
         self.state.update(dt);
+        if std::mem::take(&mut self.state.join_completed) { self.go(Page::Drive); }
         #[cfg(not(target_os = "android"))]
         self.update_discord();
         self.update_tick(event_loop);
@@ -968,10 +974,11 @@ impl Launcher {
         let dialog = self.update_dialog_open();
         let crash = !dialog && self.state.crash.is_some();
         let reset = !dialog && !crash && self.pages.confirm_reset;
-        if self.browser.is_some() || dialog || crash || reset {
+        let joining = !dialog && !crash && !reset && self.state.join_pending_text().is_some();
+        if self.browser.is_some() || dialog || crash || reset || joining {
             self.pages.pads.cancel_feedback_test();
         }
-        let saved = (self.browser.is_some() || dialog || crash || reset).then(|| {
+        let saved = (self.browser.is_some() || dialog || crash || reset || joining).then(|| {
             let i = self.ui.input.clone();
             self.ui.input.mouse = Vec2::new(-1e4, -1e4);
             self.ui.input.pressed = false;
@@ -1029,6 +1036,8 @@ impl Launcher {
                 self.draw_crash_dialog();
             } else if reset {
                 pages::reset_dialog(self);
+            } else if joining {
+                self.draw_join_dialog();
             } else {
                 self.draw_browser();
             }
@@ -1037,6 +1046,23 @@ impl Launcher {
         // (see `frame`), which stays in the window until the game ends
         if !mobile && self.state.in_game() && !self.awake() {
             self.draw_game_banner();
+        }
+    }
+
+    /// The explicit connection attempt, with a cancel action on desktop and phone.
+    fn draw_join_dialog(&mut self) {
+        let Some(text) = self.state.join_pending_text() else { return; };
+        let size = self.ui.size;
+        let full = Rect::new(0.0, 0.0, size.x, size.y);
+        self.ui.solid(full);
+        self.ui.p().rect(full, omsi_ui::Color::rgba(0, 0, 0, 0.62));
+        let w = (size.x - 32.0).min(480.0);
+        let r = Rect::new((size.x - w) * 0.5, (size.y - 180.0) * 0.5, w, 180.0);
+        self.ui.panel(r);
+        self.ui.text_in("Join server", Rect::new(r.x + 24.0, r.y + 18.0, r.w - 48.0, 28.0), 18.0, Weight::Bold, TEXT, Align::Left);
+        self.ui.paragraph(text, Vec2::new(r.x + 24.0, r.y + 56.0), r.w - 48.0, 13.0, Weight::Regular, TEXT_DIM);
+        if self.ui.button("join-auth-cancel", Rect::new(r.x + 24.0, r.bottom() - 58.0, r.w - 48.0, 36.0), "Cancel", Some("close"), ui::ButtonKind::Normal) {
+            self.state.cancel_join_auth();
         }
     }
 

@@ -1090,6 +1090,7 @@ fn online(l: &mut Launcher, body: Rect) {
         } else {
             // a session code or a friend's address (a server's too: asked meanwhile, and
             // joined through its web gateway once it has answered): joined when the game starts
+            l.state.leave_server();
             if !omsi_net::looks_like_code(&c) {
                 l.state.ask_server(&c, 5.0);
             }
@@ -1106,6 +1107,7 @@ fn online(l: &mut Launcher, body: Rect) {
     l.ui.p().rounded(hr, 12.0, FIELD);
     l.ui.text_in("Host my next game", Rect::new(hr.x + 16.0, hr.y, hr.w - 120.0, hr.h), 14.0, Weight::Medium, TEXT, Align::Left);
     if l.ui.toggle("po-host", Rect::new(hr.right() - 70.0, hr.y + 8.0, 56.0, 28.0), &mut host, "") {
+        l.state.leave_server();
         l.state.choice.lan_mode = if host { "host".into() } else { "off".into() };
         l.state.joined_server = None;
         l.state.touched();
@@ -1157,12 +1159,7 @@ fn online(l: &mut Launcher, body: Rect) {
 }
 
 fn join(l: &mut Launcher, address: &str) {
-    l.state.ask_server(address, 5.0);
-    l.state.join_server(address);
-    if l.state.joined_server.as_deref() == Some(address) {
-        l.phone.tab = Tab::Play;
-        l.go(Page::Drive);
-    }
+    l.state.request_join_server(address);
 }
 
 fn more(l: &mut Launcher, body: Rect) {

@@ -8,6 +8,7 @@ use omsi_launcher_lib as core;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 /// Results of background work.
 pub enum Msg {
@@ -32,6 +33,8 @@ pub enum Msg {
     Installed(Result<core::install::Progress, String>),
     Join(serde_json::Value),
     Server { address: String, info: Result<omsi_net::ws::ServerInfo, String> },
+    JoinAuthorized { generation: u64, ticket: Result<super::join_auth::Ticket, String> },
+    JoinReady { generation: u64, address: String, info: Result<omsi_net::ws::ServerInfo, String> },
     /// A background job stopped on an error of its own (a panic): whatever it was loading
     /// is not coming.
     Crashed(String),
@@ -169,6 +172,14 @@ impl Choice {
     }
 }
 
+struct PendingJoin {
+    generation: u64,
+    address: String,
+    cancel: Arc<AtomicBool>,
+    authenticating: bool,
+    selected_address: String,
+}
+
 pub struct State {
     pub config: core::Config,
     pub maps: Vec<core::MapInfo>,
@@ -233,12 +244,18 @@ pub struct State {
     pub server_info: std::collections::HashMap<String, (Instant, Result<omsi_net::ws::ServerInfo, String>)>,
     pub server_asked: std::collections::HashMap<String, Instant>,
     pub joined_server: Option<String>,
+    pending_join: Option<PendingJoin>,
+    join_generation: u64,
+    pub join_completed: bool,
+    auth_workers: Vec<std::thread::JoinHandle<()>>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 }
 
 impl State {
     pub fn new() -> State {
+        // Startup and restored duties never authorize a protected Join implicitly.
+        let _ = omsi_net::access::clear(core::TANGENTA_ACCESS_ORIGIN);
         let (tx, rx) = channel();
         let config = core::load_config();
         let settings = core::get_settings().unwrap_or_else(|_| core::settings_from_text(None));
@@ -296,6 +313,10 @@ impl State {
             server_info: Default::default(),
             server_asked: Default::default(),
             joined_server: None,
+            pending_join: None,
+            join_generation: 0,
+            join_completed: false,
+            auth_workers: Vec::new(),
             tx,
             rx,
         };
@@ -490,8 +511,83 @@ impl State {
         });
     }
 
+    pub fn join_pending_text(&self) -> Option<&'static str> {
+        self.pending_join.as_ref().map(|p| if p.authenticating {
+            "Complete Discord sign-in in your browser to join Tangenta."
+        } else { "Connecting to the server…" })
+    }
+
+    /// Only an explicit Join action enters here. Status refresh and startup never do.
+    pub fn request_join_server(&mut self, address: &str) {
+        let address = address.trim().to_string();
+        let protected = core::is_tangenta_server(&address);
+        self.cancel_pending_join();
+        if !protected { let _ = omsi_net::access::clear(core::TANGENTA_ACCESS_ORIGIN); }
+        self.joined_server = None;
+        self.choice.lan_mode = "off".into();
+        self.join_completed = false;
+        self.touched();
+        let generation = self.join_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let authenticating = protected && !omsi_net::access::has_valid_credentials(&address).unwrap_or(false);
+        self.pending_join = Some(PendingJoin { generation, address: address.clone(), cancel: cancel.clone(), authenticating, selected_address: self.choice.lan_addr.clone() });
+        if authenticating {
+            self.set_status("Sign in with Discord to join Tangenta…", false);
+            let tx = self.tx.clone();
+            self.auth_workers.push(std::thread::spawn(move || {
+                let ticket = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::join_auth::authorize(cancel)))
+                    .unwrap_or_else(|_| Err("Discord sign-in could not be completed. Try Join again.".into()));
+                let _ = tx.send(Msg::JoinAuthorized { generation, ticket });
+            }));
+        } else {
+            self.query_join(generation, address);
+        }
+    }
+
+    fn query_join(&self, generation: u64, address: String) {
+        self.spawn(move || Msg::JoinReady {
+            generation,
+            info: if omsi_net::looks_like_code(&address) { host_status(&address) } else { omsi_net::ws::query(&address, true) },
+            address,
+        });
+    }
+
+    fn cancel_pending_join(&mut self) {
+        if let Some(pending) = self.pending_join.take() { pending.cancel.store(true, Ordering::Release); }
+        self.join_generation = self.join_generation.wrapping_add(1);
+        self.join_completed = false;
+    }
+
+    pub fn cancel_join_auth(&mut self) {
+        self.cancel_pending_join();
+        let _ = omsi_net::access::clear(core::TANGENTA_ACCESS_ORIGIN);
+        self.joined_server = None;
+        self.choice.lan_mode = "off".into();
+        self.touched();
+        self.set_status("Connection cancelled. You have not joined the server.", false);
+    }
+
+    /// Closing the window must not orphan an OAuth helper. Give the cancellation
+    /// worker a bounded chance to kill and reap it; otherwise keep the window alive.
+    pub fn shutdown_join_auth(&mut self) -> bool {
+        self.cancel_join_auth();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while self.auth_workers.iter().any(|worker| !worker.is_finished()) && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ready = self.auth_workers.iter().all(|worker| worker.is_finished());
+        if ready {
+            for worker in self.auth_workers.drain(..) { let _ = worker.join(); }
+        }
+        ready
+    }
+
     /// The Drive page joins `address`: the server's map is the map, the session is joined.
     pub fn join_server(&mut self, address: &str) {
+        if core::is_tangenta_server(address) && !omsi_net::access::has_valid_credentials(address).unwrap_or(false) {
+            self.set_status("Press Join on the Tangenta server to sign in with Discord first.", true);
+            return;
+        }
         let Some((_, Ok(info))) = self.server_info.get(address).cloned() else {
             self.set_status("The server has not answered yet (is its address right? is it running?)", true);
             return;
@@ -518,6 +614,8 @@ impl State {
 
     /// Back to playing alone (the Drive page's "Leave Server").
     pub fn leave_server(&mut self) {
+        self.cancel_pending_join();
+        let _ = omsi_net::access::clear(core::TANGENTA_ACCESS_ORIGIN);
         self.joined_server = None;
         self.choice.lan_mode = "off".into();
         self.touched();
@@ -549,6 +647,11 @@ impl State {
     }
 
     pub fn launch(&mut self) {
+        if self.pending_join.is_some() || (self.choice.lan_mode == "join" && core::is_tangenta_server(&self.choice.lan_addr)
+            && (self.joined_server.is_none() || !omsi_net::access::has_valid_credentials(&self.choice.lan_addr).unwrap_or(false))) {
+            self.set_status("Press Join on the Tangenta server to sign in with Discord first.", true);
+            return;
+        }
         if !self.save_pending_settings() {
             return;
         }
@@ -629,6 +732,7 @@ impl State {
 
     /// Continue the situation chosen of the map's (`laststn.osn`, or a save slot, #341).
     pub fn launch_last_situation(&mut self) {
+        self.leave_server();
         if !self.save_pending_settings() {
             return;
         }
@@ -647,6 +751,7 @@ impl State {
 
     /// Start one of OMSI's tutorials (1..4).
     pub fn launch_tutorial(&mut self, n: usize) {
+        self.leave_server();
         if !self.save_pending_settings() {
             return;
         }
@@ -716,6 +821,8 @@ impl State {
     }
 
     pub fn update(&mut self, dt: f32) {
+        self.invalidate_changed_join();
+        self.auth_workers.retain(|worker| !worker.is_finished());
         while let Ok(m) = self.rx.try_recv() {
             self.handle(m);
         }
@@ -754,8 +861,44 @@ impl State {
     }
 
     fn handle(&mut self, m: Msg) {
+        self.invalidate_changed_join();
         match m {
+            Msg::JoinAuthorized { generation, ticket } => {
+                let Some(pending) = self.pending_join.as_ref().filter(|p| p.generation == generation && !p.cancel.load(Ordering::Acquire)) else { return; };
+                let address = pending.address.clone();
+                match ticket {
+                    Ok(ticket) => {
+                        if !core::is_tangenta_server(&address) || omsi_net::access::install(core::TANGENTA_ACCESS_ORIGIN, ticket.token, ticket.expires_at).is_err() {
+                            self.cancel_join_auth();
+                            self.set_status("Discord sign-in could not be completed. Try Join again.", true);
+                            return;
+                        }
+                        if let Some(pending) = self.pending_join.as_mut() { pending.authenticating = false; }
+                        self.set_status("Connecting to Tangenta…", false);
+                        // Never join using a cached unauthenticated status response.
+                        self.query_join(generation, address);
+                    }
+                    Err(message) => {
+                        self.cancel_join_auth();
+                        self.set_status(message, true);
+                    }
+                }
+            }
+            Msg::JoinReady { generation, address, info } => {
+                if !self.pending_join.as_ref().is_some_and(|p| p.generation == generation && p.address == address && !p.cancel.load(Ordering::Acquire)) { return; }
+                self.pending_join = None;
+                let ok = info.is_ok();
+                self.server_info.insert(address.clone(), (Instant::now(), info));
+                if ok {
+                    self.join_server(&address);
+                    self.join_completed = self.joined_server.as_deref() == Some(address.as_str());
+                } else {
+                    let _ = omsi_net::access::clear(core::TANGENTA_ACCESS_ORIGIN);
+                    self.set_status("The server could not be reached. You have not joined it; try Join again.", true);
+                }
+            }
             Msg::Crashed(why) => {
+                if self.pending_join.is_some() { self.cancel_join_auth(); }
                 log::error!("launcher: a background job stopped: {why}");
                 self.loading_content = false;
                 self.loading_lines = false;
@@ -1028,6 +1171,13 @@ impl State {
 
     // --- helpers for the pages -------------------------------------------------------------
 
+    fn invalidate_changed_join(&mut self) {
+        if self.pending_join.as_ref().is_some_and(|p| self.choice.lan_mode != "off" || self.choice.lan_addr != p.selected_address) {
+            self.cancel_pending_join();
+            let _ = omsi_net::access::clear(core::TANGENTA_ACCESS_ORIGIN);
+        }
+    }
+
     pub fn bus(&self) -> Option<&core::VehicleInfo> {
         self.vehicles.iter().find(|v| v.file == self.choice.bus)
     }
@@ -1226,6 +1376,15 @@ pub fn crash_of(log: &std::path::Path) -> Option<(String, String)> {
     Some((what.chars().take(600).collect(), tail))
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending_join.take() { pending.cancel.store(true, Ordering::Release); }
+        // Closing the launcher also waits for its cancelled helper to be killed and
+        // reaped. Previous attempts already carry their cancellation flag.
+        for worker in self.auth_workers.drain(..) { let _ = worker.join(); }
+    }
+}
+
 #[cfg(test)]
 mod choice_tests {
     /// `launcher-duty.json` from before the number plate field: the missing key falls back to
@@ -1312,6 +1471,10 @@ mod map_switch_tests {
             server_info: Default::default(),
             server_asked: Default::default(),
             joined_server: None,
+            pending_join: None,
+            join_generation: 0,
+            join_completed: false,
+            auth_workers: Vec::new(),
             tx,
             rx,
         }
@@ -1319,6 +1482,66 @@ mod map_switch_tests {
 
     fn server_info(file: &str) -> omsi_net::ws::ServerInfo {
         omsi_net::ws::ServerInfo { map: file.into(), name: "Praha Tangenta".into(), ..Default::default() }
+    }
+
+    fn pending_protected_join(s: &mut State) -> Arc<AtomicBool> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        s.join_generation = 7;
+        s.pending_join = Some(PendingJoin { generation: 7, address: core::TANGENTA_ACCESS_ORIGIN.into(), cancel: cancel.clone(), authenticating: true, selected_address: s.choice.lan_addr.clone() });
+        cancel
+    }
+
+    #[test]
+    fn cancelled_or_stale_authorization_reply_never_joins() {
+        let mut s = state_on_brno();
+        let cancel = pending_protected_join(&mut s);
+        s.cancel_join_auth();
+        assert!(cancel.load(Ordering::Acquire));
+        s.handle(Msg::JoinAuthorized { generation: 7, ticket: Ok(super::super::join_auth::Ticket { token: "A".repeat(43), expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(60) }) });
+        s.handle(Msg::JoinReady { generation: 7, address: core::TANGENTA_ACCESS_ORIGIN.into(), info: Ok(server_info(PRAHA)) });
+        assert!(s.joined_server.is_none());
+        assert!(!s.join_completed);
+        assert_eq!(s.choice.lan_mode, "off");
+        assert_eq!(s.choice.map, BRNO);
+        assert!(!omsi_net::access::has_valid_credentials(core::TANGENTA_ACCESS_ORIGIN).unwrap());
+    }
+
+    #[test]
+    fn choosing_host_or_another_target_invalidates_pending_authorization() {
+        for host in [true, false] {
+            let mut s = state_on_brno();
+            let cancel = pending_protected_join(&mut s);
+            if host { s.choice.lan_mode = "host".into(); } else { s.choice.lan_addr = "https://other.example".into(); }
+            s.handle(Msg::JoinAuthorized { generation: 7, ticket: Ok(super::super::join_auth::Ticket { token: "A".repeat(43), expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(60) }) });
+            assert!(cancel.load(Ordering::Acquire));
+            assert!(s.pending_join.is_none());
+            assert!(s.joined_server.is_none());
+            assert_eq!(s.choice.lan_mode, if host { "host" } else { "off" });
+        }
+    }
+
+    #[test]
+    fn denied_authorization_does_not_change_map_or_join() {
+        let mut s = state_on_brno();
+        pending_protected_join(&mut s);
+        s.handle(Msg::JoinAuthorized { generation: 7, ticket: Err("This Discord account cannot join the Tangenta server.".into()) });
+        assert!(s.pending_join.is_none());
+        assert!(s.joined_server.is_none());
+        assert!(s.queued_launch.is_none());
+        assert_eq!(s.choice.map, BRNO);
+        assert_eq!(s.choice.lan_mode, "off");
+    }
+
+    #[test]
+    fn restored_protected_choice_cannot_launch_or_authorize_implicitly() {
+        let mut s = state_on_brno();
+        s.choice.lan_mode = "join".into();
+        s.choice.lan_addr = core::TANGENTA_ACCESS_ORIGIN.into();
+        s.launch();
+        assert!(s.queued_launch.is_none());
+        assert!(s.pending_join.is_none());
+        assert!(s.auth_workers.is_empty());
+        assert!(s.joined_server.is_none());
     }
 
     fn add_server(s: &mut State, file: &str) {

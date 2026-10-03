@@ -56,6 +56,7 @@ fn by_code(l: &mut Launcher, r: Rect) {
     y += h + 12.0;
     let mut on = hosting;
     if l.ui.toggle("mp-host", Rect::new(host.x + 18.0, y, host.w - 36.0, 32.0), &mut on, "Host my next duty") {
+        l.state.leave_server();
         l.state.choice.lan_mode = if on { "host".into() } else { "off".into() };
         l.state.joined_server = None;
         l.state.touched();
@@ -107,6 +108,7 @@ fn by_code(l: &mut Launcher, r: Rect) {
     y += h + 12.0;
     let mut a = if l.state.choice.lan_mode == "join" && l.state.joined_server.is_none() { l.state.choice.lan_addr.clone() } else { String::new() };
     if l.ui.text_input("mp-code", Rect::new(join.x + 18.0, y, join.w - 36.0, ROW), &mut a, "OMSI-XXXX-XXXX-…", Some("link")) {
+        l.state.leave_server();
         l.state.choice.lan_addr = a.trim().to_string();
         l.state.choice.lan_mode = if a.trim().is_empty() { "off".into() } else { "join".into() };
         l.state.joined_server = None;
@@ -122,7 +124,12 @@ fn by_code(l: &mut Launcher, r: Rect) {
     let can = l.state.choice.lan_mode == "join" && l.state.joined_server.is_none() && l.state.join.0 && !l.state.choice.lan_addr.is_empty();
     if l.ui.button("mp-join", Rect::new(join.x + 18.0, join.bottom() - 18.0 - ROW, 200.0, ROW), "Choose a bus and join", Some("exit_to_app"), if can { ButtonKind::Primary } else { ButtonKind::Normal }) {
         if can {
-            l.go(super::Page::Drive);
+            let address = l.state.choice.lan_addr.clone();
+            if omsi_launcher_lib::is_tangenta_server(&address) {
+                l.state.request_join_server(&address);
+            } else {
+                l.go(super::Page::Drive);
+            }
         } else {
             l.state.set_status("Paste a session code first", true);
         }
@@ -230,11 +237,7 @@ fn servers(l: &mut Launcher, r: Rect) {
         l.mp.selected = None;
     }
     if let Some(a) = join {
-        l.state.ask_server(&a, 5.0);
-        l.state.join_server(&a);
-        if l.state.joined_server.as_deref() == Some(a.as_str()) {
-            l.go(super::Page::Drive);
-        }
+        l.state.request_join_server(&a);
     }
     if l.ui.button("mp-refresh", Rect::new(r.x, r.bottom() - ROW, 150.0, ROW), "Refresh", Some("refresh"), ButtonKind::Normal) {
         for e in &entries {

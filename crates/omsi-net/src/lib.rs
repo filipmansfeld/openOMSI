@@ -76,6 +76,7 @@
 //! answers, and gives up with a message saying why that may be after `JOIN_TIMEOUT`.
 
 pub mod addrs;
+pub mod access;
 pub mod bridge;
 pub mod wire;
 pub mod world;
