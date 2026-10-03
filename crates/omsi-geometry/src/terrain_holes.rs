@@ -255,6 +255,18 @@ mod tests {
             [area(a, b, p.extend(0.0)), area(b, c, p.extend(0.0)), area(c, a, p.extend(0.0))].iter().all(|v| v * s >= -1e-5)
         })
     }
+    // Linear clamp sampling, as used by the terrain material's alpha-test mask.
+    fn sampled_alpha(mask: &[u8], size: usize, uv: DVec2) -> f64 {
+        let p = uv * size as f64 - DVec2::splat(0.5);
+        let f = p.floor();
+        let t = p - f;
+        [(0, 0, (1.0 - t.x) * (1.0 - t.y)), (1, 0, t.x * (1.0 - t.y)), (0, 1, (1.0 - t.x) * t.y), (1, 1, t.x * t.y)]
+            .into_iter().map(|(dx, dy, w)| {
+                let x = (f.x as i32 + dx).clamp(0, size as i32 - 1) as usize;
+                let y = (f.y as i32 + dy).clamp(0, size as i32 - 1) as usize;
+                w * mask[(y * size + x) * 4 + 3] as f64 / 255.0
+            }).sum()
+    }
 
     #[test]
     fn above_coplanar_and_submillimetre_cutters_keep_terrain() {
@@ -324,6 +336,10 @@ mod tests {
             assert!((size / 2 - 4..=size / 2 + 4).any(|j| {
                 (size / 4 - 4..=size / 4 + 4).any(|i| (1..255).contains(&mask[(j * size + i) * 4 + 3]))
             }), "missing inner-rim antialiasing at raster size {size}");
+            assert!(sampled_alpha(&mask, size, DVec2::splat(0.5)) >= 0.5,
+                "the retained island must survive the renderer's filtered alpha test");
+            assert!(sampled_alpha(&mask, size, DVec2::new(0.125, 0.5)) < 0.5,
+                "the buried surrounding ground must still be removed after filtering");
         }
     }
 
@@ -362,6 +378,26 @@ mod tests {
         let alpha = mask[(8 * size + 8) * 4 + 3];
         assert!(alpha as usize >= kept * 255 / 16, "center erosion lost the island's fractional coverage: {alpha}");
         assert_eq!(mask[(7 * size + 7) * 4 + 3], 0, "the surrounding high ground remains cut");
+    }
+
+    #[test]
+    fn clipped_hole_without_covered_centers_still_requests_a_mask() {
+        let size = 16;
+        let cell = tile_size() as f32 / size as f32;
+        let cutter = MeshData {
+            positions: vec![Vec3::new(7.51 * cell, 6.0 * cell, 5.0), Vec3::new(8.49 * cell, 6.0 * cell, 5.0), Vec3::new(8.49 * cell, 11.0 * cell, 5.0), Vec3::new(7.51 * cell, 11.0 * cell, 5.0)],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            ..Default::default()
+        };
+        let terrain = flat(10.0);
+        let cut = mesh_hole_below_terrain(&cutter, &Mat4::IDENTITY, DVec3::ZERO, &terrain, DVec3::ZERO);
+        let mut surface = TileSurface::new(size);
+        surface.rasterize_hole(&cut, &Mat4::IDENTITY, DVec3::ZERO, 0, 0);
+        surface.finish();
+        assert!((0..size * size).all(|k| surface.hole_height(k).is_none()), "only coverage samples should hit the narrow strip");
+        let mask = surface.mask_image(&|x, y| terrain.sample(x, y), 0.12);
+        assert!(mask.chunks_exact(4).any(|pixel| pixel[3] < 255));
+        assert!(surface.cuts_anything(&|x, y| terrain.sample(x, y), 0.12), "the scene must not discard a non-empty fractional cut mask");
     }
 
     #[test]

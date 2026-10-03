@@ -2571,7 +2571,7 @@ impl TileSurface {
         self.touched().any(|k| {
             let (i, j) = (k % n, k / n);
             let t = terrain_at((i as f32 + 0.5) * cell, (j as f32 + 0.5) * cell);
-            self.hole_height(k).is_some() || (self.covered(k) && self.cuts(k, t, flush))
+            self.hole_coverage(k) != 0 || self.hole_height(k).is_some() || (self.covered(k) && self.cuts(k, t, flush))
         })
     }
 }
