@@ -1,0 +1,90 @@
+name: Tangenta client draft release
+
+on:
+  push:
+    tags: ['v*-tangenta.*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tangenta-client-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-client:
+    if: github.repository == 'filipmansfeld/openOMSI'
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the Tangenta tag
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+-tangenta\.[0-9]+$') { throw 'Not a Tangenta revision tag' }
+          $version = $tag.Substring(1)
+          if ((Get-Content -LiteralPath TANGENTA_VERSION -Raw).Trim() -ne $version) { throw 'Tag and TANGENTA_VERSION differ' }
+          "OPENOMSI_VERSION=$version" >> $env:GITHUB_ENV
+          "TANGENTA_TAG=$tag" >> $env:GITHUB_ENV
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tangenta-windows-x64
+      - name: Update channel and network regression tests
+        shell: pwsh
+        run: |
+          cargo test --locked -p omsi-app --lib updater::tests -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p omsi-net --lib -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build the Windows client
+        shell: cmd
+        run: scripts\build-windows.cmd x86_64-pc-windows-msvc
+      - name: DirectX shader compiler
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R microsoft/DirectXShaderCompiler --pattern 'dxc_*.zip' -D dxc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $zip = Get-ChildItem dxc/*.zip | Where-Object { $_.Name -notmatch 'linux|pdb' } | Select-Object -First 1
+          if (!$zip) { throw 'DirectX compiler archive missing' }
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath dxc/x
+          Copy-Item dxc/x/bin/x64/dxcompiler.dll, dxc/x/bin/x64/dxil.dll dist/windows/
+      - name: Visual C++ runtime
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -Last 1
+          if (!$crt) { throw 'Visual C++ runtime directory missing' }
+          foreach ($dll in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
+            Copy-Item -LiteralPath (Join-Path $crt.FullName $dll) -Destination dist/windows/
+          }
+      - name: Package the flat client archive
+        shell: pwsh
+        run: |
+          $name = "openOMSI-$env:OPENOMSI_VERSION-client-windows-x64.zip"
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item LICENSE dist/windows/
+          Copy-Item docs/TANGENTA-CLIENT-RELEASES.md dist/windows/README.md
+          "Version: $env:OPENOMSI_VERSION`nSource: $env:GITHUB_SHA`nRepository: $env:GITHUB_REPOSITORY`nUpstream base: 8842610fca44a0979307597d9946af1b6e606717" | Set-Content dist/windows/BUILD-INFO.txt
+          Compress-Archive -Path dist/windows/* -DestinationPath "out/$name"
+          $digest = (Get-FileHash -LiteralPath "out/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $name" | Set-Content "out/$name.sha256"
+          "Tangenta $env:OPENOMSI_VERSION. Windows x64 client. Source: $env:GITHUB_SHA. Upstream base: v0.1.1098. The update channel accepts only Tangenta client releases from filipmansfeld/openOMSI." | Set-Content out/release-notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tangenta-client-windows-x64
+          path: out/*
+      - name: Create a draft release for review
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:TANGENTA_TAG --repo $env:GITHUB_REPOSITORY --verify-tag --draft --title "Tangenta $env:OPENOMSI_VERSION" --notes-file out/release-notes.md "out/openOMSI-$env:OPENOMSI_VERSION-client-windows-x64.zip" "out/openOMSI-$env:OPENOMSI_VERSION-client-windows-x64.zip.sha256"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          'The release is a draft. Review the Windows client before publishing it. Tangenta clients ignore draft releases.' >> $env:GITHUB_STEP_SUMMARY

@@ -16,6 +16,7 @@ fn main() {
     println!("cargo:rustc-env=OPENOMSI_VERSION={}", version(&git));
     println!("cargo:rerun-if-env-changed=OPENOMSI_VERSION");
     println!("cargo:rerun-if-changed=../../VERSION");
+    println!("cargo:rerun-if-changed=../../TANGENTA_VERSION");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
     windows_icon();
@@ -31,6 +32,11 @@ fn main() {
 /// changed (the CI passes the same number in `OPENOMSI_VERSION`).
 fn version(git: &dyn Fn(&[&str]) -> Option<String>) -> String {
     if let Ok(v) = std::env::var("OPENOMSI_VERSION") {
+        if !v.trim().is_empty() {
+            return v.trim().to_string();
+        }
+    }
+    if let Ok(v) = std::fs::read_to_string("../../TANGENTA_VERSION") {
         if !v.trim().is_empty() {
             return v.trim().to_string();
         }

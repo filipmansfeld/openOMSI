@@ -1,8 +1,8 @@
-//! Updates from the project's GitHub releases (github.com/openOMSI-Project/openOMSI).
+//! Tangenta client updates from github.com/filipmansfeld/openOMSI only.
 //!
-//! Every push to main publishes a release `v<MAJOR.MINOR.COMMIT>` with one archive per
-//! platform (see .github/workflows/release.yml). The launcher asks the GitHub API for the
-//! latest release when it starts (setting `update_check`), and when it is newer than this
+//! Published releases use `v<MAJOR.MINOR.COMMIT>-tangenta.<REVISION>` and a client archive
+//! per platform (see .github/workflows/tangenta-client.yml). The launcher asks the fork's
+//! releases API when it starts (setting `update_check`), and when a release is newer than this
 //! build it offers it - or, with `update_auto`, installs it at once:
 //!
 //! * **Windows, macOS, Linux**: the archive is downloaded (and checked against the SHA-256
@@ -18,10 +18,10 @@
 //!   (`OmsiActivity.installApk`, a PackageInstaller session). The system asks the player;
 //!   Cancel comes back as an error here, Update replaces the app and starts it again.
 //!
-//! `OMSI_UPDATE_URL=<url or file:///…json>` points the check at another release description
-//! (for testing: a file in the GitHub API's format whose asset URLs may be `file://` too),
-//! `OMSI_NO_UPDATE=1` switches the check off. A development build (run from a cargo `target`
-//! folder) checks, but never replaces itself.
+//! Drafts, prereleases, upstream tags, server archives, external URLs and files without a
+//! GitHub SHA-256 digest are refused. There is no upstream fallback or URL override.
+//! `OMSI_NO_UPDATE=1` switches the automatic check off. A development build (run from a
+//! cargo `target` folder) checks, but never replaces itself.
 
 // (a phone installs through the system: the unpacking and swapping below are the computers')
 #![cfg_attr(target_os = "android", allow(dead_code))]
@@ -31,9 +31,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// The project on GitHub.
-pub const REPO: &str = "openOMSI-Project/openOMSI";
-pub const REPO_URL: &str = "https://github.com/openOMSI-Project/openOMSI";
-const LATEST_API: &str = "https://api.github.com/repos/openOMSI-Project/openOMSI/releases/latest";
+pub const REPO: &str = "filipmansfeld/openOMSI";
+pub const REPO_URL: &str = "https://github.com/filipmansfeld/openOMSI";
+pub const PRODUCT: &str = "Tangenta";
+const RELEASES_API: &str = "https://api.github.com/repos/filipmansfeld/openOMSI/releases";
+const CHANNEL: &str = "tangenta";
 
 /// A release newer than this build, with the file for this platform.
 #[derive(Clone, Debug, PartialEq)]
@@ -45,7 +47,7 @@ pub struct Release {
     pub asset_name: String,
     pub asset_url: String,
     pub size: u64,
-    /// `sha256:<hex>` as GitHub lists it for the asset (None for releases older than that).
+    /// The mandatory GitHub asset digest (without the `sha256:` prefix).
     pub sha256: Option<String>,
 }
 
@@ -99,14 +101,21 @@ impl Updater {
         *lock(&self.status) = s;
     }
 
-    /// Ask GitHub for the latest release (in the background).
-    pub fn check(&mut self) {
+    fn begin_check(&mut self) -> bool {
         self.checked_once = true;
         if matches!(self.status(), Status::Checking | Status::Downloading { .. } | Status::Installing(_) | Status::WaitingForInstaller(_) | Status::Restarting(_)) {
-            return;
+            return false;
         }
         self.dismissed = false;
+        // A failed automatic installation may be retried from the dialog in this start.
+        self.auto_started = false;
         self.set(Status::Checking);
+        true
+    }
+
+    /// Ask GitHub for the latest release (in the background).
+    pub fn check(&mut self) {
+        if !self.begin_check() { return; }
         let status = self.status.clone();
         std::thread::spawn(move || {
             let s = match latest() {
@@ -170,21 +179,36 @@ pub fn current_version() -> &'static str {
     crate::startup::VERSION
 }
 
-/// `0.1.7` / `v0.1.7` as numbers (missing parts are 0).
-fn version_parts(v: &str) -> Vec<u64> {
-    v.trim().trim_start_matches(['v', 'V']).split(['.', '-', '+']).map_while(|p| p.parse::<u64>().ok()).collect()
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ChannelVersion {
+    base: [u64; 3],
+    revision: u64,
+}
+
+/// A pinned engine base plus a Tangenta revision. The original `-tangenta` build is 0.
+fn version_parts(v: &str) -> Option<ChannelVersion> {
+    let v = v.strip_prefix('v').unwrap_or(v);
+    let (base, channel) = v.split_once('-')?;
+    let number = |s: &str| {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) { return None; }
+        s.parse::<u64>().ok()
+    };
+    let mut parts = base.split('.');
+    let base = [number(parts.next()?)?, number(parts.next()?)?, number(parts.next()?)?];
+    if parts.next().is_some() { return None; }
+    let revision = if channel == CHANNEL { 0 } else { number(channel.strip_prefix(CHANNEL)?.strip_prefix('.')?)? };
+    Some(ChannelVersion { base, revision })
 }
 
 /// Whether `candidate` is a newer version than `current`.
 pub fn newer(candidate: &str, current: &str) -> bool {
-    let (mut a, mut b) = (version_parts(candidate), version_parts(current));
-    let n = a.len().max(b.len());
-    a.resize(n, 0);
-    b.resize(n, 0);
-    !a.is_empty() && a > b
+    match (version_parts(candidate), version_parts(current)) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
+    }
 }
 
-/// The release file for this platform, as `release.yml` names it.
+/// The release file for this platform, as the Tangenta release workflow names it.
 pub fn asset_name(version: &str) -> Option<String> {
     let suffix = if cfg!(target_os = "android") {
         "android-arm64.apk"
@@ -203,7 +227,8 @@ pub fn asset_name(version: &str) -> Option<String> {
     } else {
         return None;
     };
-    Some(format!("openOMSI-{version}-{suffix}"))
+    version_parts(version)?;
+    Some(format!("openOMSI-{version}-client-{suffix}"))
 }
 
 // --- the release ----------------------------------------------------------------------------
@@ -216,11 +241,8 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
-/// A URL's body: `file://` read from the disk (tests), anything else over HTTP(S).
+/// Fetch the fixed fork API. Release URLs cannot be overridden by the environment.
 fn fetch_text(url: &str) -> anyhow::Result<String> {
-    if let Some(p) = url.strip_prefix("file://") {
-        return Ok(std::fs::read_to_string(p)?);
-    }
     let r = agent().get(url).set("Accept", "application/vnd.github+json").call().map_err(|e| anyhow::anyhow!("{}", short_error(&e)))?;
     Ok(r.into_string()?)
 }
@@ -234,15 +256,36 @@ fn short_error(e: &ureq::Error) -> String {
 
 /// The latest release when it is newer than this build and has a file for this platform.
 pub fn latest() -> anyhow::Result<Option<Release>> {
-    let url = omsi_cfg::env::var("OMSI_UPDATE_URL").unwrap_or_else(|_| LATEST_API.to_string());
-    let v: serde_json::Value = serde_json::from_str(&fetch_text(&url)?)?;
-    parse_release(&v, current_version())
+    anyhow::ensure!(version_parts(current_version()).is_some(), "this build has no Tangenta channel version");
+    let mut best: Option<Release> = None;
+    // Pagination also handles a fork with many upstream or unfinished releases.
+    for page in 1..=10 {
+        let url = format!("{RELEASES_API}?per_page=100&page={page}");
+        let v: serde_json::Value = serde_json::from_str(&fetch_text(&url)?)?;
+        let releases = v.as_array().ok_or_else(|| anyhow::anyhow!("GitHub did not return a release list"))?;
+        select_releases(releases, current_version(), &mut best)?;
+        if releases.len() < 100 { break; }
+    }
+    Ok(best)
+}
+
+fn select_releases(releases: &[serde_json::Value], current: &str, best: &mut Option<Release>) -> anyhow::Result<()> {
+    for v in releases {
+        if let Some(r) = parse_release(v, current)? {
+            if best.as_ref().map(|b| newer(&r.version, &b.version)).unwrap_or(true) {
+                *best = Some(r);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A release described as the GitHub API does, when newer than `current`.
 fn parse_release(v: &serde_json::Value, current: &str) -> anyhow::Result<Option<Release>> {
     let tag = v["tag_name"].as_str().ok_or_else(|| anyhow::anyhow!("the release has no tag"))?;
-    let version = tag.trim_start_matches(['v', 'V']).to_string();
+    let Some(version) = tag.strip_prefix('v') else { return Ok(None) };
+    if version.starts_with('v') || version_parts(version).is_none() { return Ok(None); }
+    let version = version.to_string();
     if v["draft"].as_bool() == Some(true) || v["prerelease"].as_bool() == Some(true) || !newer(&version, current) {
         return Ok(None);
     }
@@ -252,7 +295,7 @@ fn parse_release(v: &serde_json::Value, current: &str) -> anyhow::Result<Option<
         log::info!("update check: {version} has no {want} (yet)");
         return Ok(None);
     };
-    Ok(Some(Release {
+    let r = Release {
         version,
         page: v["html_url"].as_str().map(str::to_string).unwrap_or_else(|| format!("{REPO_URL}/releases/tag/{tag}")),
         notes: v["body"].as_str().unwrap_or("").to_string(),
@@ -260,7 +303,21 @@ fn parse_release(v: &serde_json::Value, current: &str) -> anyhow::Result<Option<
         asset_url: a["browser_download_url"].as_str().ok_or_else(|| anyhow::anyhow!("the release file has no address"))?.to_string(),
         size: a["size"].as_u64().unwrap_or(0),
         sha256: a["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).map(|h| h.to_ascii_lowercase()),
-    }))
+    };
+    validate_release(&r)?;
+    Ok(Some(r))
+}
+
+/// Enforce the channel again before installation, including callers of `install`.
+fn validate_release(r: &Release) -> anyhow::Result<()> {
+    anyhow::ensure!(!r.version.starts_with('v') && version_parts(&r.version).is_some(), "the release is not a Tangenta version");
+    anyhow::ensure!(asset_name(&r.version).as_deref() == Some(r.asset_name.as_str()), "the release file is not this platform's Tangenta client");
+    let tag = format!("v{}", r.version);
+    anyhow::ensure!(r.page == format!("{REPO_URL}/releases/tag/{tag}"), "the release page is outside the Tangenta repository");
+    anyhow::ensure!(r.asset_url == format!("{REPO_URL}/releases/download/{tag}/{}", r.asset_name), "the release download is outside the Tangenta repository");
+    anyhow::ensure!(r.size > 0, "the release file has no size");
+    anyhow::ensure!(r.sha256.as_ref().map(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())).unwrap_or(false), "the release file has no valid GitHub SHA-256 digest");
+    Ok(())
 }
 
 /// Where downloads wait (the data folder: the program's own folder is only written when the
@@ -277,15 +334,9 @@ fn download(r: &Release, to: &Path, status: &Mutex<Status>) -> anyhow::Result<()
     let part = to.with_extension("part");
     let mut hasher = sha2::Sha256::new();
     let mut out = std::fs::File::create(&part)?;
-    let (mut reader, total): (Box<dyn Read>, u64) = if let Some(p) = r.asset_url.strip_prefix("file://") {
-        let f = std::fs::File::open(p)?;
-        let n = f.metadata()?.len();
-        (Box::new(f), n)
-    } else {
-        let resp = agent().get(&r.asset_url).set("Accept", "application/octet-stream").call().map_err(|e| anyhow::anyhow!("{}", short_error(&e)))?;
-        let n = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(r.size);
-        (Box::new(resp.into_reader()), n)
-    };
+    let resp = agent().get(&r.asset_url).set("Accept", "application/octet-stream").call().map_err(|e| anyhow::anyhow!("{}", short_error(&e)))?;
+    let total = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(r.size);
+    let mut reader = resp.into_reader();
     let mut buf = vec![0u8; 256 * 1024];
     let mut done = 0u64;
     loop {
@@ -315,6 +366,7 @@ fn download(r: &Release, to: &Path, status: &Mutex<Status>) -> anyhow::Result<()
 }
 
 fn download_and_install(r: &Release, status: &Mutex<Status>) -> anyhow::Result<()> {
+    validate_release(r)?;
     // (on a computer: where it goes must be writable before 15 MB are fetched for nothing)
     #[cfg(not(target_os = "android"))]
     {
@@ -647,35 +699,105 @@ mod tests {
 
     #[test]
     fn versions_compare_by_number() {
-        assert!(newer("0.1.8", "0.1.7"));
-        assert!(newer("v0.1.10", "0.1.9"));
-        assert!(newer("0.2.0", "0.1.99"));
-        assert!(newer("1.0", "0.9.9"));
-        assert!(!newer("0.1.7", "0.1.7"));
-        assert!(!newer("v0.1.6", "0.1.7"));
-        assert!(!newer("garbage", "0.1.7"));
+        assert!(newer("0.1.1098-tangenta.2", "0.1.1098-tangenta.1"));
+        assert!(newer("v0.1.1098-tangenta.10", "0.1.1098-tangenta.9"));
+        assert!(newer("0.1.1098-tangenta.1", "0.1.1098-tangenta"));
+        assert!(newer("0.1.1099-tangenta.1", "0.1.1098-tangenta.99"));
+        assert!(!newer("0.1.1098-tangenta.1", "0.1.1098-tangenta.1"));
+        assert!(!newer("0.1.1098-tangenta", "0.1.1098-tangenta.1"));
+        for v in ["0.1.9999", "0.1.9999-official.1", "0.1.1098-tangenta.2-extra", "0.1.1098-tangenta.2+dev", "0.1.1098-tangenta.-1", "0.1.1098-tangenta.18446744073709551616", "garbage"] {
+            assert!(!newer(v, "0.1.1098-tangenta.1"), "{v}");
+        }
+    }
+
+    fn release_fixture(version: &str) -> serde_json::Value {
+        let name = asset_name(version).unwrap();
+        serde_json::json!({
+            "tag_name": format!("v{version}"), "html_url": format!("{REPO_URL}/releases/tag/v{version}"), "body": "notes",
+            "assets": [
+                {"name": format!("openOMSI-{version}-server-linux-x64.zip"), "browser_download_url": "https://x/server", "size": 5},
+                {"name": name, "browser_download_url": format!("{REPO_URL}/releases/download/v{version}/{name}"), "size": 42, "digest": format!("sha256:{}", "AB".repeat(32))}
+            ]
+        })
     }
 
     #[test]
     fn the_platform_file_of_a_github_release() {
-        let name = asset_name("0.1.9").unwrap();
-        let v = serde_json::json!({
-            "tag_name": "v0.1.9", "html_url": "https://github.com/openOMSI-Project/openOMSI/releases/tag/v0.1.9", "body": "notes",
-            "assets": [
-                {"name": "openOMSI-0.1.9-server-linux-x64.zip", "browser_download_url": "https://x/server", "size": 5},
-                {"name": name, "browser_download_url": "https://x/mine", "size": 42, "digest": "sha256:ABCDEF"}
-            ]
-        });
-        let r = parse_release(&v, "0.1.7").unwrap().unwrap();
-        assert_eq!((r.version.as_str(), r.asset_url.as_str(), r.size, r.sha256.as_deref()), ("0.1.9", "https://x/mine", 42, Some("abcdef")));
+        let v = release_fixture("0.1.1098-tangenta.2");
+        let r = parse_release(&v, "0.1.1098-tangenta.1").unwrap().unwrap();
+        assert_eq!(r.version, "0.1.1098-tangenta.2");
+        assert_eq!(r.size, 42);
+        assert_eq!(r.sha256, Some("ab".repeat(32)));
         // not newer, a draft, or without this platform's file: nothing to offer
-        assert!(parse_release(&v, "0.1.9").unwrap().is_none());
+        assert!(parse_release(&v, "0.1.1098-tangenta.2").unwrap().is_none());
         let mut d = v.clone();
         d["draft"] = serde_json::json!(true);
-        assert!(parse_release(&d, "0.1.7").unwrap().is_none());
+        assert!(parse_release(&d, "0.1.1098-tangenta.1").unwrap().is_none());
+        d["draft"] = serde_json::json!(false);
+        d["prerelease"] = serde_json::json!(true);
+        assert!(parse_release(&d, "0.1.1098-tangenta.1").unwrap().is_none());
         let mut n = v.clone();
         n["assets"] = serde_json::json!([]);
-        assert!(parse_release(&n, "0.1.7").unwrap().is_none());
+        assert!(parse_release(&n, "0.1.1098-tangenta.1").unwrap().is_none());
+    }
+
+    #[test]
+    fn only_the_own_tangenta_channel_can_be_installed() {
+        let v = release_fixture("0.1.1098-tangenta.2");
+        let current = "0.1.1098-tangenta.1";
+        for tag in ["v0.1.9999", "v0.1.1098-other.99", "vv0.1.1098-tangenta.2"] {
+            let mut d = v.clone();
+            d["tag_name"] = serde_json::json!(tag);
+            assert!(parse_release(&d, current).unwrap().is_none());
+        }
+        for url in ["https://github.com/openOMSI-Project/openOMSI/releases/download/v0.1.1098-tangenta.2/mine.zip", "https://example.com/client.zip", "file:///tmp/client.zip"] {
+            let mut d = v.clone();
+            d["assets"][1]["browser_download_url"] = serde_json::json!(url);
+            assert!(parse_release(&d, current).is_err());
+        }
+        for digest in [serde_json::Value::Null, serde_json::json!("sha256:ABCDEF"), serde_json::json!(format!("sha256:{}", "zz".repeat(32)))] {
+            let mut d = v.clone();
+            d["assets"][1]["digest"] = digest;
+            assert!(parse_release(&d, current).is_err());
+        }
+        let mut d = v.clone();
+        d["html_url"] = serde_json::json!("https://github.com/openOMSI-Project/openOMSI/releases/tag/v0.1.1098-tangenta.2");
+        assert!(parse_release(&d, current).is_err());
+        let mut d = v.clone();
+        d["assets"][1]["size"] = serde_json::json!(0);
+        assert!(parse_release(&d, current).is_err());
+        let mut r = parse_release(&v, current).unwrap().unwrap();
+        r.asset_url = "https://example.com/client.zip".into();
+        assert!(download_and_install(&r, &Mutex::new(Status::Idle)).is_err());
+    }
+
+    #[test]
+    fn releases_are_filtered_and_the_highest_ready_revision_is_selected() {
+        let current = "0.1.1098-tangenta.1";
+        let mut best = None;
+        select_releases(&[], current, &mut best).unwrap();
+        assert!(best.is_none());
+        let official = serde_json::json!({"tag_name": "v0.1.9999"});
+        let mut unfinished = release_fixture("0.1.1098-tangenta.12");
+        unfinished["assets"] = serde_json::json!([]);
+        select_releases(&[official, release_fixture("0.1.1098-tangenta.10"), unfinished, release_fixture("0.1.1098-tangenta.2")], current, &mut best).unwrap();
+        assert_eq!(best.as_ref().unwrap().version, "0.1.1098-tangenta.10");
+        // A second page can contain a higher ready revision than the first page.
+        select_releases(&[release_fixture("0.1.1098-tangenta.11")], current, &mut best).unwrap();
+        assert_eq!(best.as_ref().unwrap().version, "0.1.1098-tangenta.11");
+    }
+
+    #[test]
+    fn an_explicit_retry_can_restart_automatic_installation() {
+        let mut updater = Updater { auto_started: true, ..Updater::default() };
+        updater.set(Status::Downloading { release: parse_release(&release_fixture("0.1.1098-tangenta.2"), "0.1.1098-tangenta.1").unwrap().unwrap(), done: 0, total: 42 });
+        // An active transfer cannot be interrupted by another check.
+        assert!(!updater.begin_check());
+        assert!(updater.auto_started);
+        updater.set(Status::Failed("download failed".into()));
+        assert!(updater.begin_check());
+        assert!(!updater.auto_started);
+        assert_eq!(updater.status(), Status::Checking);
     }
 
     #[test]

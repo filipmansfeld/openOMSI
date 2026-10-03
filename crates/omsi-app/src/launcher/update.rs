@@ -79,11 +79,11 @@ impl Launcher {
         match status {
             Status::Available(rel) => {
                 self.ui.icon("system_update", icon_at, 26.0, ACCENT);
-                self.ui.text_in(&format!("openOMSI {} is available", rel.version), title_r, 18.0, Weight::Bold, TEXT, Align::Left);
+                self.ui.text_in(&format!("{} {} is available", updater::PRODUCT, rel.version), title_r, 18.0, Weight::Bold, TEXT, Align::Left);
                 let text = if cfg!(target_os = "android") {
-                    format!("You have {current}. Update now? The launcher downloads the new version ({}) from GitHub and Android installs it; openOMSI then starts again - your mods and settings stay as they are.", mb(rel.size))
+                    format!("You have {current}. Update now? The launcher downloads the Tangenta version ({}) from github.com/{} and Android installs it; Tangenta then starts again - your mods and settings stay as they are.", mb(rel.size), updater::REPO)
                 } else {
-                    format!("You have {current}. Update now? The launcher downloads the new version ({}) from GitHub, puts it in place of this one and starts again - your mods and settings stay as they are.", mb(rel.size))
+                    format!("You have {current}. Update now? The launcher downloads the Tangenta version ({}) from github.com/{}, puts it in place of this one and starts again - your mods and settings stay as they are.", mb(rel.size), updater::REPO)
                 };
                 self.ui.paragraph(&text, body_at, inner.w, 13.0, Weight::Regular, TEXT_DIM);
                 let mut auto = self.setting("update_auto", false);
@@ -103,20 +103,20 @@ impl Launcher {
             }
             Status::Downloading { release, done, total } => {
                 self.ui.icon("download", icon_at, 26.0, ACCENT);
-                self.ui.text_in(&format!("Downloading openOMSI {}", release.version), title_r, 18.0, Weight::Bold, TEXT, Align::Left);
+                self.ui.text_in(&format!("Downloading {} {}", updater::PRODUCT, release.version), title_r, 18.0, Weight::Bold, TEXT, Align::Left);
                 let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
                 self.ui.paragraph(&format!("{} of {} from github.com/{}", mb(done), mb(total), updater::REPO), body_at, inner.w, 13.0, Weight::Regular, TEXT_DIM);
                 self.ui.progress(Rect::new(inner.x, body_at.y + 40.0, inner.w, 10.0), frac, true);
             }
             Status::Installing(release) | Status::Restarting(release) => {
                 self.ui.icon("install_desktop", icon_at, 26.0, ACCENT);
-                self.ui.text_in(&format!("Installing openOMSI {}", release.version), title_r, 18.0, Weight::Bold, TEXT, Align::Left);
+                self.ui.text_in(&format!("Installing {} {}", updater::PRODUCT, release.version), title_r, 18.0, Weight::Bold, TEXT, Align::Left);
                 self.ui.paragraph("The new version is put in place; the launcher starts again in a moment.", body_at, inner.w, 13.0, Weight::Regular, TEXT_DIM);
                 self.ui.progress(Rect::new(inner.x, body_at.y + 40.0, inner.w, 10.0), 1.0, true);
             }
             Status::WaitingForInstaller(release) => {
                 self.ui.icon("install_mobile", icon_at, 26.0, ACCENT);
-                self.ui.text_in(&format!("Installing openOMSI {}", release.version), title_r, 18.0, Weight::Bold, TEXT, Align::Left);
+                self.ui.text_in(&format!("Installing {} {}", updater::PRODUCT, release.version), title_r, 18.0, Weight::Bold, TEXT, Align::Left);
                 self.ui.paragraph("Android asks whether to update openOMSI: press Update there. The app then starts again by itself.", body_at, inner.w, 13.0, Weight::Regular, TEXT_DIM);
                 self.ui.progress(Rect::new(inner.x, body_at.y + 60.0, inner.w, 10.0), 1.0, true);
             }
@@ -131,7 +131,7 @@ impl Launcher {
                     self.update.check();
                 }
                 if self.ui.button("upd-github", Rect::new(inner.x, buttons_y, 170.0, 38.0), "Open on GitHub", Some("open_in_new"), ButtonKind::Ghost) {
-                    updater::open_url(&format!("{}/releases/latest", updater::REPO_URL));
+                    updater::open_url(&format!("{}/releases", updater::REPO_URL));
                 }
             }
             _ => {}
@@ -150,7 +150,7 @@ impl Launcher {
             return;
         }
         let fade = (t / 0.3).min(1.0).min((9.0 - t) / 0.6).clamp(0.0, 1.0);
-        let text = format!("Updated to openOMSI {v}");
+        let text = format!("Updated to {} {v}", updater::PRODUCT);
         let w = self.ui.width(&text, 13.5, Weight::Bold) + 60.0;
         let r = Rect::new(self.ui.size.x - w - 20.0, 18.0, w, 42.0);
         self.ui.p().rounded(r, 8.0, PANEL.alpha(0.97 * fade));
