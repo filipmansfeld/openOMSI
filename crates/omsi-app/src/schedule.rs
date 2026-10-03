@@ -4190,14 +4190,27 @@ impl PlayerDuty {
     /// Places of stops the timetable did not know (their tiles were not loaded when the duty
     /// was made): the navigator reads the whole map.
     pub fn learn_places(&mut self, places: &HashMap<i64, glam::DVec3>) {
+        self.learn_places_from(|id| places.get(&id).copied());
+    }
+
+    /// Fill missing places as tiles stream in, without depending on the navigator or
+    /// forgetting known stops when their tiles unload. Learning a place does not move
+    /// the duty: the next update still has to observe the bus arriving and leaving.
+    pub fn learn_places_from(&mut self, place_of: impl Fn(i64) -> Option<glam::DVec3>) {
         for trip in &mut self.trips {
+            let mut changed = false;
             for s in &mut trip.stops {
                 if s.position.is_none() {
-                    s.position = places.get(&s.object_id).copied();
+                    if let Some(position) = place_of(s.object_id) {
+                        s.position = Some(position);
+                        changed = true;
+                    }
                 }
             }
             // (a stop that only now has a place gives its neighbours their direction)
-            trip.set_dirs();
+            if changed {
+                trip.set_dirs();
+            }
         }
     }
 
@@ -4854,6 +4867,58 @@ mod tests {
             end: stops.last().unwrap().arr,
             stops,
         }
+    }
+
+    #[test]
+    fn late_places_restore_each_stops_progress() {
+        let mut warm_trip = planned(0.0, &[(0.0, 0.0, 0.0), (100.0, 60.0, 60.0), (200.0, 120.0, 120.0), (500.0, 200.0, 200.0)]);
+        warm_trip.set_dirs();
+        let mut cold_trip = warm_trip.clone();
+        cold_trip.stops[1].position = None;
+        cold_trip.stops[2].position = None;
+        cold_trip.set_dirs();
+        let duty = |trip| PlayerDuty { line: "5".into(), tour: "1".into(), trips: vec![trip], trip_index: 0, first_trip: 0, next_stop: 0, at_stop: false, arrived_late: None, done: false, left_late: None, held_back: false, placed: true, trip_changed: false, picked: true, first_update: None, heading: 90.0 };
+        let (mut warm, mut cold) = (duty(warm_trip), duty(cold_trip));
+        // The navigator has finished, but it did not know these attached stops yet.
+        cold.learn_places(&HashMap::new());
+        for (x, now) in [(0.0, 0.0), (40.0, 30.0)] {
+            assert_eq!(cold.advance(glam::DVec3::new(x, 0.0, 0.0), now), warm.advance(glam::DVec3::new(x, 0.0, 0.0), now));
+        }
+        assert_eq!(cold.next_stop, 1);
+        assert!(cold.trip().stops[0].dir.outbound.is_none());
+        let mut positions = HashMap::new();
+        for (id, x, arrival) in [(1, 100.0, 60.0), (2, 200.0, 120.0)] {
+            positions.insert(id, (glam::DVec3::new(x, 0.0, 0.0), [180.0, 0.0, 0.0]));
+            cold.learn_places_from(|id| positions.get(&id).map(|p| p.0));
+            assert!(cold.trip().stops[(id - 1) as usize].dir.outbound.is_some());
+            for (at, now) in [(x, arrival), (x + 40.0, arrival + 10.0)] {
+                assert_eq!(cold.advance(glam::DVec3::new(at, 0.0, 0.0), now), warm.advance(glam::DVec3::new(at, 0.0, 0.0), now));
+                assert_eq!(cold.next_stop, warm.next_stop);
+            }
+            assert_eq!(cold.next_stop, (id + 1) as usize, "both stops must be served individually");
+        }
+        // Unloading does not lose their learned places, and a later registry snapshot
+        // cannot silently move an already known stop under a running duty.
+        positions.clear();
+        positions.insert(1, (glam::DVec3::new(999.0, 0.0, 0.0), [0.0; 3]));
+        cold.learn_places_from(|id| positions.get(&id).map(|p| p.0));
+        assert_eq!(cold.trip().stops[1].position, Some(glam::DVec3::new(100.0, 0.0, 0.0)));
+        assert_eq!(cold.trip().stops[2].position, Some(glam::DVec3::new(200.0, 0.0, 0.0)));
+        assert_eq!(cold.next_stop, 3);
+    }
+
+    #[test]
+    fn learning_places_keeps_a_manually_held_back_stop() {
+        let mut trip = planned(0.0, &[(0.0, 0.0, 0.0), (100.0, 60.0, 60.0), (500.0, 120.0, 120.0), (1000.0, 200.0, 200.0)]);
+        trip.stops[3].position = None;
+        let mut d = PlayerDuty { line: "5".into(), tour: "1".into(), trips: vec![trip], trip_index: 0, first_trip: 0, next_stop: 0, at_stop: false, arrived_late: None, done: false, left_late: None, held_back: false, placed: true, trip_changed: false, picked: true, first_update: None, heading: 90.0 };
+        d.skip_to(2);
+        d.skip_to(1);
+        d.learn_places_from(|id| (id == 3).then_some(glam::DVec3::new(1000.0, 0.0, 0.0)));
+        assert!(d.held_back);
+        assert_eq!(d.next_stop, 1);
+        d.advance(glam::DVec3::new(500.0, 0.0, 0.0), 100.0);
+        assert_eq!(d.next_stop, 1, "learning places must not release a manual selection");
     }
 
     #[test]

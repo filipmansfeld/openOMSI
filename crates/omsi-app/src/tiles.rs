@@ -155,7 +155,11 @@ impl MapIndex {
     pub fn build(tiles: &[(usize, i32, i32, PathBuf)], chrono_dirs: &[PathBuf], root: &Path) -> MapIndex {
         /// What one tile adds besides its own index part: its rows (key, spline, start
         /// distance, interval) and its repeaters (master key, spline, first object index).
-        type RowParts = (Vec<((usize, i64), i64, f64, f64)>, Vec<((usize, i64), i64, usize)>);
+        type RowParts = (
+            Vec<((usize, i64), i64, f64, f64)>,
+            Vec<((usize, i64), i64, usize)>,
+            Vec<((i32, i32), MapSpline, SplineAttachment)>,
+        );
         let t0 = std::time::Instant::now();
         let signal_types = parking_lot::Mutex::new(HashMap::new());
         // (per tile: the parents its children name a light of, and its objects' files - the
@@ -216,7 +220,21 @@ impl MapIndex {
                 for a in &tile.spline_attachments {
                     let Some(s) = tile.splines.get(a.spline_index.max(0) as usize) else { continue };
                     match a.repeater {
-                        None => rows.0.push(((*gi, a.id), s.id, a.offset[2], a.interval)),
+                        None => {
+                            rows.0.push(((*gi, a.id), s.id, a.offset[2], a.interval));
+                            if !s.deleted {
+                                rows.2.push(((*tx, *ty), s.clone(), SplineAttachment {
+                                    file: a.file.clone(),
+                                    id: a.id,
+                                    offset: a.offset,
+                                    rot: a.rot,
+                                    interval: a.interval,
+                                    range: a.range,
+                                    tilt: a.tilt,
+                                    ..Default::default()
+                                }));
+                            }
+                        }
                         Some((master_tile, first)) => rows.1.push(((master_tile, a.id), s.id, first)),
                     }
                 }
@@ -249,21 +267,19 @@ impl MapIndex {
                     part.stop_side.insert(a.id, stop_side(&a.strings));
                     part.stop_length.insert(a.id, stop_length(&a.strings));
                 }
-                // an object put on a spline (`[splineAttachement]`: an entry point or a stop
-                // on the road): where the row's first object stands on its own spline - enough
-                // to find it and load its tiles (the placed object gives the exact place; a
-                // Novi Sad entry point was "not in the map" before)
-                for a in tile.spline_attachments.iter().filter(|a| a.repeater.is_none()) {
-                    let Some(s) = tile.splines.get(a.spline_index.max(0) as usize) else { continue };
-                    let Some(first) = row_start(a, s, None).and_then(|st| place_on(a, s, origin, None, st).into_iter().next()) else { continue };
-                    part.objects.entry(a.id).or_insert(((*tx, *ty), first.pose.pos, [first.pose.heading(), 0.0, 0.0]));
-                }
                 part.tiles_read = 1;
                 Some((part, rows, lights))
             })
             .collect();
         let mut index = MapIndex::default();
         let mut rows: RowParts = Default::default();
+        // A stop's distance counts from the chain's start, often beyond the length of
+        // its own segment. All predecessors must be known before indexing row poses,
+        // including those on other tiles in maps without an authored chain offset.
+        let mut parts = parts;
+        for (part, _, _) in parts.iter_mut().flatten() {
+            index.splines.extend(std::mem::take(&mut part.splines));
+        }
         let named: HashSet<i64> = parts.iter().flatten().flat_map(|p| p.2 .0.iter().copied()).collect();
         let mut programs: HashMap<String, bool> = HashMap::new();
         for (_, ids, names) in parts.iter().flatten().map(|p| &p.2) {
@@ -285,8 +301,13 @@ impl MapIndex {
         }
         for p in parts {
             match p {
-                Some((p, (r, q), _)) => {
-                    index.splines.extend(p.splines);
+                Some((mut p, (r, q, objects), _)) => {
+                    for (tile, spline, attachment) in objects {
+                        let origin = DVec2::new(tile.0 as f64 * tile_size(), tile.1 as f64 * tile_size());
+                        let Some(first) = row_start(&attachment, &spline, Some(&index))
+                            .and_then(|start| place_on(&attachment, &spline, origin, Some(&index), start).into_iter().next()) else { continue };
+                        p.objects.entry(attachment.id).or_insert((tile, first.pose.pos, [first.pose.heading(), 0.0, 0.0]));
+                    }
                     for (id, v) in p.objects {
                         if let Some(prev) = index.objects.get(&id).filter(|prev| prev.0 != v.0) {
                             index.duplicates.insert((prev.0, id), (prev.1, prev.2));
@@ -1051,6 +1072,41 @@ impl Streamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_index_resolves_chained_spline_stops() {
+        let dir = std::env::temp_dir().join(format!("omsi-index-stop-chain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for version in [10, 14] {
+            // Entirely synthetic: the stop lies 25 m into the second segment, but its
+            // authored distance (625 m) includes the 600 m before that segment.
+            let spline = |id: i64, y: f64, length: f64, offset: f64| {
+                let links = if version >= 11 {
+                    // Stale predecessor links must not override the authored offset.
+                    format!("0\n{}\n", if id == 1 { 2 } else { 0 })
+                } else {
+                    format!("{}\n", if id == 1 { -1 } else { 0 })
+                };
+                let chain = if version >= 11 { format!("0\n0\n{offset}\n") } else { String::new() };
+                format!("[spline]\n0\nsynthetic.sli\n{id}\n{links}0\n0\n{y}\n0\n{length}\n0\n0\n0\n0\n0\n{chain}\n")
+            };
+            let turn = if version >= 12 { "180\n0\n0\n10\n0\n1\n" } else { "180\n10\n0\n" };
+            let contents = format!("[version]\n{version}\n\n{}{}[splineAttachement]\n0\nsynthetic-stop.sco\n100\n1\n-3\n2\n625\n{turn}0\n",
+                spline(1, 0.0, 600.0, 0.0), spline(2, 600.0, 50.0, 600.0));
+            let path = dir.join(format!("tile_3_-2_v{version}.map"));
+            std::fs::write(&path, contents).unwrap();
+            let index = MapIndex::build(&[(0, 3, -2, path.clone())], &[], &dir);
+            let (_, pos, rot) = index.objects.get(&100).expect("the cold index must know the stop");
+            assert!((*pos - DVec3::new(3.0 * tile_size() - 3.0, -2.0 * tile_size() + 625.0, 2.0)).length() < 1e-8);
+            let tile = read_tile(&path, &[]).unwrap();
+            let placed = tile_row_objects(&tile.spline_attachments[0], &tile.splines,
+                DVec2::new(3.0 * tile_size(), -2.0 * tile_size()), Some(&index));
+            assert_eq!(placed.len(), 1);
+            assert!((*pos - placed[0].1.pose.pos).length() < 1e-8, "cold and streamed placement must agree");
+            assert!((rot[0] - placed[0].1.pose.heading()).abs() < 1e-6);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn traffic_light_parents_follow_placed_signals_not_other_children() {

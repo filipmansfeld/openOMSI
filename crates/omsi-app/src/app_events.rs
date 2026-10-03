@@ -1288,6 +1288,12 @@ impl ApplicationHandler for App {
                     self.world.as_ref(),
                     self.paused || !duty_confirmed,
                 ) {
+                    // Attached stops may only acquire a place when their tile is loaded.
+                    // Read just the duty's missing ids, not a copy of the map's registry.
+                    {
+                        let positions = w.object_positions.lock();
+                        d.learn_places_from(|id| positions.get(&id).map(|p| p.0));
+                    }
                     if let Some(stop) = p.html_next_stop.take() {
                         if d.skip_to(stop) {
                             let (trip, k) = d.trip_for_ibis();
