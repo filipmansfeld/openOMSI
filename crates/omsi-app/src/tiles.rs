@@ -156,7 +156,7 @@ impl MapIndex {
         /// What one tile adds besides its own index part: its rows (key, spline, start
         /// distance, interval) and its repeaters (master key, spline, first object index).
         type RowParts = (
-            Vec<((usize, i64), i64, f64, f64)>,
+            Vec<((usize, i64), i64, f64, f64, Option<f64>)>,
             Vec<((usize, i64), i64, usize)>,
             Vec<((i32, i32), MapSpline, SplineAttachment)>,
         );
@@ -200,19 +200,9 @@ impl MapIndex {
                 };
                 let mut rows: RowParts = Default::default();
                 for s in tile.splines.iter().filter(|s| !s.deleted) {
-                    let map_chain_offset = if tile.version >= 11 || tile.version == 0 {
-                        let offset = if s.tex_offset.is_finite() && s.tex_offset > 0.0 {
-                            s.tex_offset
-                        } else {
-                            0.0
-                        };
-                        Some(offset)
-                    } else {
-                        None
-                    };
                     part.splines.insert(s.id, IndexedSpline {
                         length: s.length,
-                        map_chain_offset,
+                        map_chain_offset: s.map_chain_offset,
                         prev: s.prev_id,
                         next: s.next_id,
                     });
@@ -221,7 +211,7 @@ impl MapIndex {
                     let Some(s) = tile.splines.get(a.spline_index.max(0) as usize) else { continue };
                     match a.repeater {
                         None => {
-                            rows.0.push(((*gi, a.id), s.id, a.offset[2], a.interval));
+                            rows.0.push(((*gi, a.id), s.id, a.offset[2], a.interval, s.map_chain_offset));
                             if !s.deleted {
                                 rows.2.push(((*tx, *ty), s.clone(), SplineAttachment {
                                     file: a.file.clone(),
@@ -334,8 +324,9 @@ impl MapIndex {
             }
         }
         let mut intervals: HashMap<(usize, i64), f64> = HashMap::new();
-        for (key, spline, d, interval) in rows.0 {
-            index.masters.insert(key, (spline, d - chain_offset(&index, spline)));
+        for (key, spline, d, interval, authored_offset) in rows.0 {
+            let offset = authored_offset.unwrap_or_else(|| chain_offset(&index, spline));
+            index.masters.insert(key, (spline, d - offset));
             intervals.insert(key, interval);
         }
         // how well the chain model matches the editor: a repeater names the first object of
@@ -597,7 +588,12 @@ fn row_start(att: &SplineAttachment, spline: &MapSpline, index: Option<&MapIndex
     let d = att.offset[2];
     let Some((master_tile, first)) = att.repeater else {
         // the start distance counts from the start of the chain
-        let d0 = index.map(|ix| d - chain_offset(ix, spline.id)).unwrap_or(d);
+        // Separate towns in a merged map can reuse spline ids. The record's authored
+        // offset belongs to this spline, whereas a global id lookup may name another.
+        let offset = spline.map_chain_offset
+            .or_else(|| index.map(|ix| chain_offset(ix, spline.id)))
+            .unwrap_or(0.0);
+        let d0 = d - offset;
         return Some(RowStart { s: d0, j: 0, backwards: false, d0, acc: 0.0 });
     };
     let master = index.and_then(|ix| ix.masters.get(&(master_tile, att.id)).copied());
@@ -1074,6 +1070,29 @@ impl Streamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authored_offsets_keep_stops_on_tiles_with_duplicate_spline_ids() {
+        let dir = std::env::temp_dir().join(format!("omsi-index-duplicate-spline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = |stop, offset, distance| format!("[version]\n14\n\n[spline]\n0\nsynthetic.sli\n10\n0\n0\n0\n0\n0\n0\n50\n0\n0\n0\n0\n0\n0\n0\n{offset}\n\n[splineAttachement]\n0\nsynthetic-stop.sco\n{stop}\n0\n0\n0\n{distance}\n0\n0\n0\n10\n0\n0\n0\n");
+        let (first, second) = (dir.join("tile_0_0.map"), dir.join("tile_2_-1.map"));
+        std::fs::write(&first, record(100, 0.0, 25.0)).unwrap();
+        std::fs::write(&second, record(200, 600.0, 625.0)).unwrap();
+        let index = MapIndex::build(&[(0, 0, 0, first.clone()), (1, 2, -1, second.clone())], &[], &dir);
+        assert_eq!(index.splines[&10].map_chain_offset, Some(600.0));
+        for (tile_index, stop, x, y, path) in [(0, 100, 0, 0, first), (1, 200, 2, -1, second)] {
+            let origin = DVec2::new(x as f64 * tile_size(), y as f64 * tile_size());
+            let pos = index.objects.get(&stop).expect("both towns must keep their stop").1;
+            assert!((pos - origin.extend(0.0) - DVec3::new(0.0, 25.0, 0.0)).length() < 1e-8);
+            assert_eq!(index.masters[&(tile_index, stop)].1, 25.0);
+            let tile = read_tile(&path, &[]).unwrap();
+            let placed = tile_row_objects(&tile.spline_attachments[0], &tile.splines, origin, Some(&index));
+            assert_eq!(placed.len(), 1);
+            assert!((placed[0].1.pose.pos - pos).length() < 1e-8, "streamed placement also uses the local authored offset");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn cold_index_resolves_chained_spline_stops() {
