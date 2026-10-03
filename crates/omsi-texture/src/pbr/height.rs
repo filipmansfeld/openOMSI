@@ -51,14 +51,17 @@ impl Dimensions {
     }
 }
 
-pub(super) fn load(path: &Path, config: &Path) -> Result<Image, String> {
+pub(super) fn load(path: &Path, config: &Path) -> Result<(Image, f32), String> {
     let file = omsi_cfg::CfgFile::read(config).map_err(|e| e.to_string())?;
     let dimensions = Dimensions::parse(&file)?;
     let image = crate::decode_file(path).map_err(|e| e.to_string())?;
     if !super::is_grey(&image) {
         return Err("expected a linear grayscale height map".into());
     }
-    Ok(normals(&capped_linear(image, super::MAX_SIDE), &dimensions))
+    Ok((
+        normals(&capped_linear(image, super::MAX_SIDE), &dimensions),
+        dimensions.height,
+    ))
 }
 
 fn capped_linear(image: Image, max: u32) -> Image {
@@ -122,6 +125,9 @@ fn normals(image: &Image, dimensions: &Dimensions) -> Image {
                 rgba[(y * width + x) * 4 + c] =
                     ((value * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
             }
+            // Keep the authored linear height for parallax. This alpha is data, not
+            // coverage, and must not be sRGB-encoded when the normal is uploaded.
+            rgba[(y * width + x) * 4 + 3] = image.rgba[(y * width + x) * 4];
         }
     }
     Image {
@@ -169,12 +175,10 @@ mod tests {
         for limit in [2, 1] {
             let image = capped_linear(grey(4, 4, |x, y| ((x + y) % 2 * 255) as u8), limit);
             assert_eq!((image.width, image.height), (limit, limit));
-            assert!(
-                image
-                    .rgba
-                    .chunks_exact(4)
-                    .all(|p| p == [128, 128, 128, 255])
-            );
+            assert!(image
+                .rgba
+                .chunks_exact(4)
+                .all(|p| p == [128, 128, 128, 255]));
         }
         // Five texels become two equal UV footprints: the centre texel contributes
         // half its area to each side, and the last texel must not be discarded.
@@ -206,12 +210,10 @@ mod tests {
         }
         for size in ["0", "-1", "0.009", "1001", "NaN", "inf", "bad"] {
             for (width, depth) in [(size, "1"), ("1", size)] {
-                assert!(
-                    config(&format!(
-                        "[height_scale]\n0.1\n[texture_size]\n{width}\n{depth}"
-                    ))
-                    .is_err()
-                );
+                assert!(config(&format!(
+                    "[height_scale]\n0.1\n[texture_size]\n{width}\n{depth}"
+                ))
+                .is_err());
             }
         }
     }
@@ -224,7 +226,7 @@ mod tests {
             depth: 1.6,
         };
         let flat = normals(&grey(8, 8, |_, _| 157), &dimensions);
-        assert!(flat.rgba.chunks_exact(4).all(|p| p == [128, 128, 255, 255]));
+        assert!(flat.rgba.chunks_exact(4).all(|p| p == [128, 128, 255, 157]));
         // Each U texel advances 0.1 m and rises 0.02 m; each V texel advances
         // 0.2 m and falls 0.01 m. The plane's analytic normal is (-0.2, 0.05, 1).
         let plane = normals(
@@ -240,6 +242,32 @@ mod tests {
                 "{actual:?} != {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn normal_alpha_keeps_linear_height_not_source_coverage() {
+        let mut height = grey(4, 2, |x, _| [0, 64, 128, 255][x as usize]);
+        for (i, pixel) in height.rgba.chunks_exact_mut(4).enumerate() {
+            pixel[3] = if i % 2 == 0 { 255 } else { 0 };
+        }
+        let packed = normals(
+            &height,
+            &Dimensions {
+                height: 0.02,
+                width: 1.0,
+                depth: 2.0,
+            },
+        );
+        for (source, normal) in height.rgba.chunks_exact(4).zip(packed.rgba.chunks_exact(4)) {
+            assert_eq!(
+                normal[3], source[0],
+                "height alpha must preserve linear red bytes"
+            );
+        }
+        assert!(
+            !packed.has_alpha,
+            "packed height is data, not transparent coverage"
+        );
     }
 
     #[test]

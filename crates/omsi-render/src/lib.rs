@@ -375,6 +375,8 @@ struct MaterialUniform {
     /// The PBR maps beside the diffuse texture (`Scene::pbr_maps`): x has a normal map,
     /// y an occlusion, z a roughness, w a metalness channel.
     pbr: [f32; 4],
+    /// x: authored height range in metres; normal alpha contains linear height.
+    parallax: [f32; 4],
     /// x: a screen (`MaterialExtra::screen`); y: 1 `[matl_texadress_border]`, 2
     /// `[matl_texadress_mirroronce]`; z the border colour's rgb packed as r * 65536 + g * 256 + b (bytes), w its alpha.
     flags: [f32; 4],
@@ -392,6 +394,7 @@ pub struct PbrMaps {
     pub orm: Option<TextureId>,
     /// x normal, y occlusion, z roughness, w metalness (1 = present)
     pub flags: [f32; 4],
+    pub height_scale: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -688,7 +691,7 @@ impl GpuTexture {
 struct BindKey {
     textures: [(usize, u64); 7],
     address: TexAddressing,
-    uniform: [u32; 40],
+    uniform: [u32; 44],
 }
 
 /// Bytes of a texture of `format` with `levels` mip levels.
@@ -2323,6 +2326,7 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
         };
+        let height_parallax = omsi_cfg::env::var("OMSI_PARALLAX").as_deref() != Ok("0");
         let make = |format: wgpu::TextureFormat,
                     fs: &str,
                     blend: Option<wgpu::BlendState>,
@@ -2378,6 +2382,7 @@ impl Renderer {
                     compilation_options: wgpu::PipelineCompilationOptions {
                         constants: &[
                             ("ALPHA_TEST", if alpha_to_coverage { 1.0 } else { 0.0 }),
+                            ("HEIGHT_PARALLAX", if height_parallax { 1.0 } else { 0.0 }),
                             (
                                 "ALPHA_TO_COVERAGE",
                                 if use_alpha_to_coverage { 1.0 } else { 0.0 },
@@ -4244,12 +4249,20 @@ impl Renderer {
             })
             .collect();
         let mut up = |img: &omsi_texture::Image| {
-            let data = omsi_texture::Image { width: img.width, height: img.height, rgba: img.rgba.iter().map(|b| lut[*b as usize]).collect(), has_alpha: false };
+            let data = omsi_texture::Image {
+                width: img.width,
+                height: img.height,
+                rgba: img.rgba.iter().enumerate()
+                    .map(|(i, b)| if i % 4 == 3 { *b } else { lut[*b as usize] }).collect(),
+                has_alpha: false,
+            };
             self.add_texture(scene, &data, true)
         };
         let normal = set.normal.as_ref().map(&mut up);
         let orm = set.orm.as_ref().map(&mut up);
-        scene.pbr_maps.insert(diffuse, PbrMaps { normal, orm, flags: set.flags });
+        scene.pbr_maps.insert(diffuse, PbrMaps {
+            normal, orm, flags: set.flags, height_scale: set.height_scale,
+        });
     }
 
     /// The device takes BC1-3 (DXT) textures.
@@ -4779,6 +4792,11 @@ impl Renderer {
             .and_then(|id| scene.pbr_maps.get(&id))
             .map(|maps| maps.flags)
             .unwrap_or([0.0; 4]);
+        uniform.parallax = [
+            texture.and_then(|id| scene.pbr_maps.get(&id))
+                .map(|maps| maps.height_scale).unwrap_or(0.0),
+            0.0, 0.0, 0.0,
+        ];
         if uniform.ambient[3] < 1.5 {
             uniform.ambient[3] = snow_texture_flag(scene, texture);
         }
@@ -5065,6 +5083,10 @@ impl Renderer {
                 if extra.no_z_check { 1.0 } else { 0.0 },
             ],
             pbr: texture.and_then(|t| scene.pbr_maps.get(&t)).map(|m| m.flags).unwrap_or([0.0; 4]),
+            parallax: [
+                texture.and_then(|t| scene.pbr_maps.get(&t)).map(|m| m.height_scale).unwrap_or(0.0),
+                0.0, 0.0, 0.0,
+            ],
             flags: {
                 let b = extra.border.unwrap_or([0.0; 4]).map(|c| (c.clamp(0.0, 1.0) * 255.0).round());
                 [
