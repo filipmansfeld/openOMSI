@@ -6,6 +6,9 @@ use omsi_vehicle::{SoundCfg, SoundEntry};
 use std::path::Path;
 use std::sync::Arc;
 
+mod native;
+pub use native::{PlaybackControl, SoundInfo};
+
 struct RuntimeSound {
     def: SoundEntry,
     clip: Option<Arc<Clip>>,
@@ -20,9 +23,25 @@ struct RuntimeSound {
     /// such a sound get quieter while it plays (`TSound` +0x2c, reset when the trigger fires,
     /// peak hold @0x7507bc) - a door sound whose curve follows the door kept its tail.
     peak: f32,
+    last_gain: f32,
+    last_pitch: f32,
+    original: Option<SoundEntry>,
+    control: PlaybackControl,
+    pitch_multiplier: f32,
+}
+
+impl RuntimeSound {
+    fn new(def: SoundEntry, clip: Option<Arc<Clip>>) -> RuntimeSound {
+        RuntimeSound {
+            def, clip, voice: None, held: false, active_since: None, peak: 0.0,
+            last_gain: 1.0, last_pitch: 1.0, original: None,
+            control: PlaybackControl::Native, pitch_multiplier: 1.0,
+        }
+    }
 }
 
 pub struct SoundSet {
+    api_id: u64,
     sounds: Vec<RuntimeSound>,
     pub master: f32,
     /// Folder of the sound config: files of `(T.F.)` triggers resolve against it.
@@ -114,17 +133,11 @@ impl SoundSet {
                 } else {
                     None
                 };
-                RuntimeSound {
-                    def: def.clone(),
-                    clip,
-                    voice: None,
-                    held: false,
-                    active_since: None,
-                    peak: 0.0,
-                }
+                RuntimeSound::new(def.clone(), clip)
             })
             .collect();
         SoundSet {
+            api_id: native::next_id(),
             sounds,
             master: 1.0,
             dir: dir.to_path_buf(),
@@ -272,7 +285,7 @@ impl SoundSet {
         let view = self.view_mask();
         let (muffled, exterior, master) = (self.muffled, self.exterior, self.master);
         for s in self.sounds.iter_mut() {
-            if !s
+            if s.control != PlaybackControl::Native || !s
                 .def
                 .triggers
                 .iter()
@@ -460,7 +473,12 @@ impl SoundSet {
                 5.0
             }
         };
+        let ctx = self.ctx(engine);
         for s in self.sounds.iter_mut() {
+            if s.control != PlaybackControl::Native {
+                native::update_controlled(engine, s, var, object_to_world, &ctx);
+                continue;
+            }
             // How the exe plays an entry (`TSound` update, 2.2.032):
             // * with a `[trigger]`: once each time the trigger fires, from the start, never
             //   looped (a `[loopsound]` too) and without looking at its conditions;
@@ -504,10 +522,12 @@ impl SoundSet {
                 vol = Self::peak_hold(&mut s.peak, vol, fired);
             }
             let (pitch, fast_enough) = Self::pitch_of(&s.def, var, &clip);
+            s.last_gain = vol.unwrap_or(0.0);
+            s.last_pitch = pitch;
             let audible = vol.map(|v| v > 0.001).unwrap_or(false) && fast_enough;
             let params = |looping: bool| VoiceParams {
                 gain: vol.unwrap_or(0.0) * master * Self::outside_gain(muffled, exterior),
-                pitch: pitch.max(0.001),
+                pitch: (pitch * s.pitch_multiplier).max(0.001),
                 looping,
                 position: world_pos(s.def.pos),
                 doppler,
@@ -702,7 +722,7 @@ mod tests {
         assert_eq!(SoundSet::volume(&hit, &now, 2, 0.0, 1.0), Some(0.0), "read at the frame's end: silent");
         let fired = |n: &str| at_fire("ev_doorhitclose_0", n).or_else(|| now(n));
         assert_eq!(SoundSet::volume(&hit, &fired, 2, 0.0, 1.0), Some(1.0));
-        let set = SoundSet { sounds: vec![RuntimeSound { def: hit, clip: None, voice: None, held: false, active_since: None, peak: 0.0 }], master: 1.0, dir: Default::default(), exterior: false, inside: true, ai: false, listener_vehicle: true, muffled: false, parts: Vec::new() };
+        let set = SoundSet { api_id: native::next_id(), sounds: vec![RuntimeSound::new(hit, None)], master: 1.0, dir: Default::default(), exterior: false, inside: true, ai: false, listener_vehicle: true, muffled: false, parts: Vec::new() };
         assert_eq!(set.curve_triggers(), vec!["ev_doorhitclose_0".to_string()]);
     }
 

@@ -185,8 +185,9 @@ pub(crate) fn spawn_player(
     host.wear_lifespan = crate::settings::Settings::load().wear_lifespan();
     host.hof = find_hof(args, world, &vt);
     host.font_lib = Some(world.fonts.clone());
-    if !world.ticket_pack.trim().is_empty() {
-        let p = omsi_cfg::resolve_path(&args.root, &world.ticket_pack);
+    let ticket_pack = world.ticket_pack();
+    if !ticket_pack.trim().is_empty() {
+        let p = omsi_cfg::resolve_path(&args.root, &ticket_pack);
         match omsi_content::tickets::TicketPack::load(&p) {
             Ok(t) => {
                 log::info!("ticket pack {}: {} tickets", p.display(), t.tickets.len());

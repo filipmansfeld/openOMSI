@@ -76,6 +76,7 @@ fn plugin_stations(dir: &std::path::Path) -> Vec<(String, String)> {
     out
 }
 
+#[derive(Default)]
 pub struct Radio {
     stations: Vec<(String, String)>,
     volume: f32,

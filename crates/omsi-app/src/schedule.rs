@@ -27,6 +27,74 @@ struct Departure {
     spawned: bool,
 }
 
+/// Current catalogue association owned by the scheduler, independent of vehicle
+/// display/script variables. Indices refer to the current timetable catalogue.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub(crate) struct VehicleServiceMetadata {
+    pub line_name: String,
+    pub line_index: Option<usize>,
+    pub display_line: String,
+    pub tour_number: String,
+    pub tour_index: Option<usize>,
+    pub trip_name: String,
+    pub trip_index: usize,
+    pub profile_index: Option<usize>,
+    pub departure_seconds: f64,
+}
+
+fn vehicle_service_metadata(
+    data: &TimetableData,
+    departures: &[Departure],
+    owners: &HashMap<u64, usize>,
+    vehicle: u64,
+    in_service: bool,
+) -> Option<VehicleServiceMetadata> {
+    if !in_service {
+        return None;
+    }
+    let departure = departures.get(*owners.get(&vehicle)?)?;
+    let trip = data.trips.get(departure.trip)?;
+    // Do not turn duplicate authored names into a fabricated catalogue identity.
+    let unique = |mut matches: Vec<usize>| (matches.len() == 1).then(|| matches.pop().unwrap());
+    let line_index = unique(
+        data.lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| line.name.eq_ignore_ascii_case(&departure.line).then_some(i))
+            .collect(),
+    );
+    let tour_index = line_index.and_then(|i| {
+        unique(
+            data.lines[i]
+                .tours
+                .iter()
+                .enumerate()
+                .filter_map(|(j, tour)| {
+                    tour.number
+                        .eq_ignore_ascii_case(&departure.tour)
+                        .then_some(j)
+                })
+                .collect(),
+        )
+    });
+    let display_line = if trip.line.trim().is_empty() {
+        departure.line.trim()
+    } else {
+        trip.line.trim()
+    };
+    Some(VehicleServiceMetadata {
+        line_name: departure.line.clone(),
+        line_index,
+        display_line: display_line.to_string(),
+        tour_number: departure.tour.clone(),
+        tour_index,
+        trip_name: trip.name.clone(),
+        trip_index: departure.trip,
+        profile_index: (departure.profile < trip.profiles.len()).then_some(departure.profile),
+        departure_seconds: departure.time,
+    })
+}
+
 /// One step of a trip's route: a lane in map terms (None when the tile index is not in the
 /// map's list) and the leg between two stations it belongs to (0 for a track).
 #[derive(Debug, Clone, Copy)]
@@ -473,7 +541,9 @@ impl Schedule {
     /// `clock` gives the date: tours carry a validity mask (bits 0-6 Monday…Sunday, 7 public
     /// holiday, 8 school holidays, 9 school days) that selects which run today.
     pub fn new(root: &Path, world: &World, clock: &omsi_sim::SimClock) -> Schedule {
-        let chrono_dirs = world.chrono_dirs.read().clone();
+        // Resolve against the supplied clock, also when a date transition is being
+        // prepared before the live world's Chrono folders have changed.
+        let chrono_dirs = omsi_map::active_chrono_dirs(&world.map_dir, clock.date_code());
         let deactivated = omsi_map::chrono_deactivated_lines(&chrono_dirs);
         let data = TimetableData::load_with_chrono(&world.map_dir, &chrono_dirs, &deactivated);
         for e in &data.errors {
@@ -583,8 +653,9 @@ impl Schedule {
                 .clone()
                 .ok_or_else(|| "could not be loaded".to_string())
         };
+        let date_ailists = world.ai_lists_on_date(clock.date_code());
         {
-            let lists = &world.ailists;
+            let lists = &date_ailists;
             for g in lists.groups.iter().filter(|g| g.is_depot) {
                 let mut vehicles = Vec::new();
                 for tg in &g.typgroups {
@@ -611,7 +682,7 @@ impl Schedule {
         // train groups: [aigroup_2] entries pointing at .zug files
         let mut trains: HashMap<String, Vec<Vec<(Arc<VehicleType>, bool)>>> = HashMap::new();
         {
-            let lists = &world.ailists;
+            let lists = &date_ailists;
             for g in lists.groups.iter().filter(|g| !g.is_depot) {
                 for v in &g.vehicles {
                     if !v.file.to_ascii_lowercase().ends_with(".zug") {
@@ -813,6 +884,46 @@ impl Schedule {
     /// When departure `i` leaves on the traffic's clock.
     fn dep_time(&self, i: usize) -> f64 {
         self.day_base + self.departures[i].time
+    }
+
+    /// Rebase an explicit clock jump without losing the current traffic-day epoch.
+    /// Existing journeys keep their state, as they do when the in-game clock moves.
+    pub(crate) fn synchronize_clock(&mut self, clock: &omsi_sim::SimClock, traffic_time: f64) {
+        self.day_base = traffic_time - clock.time;
+        self.last_tod = clock.time;
+        self.date_clock = clock.clone();
+        self.set_day(clock);
+        self.boards_made = f64::NEG_INFINITY;
+        self.fleet_check = f64::NEG_INFINITY;
+        self.last_retry = f64::NEG_INFINITY;
+    }
+
+    /// Actual timetable-owned vehicles, excluding random traffic.
+    pub(crate) fn scheduled_vehicle_ids(&self) -> Vec<u64> {
+        self.car_departure.keys().copied().collect()
+    }
+
+    /// Released traffic can retain its departure association while leaving the
+    /// route. Only an active service owns the timetable metadata exposed to plugins.
+    pub(crate) fn vehicle_service(
+        &self,
+        id: u64,
+        in_service: bool,
+    ) -> Option<VehicleServiceMetadata> {
+        vehicle_service_metadata(
+            &self.data,
+            &self.departures,
+            &self.car_departure,
+            id,
+            in_service,
+        )
+    }
+
+    /// Explicit removal leaves the current departure consumed. A later departure
+    /// may obtain its normal replacement, but this bus is not immediately respawned.
+    pub(crate) fn forget_vehicle(&mut self, id: u64) {
+        self.car_departure.remove(&id);
+        self.running.retain(|running| running.car != id);
     }
 
     /// Past midnight on the traffic's clock: the next day's timetable.
@@ -1680,7 +1791,7 @@ impl Schedule {
         if !self.pools.contains_key(group) {
             let mut out = Vec::new();
             for g in world
-                .ailists
+                .ai_lists()
                 .groups
                 .iter()
                 .filter(|g| !g.is_depot && g.name.to_ascii_lowercase() == group)
@@ -1760,8 +1871,7 @@ impl Schedule {
                 .map(|(id, _)| *id)
                 .collect();
             for id in gone {
-                self.car_departure.remove(&id);
-                self.running.retain(|r| r.car != id);
+                self.forget_vehicle(id);
                 if traffic.remove_car(world, renderer, scene, id) {
                     log::info!("timetable: bus {id} of the player's tour taken off the road");
                 }
@@ -3511,6 +3621,25 @@ impl Schedule {
         if rest.is_empty() { trip } else { rest }
     }
 
+    /// API commands name an exact tour; they must not silently use the first tour
+    /// as the legacy command-line convenience lookup does for a missing name.
+    pub(crate) fn require_tour(&self, line: &str, tour: &str) -> Result<(), String> {
+        let line = self
+            .data
+            .lines
+            .iter()
+            .find(|l| l.name.eq_ignore_ascii_case(line))
+            .ok_or_else(|| format!("line {line} is not in the current timetable"))?;
+        if !line
+            .tours
+            .iter()
+            .any(|t| t.number.eq_ignore_ascii_case(tour))
+        {
+            return Err(format!("tour {tour} is not in line {}", line.name));
+        }
+        Ok(())
+    }
+
     /// The player drives this tour (line and tour as `player_duty` names them): OMSI leaves
     /// it to the player, so no AI bus runs it as well - one of line 76 tour 1 appeared
     /// 5 m beside the player's own bus at the Bauernhof, where the passengers queued.
@@ -3654,12 +3783,12 @@ impl Schedule {
                     .filter(|d| *d > 0);
                 return Err(format!(
                     "line {name} does not run on {}: the timetable change '{}'{} takes it off. {running} other lines run that day: pick one of them, or an earlier date",
-                    date(world.date),
+                    date(self.day),
                     dir.file_name().unwrap_or_default().to_string_lossy(),
                     from.map(|d| format!(" of {}", date(d))).unwrap_or_default()
                 ));
             }
-            return Err(format!("line {line} is not in the timetable of this map on {}: {running} lines run that day", date(world.date)));
+            return Err(format!("line {line} is not in the timetable of this map on {}: {running} lines run that day", date(self.day)));
         };
         let t = match l.tours.iter().find(|t| t.number.eq_ignore_ascii_case(tour)) {
             Some(t) => t,
@@ -3755,6 +3884,7 @@ impl Schedule {
             (trips, trip_index, 0)
         };
         // the AI leaves the player what the player drives: the tour, or just the one trip
+        self.release_player_tour();
         self.player_departure = (trips.len() == 1 && trip.is_some() && !whole_tour).then(|| trips[0].departure);
         let reserved = self.reserve_tour(&line_name, &tour_name);
         let current = &trips[trip_index];
@@ -4214,6 +4344,17 @@ impl PlayerDuty {
         }
     }
 
+    /// Unlike streaming's fill-only lookup, a date transition may move an existing
+    /// stop or remove it altogether. Replace every cached position and direction.
+    pub(crate) fn refresh_places(&mut self, lookup: impl Fn(i64) -> Option<glam::DVec3>) {
+        for trip in &mut self.trips {
+            for stop in &mut trip.stops {
+                stop.position = lookup(stop.object_id);
+            }
+            trip.set_dirs();
+        }
+    }
+
     /// Time to drive from `pos` to `to` (s), roughly: roads are longer than the straight
     /// line, a bus in town makes some 25 km/h, and it takes a minute or two to get going.
     fn approach_time(pos: glam::DVec3, to: glam::DVec3) -> f64 {
@@ -4572,6 +4713,98 @@ impl PlayerDuty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vehicle_service_uses_current_scheduler_association_and_catalogue() {
+        let mut data = TimetableData {
+            lines: vec![omsi_timetable::Line {
+                name: "177 weekday".into(),
+                tours: vec![omsi_timetable::Tour {
+                    number: "4".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            trips: vec![
+                omsi_timetable::Trip {
+                    name: "outbound".into(),
+                    line: " 177 ".into(),
+                    profiles: vec![Default::default()],
+                    ..Default::default()
+                },
+                omsi_timetable::Trip {
+                    name: "depot".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut departures = vec![
+            Departure {
+                time: 3600.0,
+                trip: 0,
+                profile: 0,
+                line: "177 weekday".into(),
+                ai_group: "fleet".into(),
+                tour: "4".into(),
+                mask: 1023,
+                spawned: true,
+            },
+            Departure {
+                time: 7200.0,
+                trip: 1,
+                profile: 0,
+                line: "177 weekday".into(),
+                ai_group: "fleet".into(),
+                tour: "4".into(),
+                mask: 1023,
+                spawned: true,
+            },
+        ];
+        let mut owners = HashMap::from([(42, 0)]);
+        let first = vehicle_service_metadata(&data, &departures, &owners, 42, true).unwrap();
+        assert_eq!(first.line_name, "177 weekday");
+        assert_eq!(first.display_line, "177");
+        assert_eq!(
+            (first.line_index, first.tour_index, first.profile_index),
+            (Some(0), Some(0), Some(0))
+        );
+        assert_eq!(
+            (
+                first.trip_index,
+                first.trip_name.as_str(),
+                first.departure_seconds
+            ),
+            (0, "outbound", 3600.0)
+        );
+        // Release leaves an owner record while the vehicle drives away; it must
+        // not continue requesting priority using the finished trip's line.
+        assert!(vehicle_service_metadata(&data, &departures, &owners, 42, false).is_none());
+        // The same vehicle takes the tour's next trip; no stale cached label survives.
+        owners.insert(42, 1);
+        let next = vehicle_service_metadata(&data, &departures, &owners, 42, true).unwrap();
+        assert_eq!(
+            (
+                next.trip_index,
+                next.trip_name.as_str(),
+                next.departure_seconds
+            ),
+            (1, "depot", 7200.0)
+        );
+        assert_eq!(next.display_line, "177 weekday");
+        assert_eq!(next.profile_index, None);
+        data.lines.push(data.lines[0].clone());
+        let ambiguous = vehicle_service_metadata(&data, &departures, &owners, 42, true).unwrap();
+        assert_eq!((ambiguous.line_index, ambiguous.tour_index), (None, None));
+        assert!(vehicle_service_metadata(&data, &departures, &owners, 43, true).is_none());
+        owners.insert(42, 9);
+        assert!(vehicle_service_metadata(&data, &departures, &owners, 42, true).is_none());
+        owners.insert(42, 1);
+        departures[1].trip = 9;
+        assert!(vehicle_service_metadata(&data, &departures, &owners, 42, true).is_none());
+        owners.remove(&42);
+        assert!(vehicle_service_metadata(&data, &departures, &owners, 42, true).is_none());
+    }
 
     /// The row OMSI's AI bus is given: the first whose ident is the destination, whatever
     /// the codes' order; of equally loose matches the first as well.

@@ -645,17 +645,7 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
                 Some(ListKind::Tours(arg.to_string(), None))
             }
             "free" => {
-                app.duty = None;
-                // unscheduled: the GetTT* callbacks answer ""/0/-1 again, as in Omsi.exe
-                if let Some(p) = app.player.as_mut() {
-                    let h = &mut p.vehicle.host;
-                    h.tt_line.clear();
-                    h.tt_stops.clear();
-                    h.tt_stop_ids.clear();
-                    h.tt_busstop_index = -1;
-                    h.tt_terminus_index = -1;
-                    h.tt_delay = 0.0;
-                }
+                clear_duty(app);
                 app.service_msg = Some(("Free drive: no duty".into(), 4.0));
                 None
             }
@@ -2389,9 +2379,38 @@ pub(crate) fn start_duty_at(app: &mut App, line: &str, tour: &str, trip: usize, 
 }
 
 fn start_duty(app: &mut App, line: &str, tour: &str) {
-    if !duty_available(app, line, tour) { return; }
+    if let Err(error) = assign_duty(app, line, tour) {
+        app.service_msg = Some((format!("No duty: {error}"), 8.0));
+    }
+}
+
+pub(crate) fn clear_duty(app: &mut App) {
+    if let Some(schedule) = app.schedule.as_mut() {
+        schedule.release_player_tour();
+    }
+    app.duty = None;
+    app.args.line = None;
+    app.args.tour = None;
+    if let Some(player) = app.player.as_mut() {
+        player.vehicle.host.schedule_active = 0.0;
+        player.vehicle.host.tt_line.clear();
+        player.vehicle.host.tt_delay = 0.0;
+        player.vehicle.host.tt_stops.clear();
+        player.vehicle.host.tt_stop_ids.clear();
+        player.vehicle.host.tt_terminus_index = -1;
+        player.vehicle.host.tt_busstop_index = -1;
+    }
+}
+
+pub(crate) fn assign_duty(app: &mut App, line: &str, tour: &str) -> Result<(), String> {
+    if !duty_available(app, line, tour) {
+        return Err(app.service_msg.as_ref().map(|(text, _)| text.clone())
+            .unwrap_or_else(|| "duty is unavailable".to_string()));
+    }
     let confirmed = app.lan.as_ref().is_none_or(|lan| lan.tour_claim_confirmed(&format!("{line}/{tour}")));
-    let (Some(w), Some(sch)) = (app.world.clone(), app.schedule.as_mut()) else { return };
+    let w = app.world.clone().ok_or("map is not loaded")?;
+    let sch = app.schedule.as_mut().ok_or("timetable is not loaded")?;
+    sch.require_tour(line, tour)?;
     let now = app.clock.time;
     match sch.player_duty(&w, line, tour, now, None, false) {
         Ok(mut d) => {
@@ -2421,8 +2440,9 @@ fn start_duty(app: &mut App, line: &str, tour: &str) {
             app.args.tour = Some(tour.to_string());
             app.duty = Some(d);
             app.service_msg = Some((format!("Line {line}, tour {}", tour.trim()), 4.0));
+            Ok(())
         }
-        Err(e) => app.service_msg = Some((format!("No duty: {e}"), 8.0)),
+        Err(e) => Err(e),
     }
 }
 

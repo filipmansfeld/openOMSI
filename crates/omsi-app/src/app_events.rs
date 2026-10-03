@@ -499,6 +499,9 @@ impl ApplicationHandler for App {
                     self.renderer.as_ref(),
                     self.scene.as_mut(),
                 ) {
+                    if let Some(weather) = self.weather.as_ref() {
+                        t.set_weather(weather, self.wetness);
+                    }
                     let center = self
                         .player
                         .as_ref()
@@ -1393,11 +1396,21 @@ impl ApplicationHandler for App {
                 if !plugins.is_empty() && !self.paused {
                     let info = crate::plugins::game_info(self);
                     let keys = std::mem::take(&mut self.plugin_keys);
-                    let plugins = self.plugins.as_mut().unwrap();
-                    let mut io = crate::plugins::Io { vehicle: self.player.as_mut().map(|p| &mut p.vehicle), dt, message: None, info, commands: Vec::new(), keys };
+                    let mut plugins = self.plugins.take().unwrap();
+                    let mut io = crate::plugins::Io {
+                        app: self,
+                        dt,
+                        message: None,
+                        info,
+                        commands: Vec::new(),
+                        keys,
+                    };
                     plugins.frame(&mut io);
                     let commands = std::mem::take(&mut io.commands);
-                    if let Some(m) = io.message {
+                    let message = io.message.take();
+                    drop(io);
+                    self.plugins = Some(plugins);
+                    if let Some(m) = message {
                         self.service_msg = Some(m);
                     }
                     // what the plugins asked the game to do: lines of the game menu
@@ -1420,6 +1433,7 @@ impl ApplicationHandler for App {
                     self.plugin_keys.clear();
                 }
                 // OMSI_WATCH_VARS=a,b: every change of those variables of the player's bus
+                crate::native_bridge::poll(self);
                 if let (Some(p), Ok(list)) = (self.player.as_ref(), omsi_cfg::env::var("OMSI_WATCH_VARS")) {
                     thread_local!(static LAST: std::cell::RefCell<std::collections::HashMap<String, f32>> = Default::default());
                     LAST.with(|last| {

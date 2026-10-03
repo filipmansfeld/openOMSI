@@ -6,6 +6,8 @@ const SLOW_UPLOAD_MB_S: f64 = 300.0;
 
 pub(crate) struct App {
     pub(crate) args: Args,
+    pub(crate) native_bridge: Option<crate::native_bridge::Bridge>,
+    pub(crate) plugin_api: Option<crate::plugin_api::ApiState>,
     pub(crate) instance: wgpu::Instance,
     pub(crate) window: Option<Arc<Window>>,
     pub(crate) surface: Option<SurfaceState<'static>>,

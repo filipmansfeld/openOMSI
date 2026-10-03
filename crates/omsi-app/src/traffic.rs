@@ -31,6 +31,23 @@ use std::sync::Arc;
 pub const AI_SCHEMES: usize = 4;
 const SCRIPT_UPLOAD_BUDGET: usize = 4 << 20;
 
+/// The same construction path for simulated and mirrored AI. Init scripts must
+/// observe current weather, not the default host values from before the API write.
+fn initialize_ai_vehicle(
+    ty: Arc<VehicleType>,
+    mut host: omsi_sim::VehicleHost,
+    weather: Option<crate::weather_setup::VehicleWeather>,
+) -> VehicleInstance {
+    if let Some(weather) = weather {
+        weather.apply_host(&mut host);
+    }
+    let mut vehicle = VehicleInstance::new(ty, host);
+    if let Some(weather) = weather {
+        weather.apply_vehicle(&mut vehicle);
+    }
+    vehicle
+}
+
 /// Start a vehicle of type `ty` once and throw it away: its `{init}` and its displays read
 /// the files they need (depot data, fonts) into the caches before the first real one of the
 /// type comes along in the middle of a drive.
@@ -132,6 +149,8 @@ pub struct BusSetup {
 }
 
 pub struct AiCar {
+    /// Native API lifetime token; simulation IDs can recur after traffic is restarted.
+    pub api_id: u64,
     /// Stable id for references from other systems (passengers).
     pub id: u64,
     /// The random seed it was made with and its paint scheme: a car that goes out of range
@@ -277,6 +296,11 @@ impl AiCar {
     pub fn standing_for(&self, day_time: f64) -> f32 {
         self.bus.as_ref().map(|b| b.standing_for(day_time)).unwrap_or(0.0)
     }
+}
+
+fn next_traffic_api_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Where a vehicle's body stands, for the checks that go by geometry rather than by lanes:
@@ -489,7 +513,28 @@ fn street_lane_weight(l: &omsi_sim::traffic::Lane) -> Option<f64> {
         .then(|| l.length() as f64 * l.density.clamp(0.05, 4.0) as f64)
 }
 
+fn advance_light_with_api(
+    controller: &mut TrafficLightController,
+    day_time: f64,
+    dt: f32,
+    requests: Option<&[bool]>,
+    hold: bool,
+) {
+    if let Some(requests) = requests {
+        for (actual, request) in controller.request.iter_mut().zip(requests) {
+            *actual |= *request;
+        }
+    }
+    controller.start(day_time);
+    if hold {
+        controller.held = true;
+    } else {
+        controller.advance(dt);
+    }
+}
+
 pub struct Traffic {
+    pub api_generation: u64,
     pub net: Network,
     /// Sum of the spawn weights of every street lane, updated only as tiles add lanes.
     street_weight: f64,
@@ -542,6 +587,9 @@ pub struct Traffic {
     /// Sound sets of despawned cars, stopped at the next audio update.
     orphan_sounds: Vec<omsi_audio::SoundSet>,
     lights: Vec<TrafficLightController>,
+    /// Native plugin writes consumed after this frame's automatic demand collection.
+    api_light_requests: HashMap<usize, Vec<bool>>,
+    api_light_holds: hashbrown::HashSet<usize>,
     controller_of_object: HashMap<i64, usize>,
     /// Coupled vehicle types by file.
     trailer_types: HashMap<std::path::PathBuf, Option<Arc<VehicleType>>>,
@@ -558,6 +606,7 @@ pub struct Traffic {
     player_still: f32,
     /// Time of day (seconds since midnight); light cycles and timetables run on it.
     pub day_time: f64,
+    current_weather: Option<crate::weather_setup::VehicleWeather>,
     /// How fast the clock runs (the time speed): the timetable keeps to it.
     pub time_scale: f64,
     /// Day of the week (0 Monday … 6 Sunday) for the traffic density curves.
@@ -929,7 +978,73 @@ impl Traffic {
     /// Build the network from the lanes collected by `World::build_scene` and load the AI
     /// car types of the map's `ailists.cfg` (the `[aigroup_2]` groups that are not depots).
     pub fn new(root: &Path, world: &World, target: usize) -> Result<Traffic> {
-        let (lanes, parked_cars, lane_tiles) = take_from_tiles(world);
+        Self::new_on_date(root, world, target, world.date, true)
+    }
+
+    /// Preflight a complete replacement without taking queued lanes or changing the
+    /// current simulation. Commit after the old AI and graph have been retired.
+    pub(crate) fn prepare_date_reset(
+        root: &Path,
+        world: &World,
+        target: usize,
+        date: i32,
+    ) -> Result<Traffic> {
+        Self::new_on_date(root, world, target, date, false)
+    }
+
+    pub(crate) fn set_weather(&mut self, weather: &omsi_content::weather::Weather, wetness: f32) {
+        let weather = crate::weather_setup::VehicleWeather::from_weather(weather, wetness);
+        self.current_weather = Some(weather);
+        for car in &mut self.cars {
+            weather.apply_vehicle(&mut car.vehicle);
+        }
+    }
+
+    /// Stop both live and already retired vehicle voices before replacing this
+    /// simulation. Retired sound sets otherwise wait for a later audio tick.
+    pub(crate) fn stop_audio(&mut self, audio: &omsi_audio::AudioEngine) {
+        for mut sounds in self.orphan_sounds.drain(..) {
+            sounds.stop_all(audio);
+        }
+        for car in &mut self.cars {
+            if let Some(mut sounds) = car.sounds.take() {
+                sounds.stop_all(audio);
+            }
+        }
+    }
+
+    /// Preserve ownership of reusable driver GPU figures and release renders
+    /// already awaiting a sync. All active cars must be retired by the caller.
+    pub(crate) fn transfer_reset_resources(
+        &mut self,
+        world: &World,
+        renderer: &Renderer,
+        scene: &mut Scene,
+        replacement: &mut Traffic,
+    ) {
+        debug_assert!(self.cars.is_empty());
+        for render in self.released.drain(..) {
+            world.release_vehicle(renderer, scene, render);
+        }
+        for (_, mut driver) in self.drivers.drain() {
+            driver.hide(renderer, scene);
+            self.driver_pool.push(driver);
+        }
+        replacement.driver_pool.append(&mut self.driver_pool);
+    }
+
+    fn new_on_date(
+        root: &Path,
+        world: &World,
+        target: usize,
+        date: i32,
+        take_world: bool,
+    ) -> Result<Traffic> {
+        let (lanes, parked_cars, lane_tiles) = if take_world {
+            take_from_tiles(world)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
         let mut net = Network {
             lanes,
             // (`[lht]`: priority to the left, passing on the right, keeping left)
@@ -979,7 +1094,7 @@ impl Traffic {
                     .map(|n| if all_groups && n.1 <= 0 { 1 } else { n.1 })
                     .collect();
             }
-            let lists = &world.ailists;
+            let lists = world.ai_lists_on_date(date);
             for g in lists.groups.iter().filter(|g| {
                 !g.is_depot
                     && g.hof.is_none()
@@ -1118,8 +1233,16 @@ impl Traffic {
                 }
             }
         }
-        let lights = world.traffic_lights.lock().clone();
-        let controller_of_object = world.controller_of_object.lock().clone();
+        let lights = if take_world {
+            world.traffic_lights.lock().clone()
+        } else {
+            Vec::new()
+        };
+        let controller_of_object = if take_world {
+            world.controller_of_object.lock().clone()
+        } else {
+            HashMap::new()
+        };
         let parked: HashMap<usize, Vec<(f32, f32)>> = HashMap::new();
         let turning = net.lanes.iter().filter(|l| l.turn != 0).count();
         let with_side = net
@@ -1177,6 +1300,7 @@ impl Traffic {
         let lanes = 0..net.lanes.len();
         let street_weight = net.lanes.iter().filter_map(street_lane_weight).sum();
         let mut t = Traffic {
+            api_generation: next_traffic_api_id(),
             net,
             street_weight,
             parked,
@@ -1200,6 +1324,8 @@ impl Traffic {
             camera: None,
             orphan_sounds: Vec::new(),
             lights,
+            api_light_requests: HashMap::new(),
+            api_light_holds: hashbrown::HashSet::new(),
             controller_of_object,
             trailer_types: HashMap::new(),
             sound_cfgs: HashMap::new(),
@@ -1208,6 +1334,7 @@ impl Traffic {
             stop_wishes: None,
             player_still: 0.0,
             day_time: 0.0,
+            current_weather: None,
             time_scale: 1.0,
             weekday: 0,
             night: false,
@@ -2469,7 +2596,7 @@ impl Traffic {
             None => Some((seed >> 8) as usize % ty.paint_schemes.len().min(AI_SCHEMES)),
         };
         host.paint_scheme = Some(scheme);
-        let mut vehicle = VehicleInstance::new(ty.clone(), host);
+        let mut vehicle = initialize_ai_vehicle(ty.clone(), host, self.current_weather);
         if let Some((num, reg)) = bus.as_ref().and_then(|b| b.number.clone()) {
             if let Some(i) = ty.program.str_var("number") {
                 vehicle.state.str_vars[i as usize] = num;
@@ -2650,6 +2777,7 @@ impl Traffic {
             log::info!("population t={:.1}: car {id} appears at ({:.0}, {:.0}), {:.0} m from the centre, {:.0} m from the camera, in frame {}, behind a building {}{}", self.time, pos.x, pos.y, (pos - center).length(), v.map(|v| (pos - v.pos).length()).unwrap_or(0.0), v.map(|v| v.frames(pos, 2.5)).unwrap_or(false), v.map(|v| self.occluded(world, &v, pos, 2.5)).unwrap_or(false), if self.initial { " (initial)" } else { "" });
         }
         self.cars.push(AiCar {
+            api_id: next_traffic_api_id(),
             id,
             state,
             vehicle,
@@ -5000,11 +5128,7 @@ impl Traffic {
                 }
             }
         }
-        let day_time = self.day_time;
-        for c in self.lights.iter_mut() {
-            c.start(day_time);
-            c.advance(dt);
-        }
+        self.advance_light_programs(dt);
         self.log_lights();
         self.player_still = match player {
             Some(p) if p.4.abs() < 0.3 => self.player_still + dt,
@@ -7011,12 +7135,10 @@ impl Traffic {
         self.time += dt;
         self.day_time += dt as f64 * self.time_scale;
         self.last_dt = dt;
-        let day_time = self.day_time;
         for c in self.lights.iter_mut() {
             c.request.iter_mut().for_each(|r| *r = false);
-            c.start(day_time);
-            c.advance(dt);
         }
+        self.advance_light_programs(dt);
         self.log_lights();
     }
 
@@ -7038,7 +7160,7 @@ impl Traffic {
         host.font_lib = Some(world.fonts.clone());
         let scheme = scheme.filter(|i| *i < ty.paint_schemes.len());
         host.paint_scheme = Some(scheme);
-        let mut vehicle = VehicleInstance::new(ty.clone(), host);
+        let mut vehicle = initialize_ai_vehicle(ty.clone(), host, self.current_weather);
         // (the host's poses say where it stands; nothing here pulls it onto the ground)
         vehicle.ground = None;
         vehicle.apply_paint_vars(scheme);
@@ -7061,6 +7183,7 @@ impl Traffic {
         state.length = front + rear;
         let body = AiBody::new(&ty.def, MotionKind::Road);
         self.cars.push(AiCar {
+            api_id: next_traffic_api_id(),
             id,
             state,
             vehicle,
@@ -7143,6 +7266,147 @@ impl Traffic {
     }
 
     /// Where the host's light program of crossing `object` stands (client).
+    pub(crate) fn api_light_controllers(&self) -> Vec<(i64, &TrafficLightController)> {
+        let mut result: Vec<_> = self
+            .controller_of_object
+            .iter()
+            .filter_map(|(object, index)| self.lights.get(*index).map(|c| (*object, c)))
+            .collect();
+        result.sort_by_key(|(object, _)| *object);
+        result
+    }
+
+    pub(crate) fn api_light_controller_mut(
+        &mut self,
+        object: i64,
+    ) -> Option<&mut TrafficLightController> {
+        self.controller_of_object
+            .get(&object)
+            .and_then(|index| self.lights.get_mut(*index))
+    }
+
+    pub(crate) fn api_light_controller_index(&self, object: i64) -> Option<usize> {
+        self.controller_of_object.get(&object).copied()
+    }
+
+    /// Demand and holds remain effective for one simulation step, even though traffic
+    /// reconstructs demand each frame. A plugin that wants a longer hold renews it.
+    pub(crate) fn api_queue_light_state(
+        &mut self,
+        object: i64,
+        requests: Option<Vec<bool>>,
+        held: Option<bool>,
+    ) {
+        if let Some(&index) = self.controller_of_object.get(&object) {
+            if let Some(requests) = requests {
+                self.api_light_requests.insert(index, requests);
+            }
+            if let Some(held) = held {
+                if held {
+                    self.api_light_holds.insert(index);
+                } else {
+                    self.api_light_holds.remove(&index);
+                }
+            }
+        }
+    }
+
+    fn advance_light_programs(&mut self, dt: f32) {
+        for (index, controller) in self.lights.iter_mut().enumerate() {
+            advance_light_with_api(
+                controller,
+                self.day_time,
+                dt,
+                self.api_light_requests.get(&index).map(Vec::as_slice),
+                self.api_light_holds.contains(&index),
+            );
+        }
+        self.api_light_requests.clear();
+        self.api_light_holds.clear();
+    }
+
+    pub(crate) fn api_refresh_path_rules(&mut self) {
+        self.street_weight = self.net.lanes.iter().filter_map(street_lane_weight).sum();
+        self.net.compute_reach();
+    }
+
+    pub(crate) fn api_is_mirror(&self) -> bool {
+        self.mirror
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn api_spawn_car(
+        &mut self,
+        world: &World,
+        renderer: &Renderer,
+        scene: &mut Scene,
+        ty: Arc<VehicleType>,
+        lane: usize,
+        distance: f32,
+        scheme: Option<Option<usize>>,
+        speed: f32,
+    ) -> Result<u64, String> {
+        if self.mirror {
+            return Err("local AI spawning is unavailable in mirrored network traffic".into());
+        }
+        if self.cars.len() >= 4096 {
+            return Err("active traffic vehicle limit reached".into());
+        }
+        let path = self.net.lanes.get(lane).ok_or("path is not loaded")?;
+        let rail = matches!(ty.def.kind, omsi_vehicle::vehicle::VehicleKind::Other(2))
+            || ty.def.rail_body_osc.is_some()
+            || !ty.def.contact_shoes.is_empty();
+        let air = matches!(ty.def.kind, omsi_vehicle::vehicle::VehicleKind::Other(3));
+        let kind = if rail {
+            LaneKind::Rail
+        } else if air {
+            LaneKind::Air
+        } else {
+            LaneKind::Street
+        };
+        if path.kind != kind {
+            return Err("vehicle type is incompatible with this path kind".into());
+        }
+        if !distance.is_finite() || distance < 0.0 || distance > path.length() {
+            return Err("distance must lie on the selected path".into());
+        }
+        if !speed.is_finite() || !(0.0..=600.0).contains(&speed) {
+            return Err("invalid initial speed".into());
+        }
+        if scheme
+            .flatten()
+            .is_some_and(|s| s >= ty.paint_schemes.len())
+        {
+            return Err("paint scheme is out of range".into());
+        }
+        let (position, heading) = path.at(distance);
+        if self.blocked(&ty, position, heading as f64) {
+            return Err("spawn position is occupied".into());
+        }
+        let seed = self.rand();
+        let center = self.viewer.map(|v| v.pos).unwrap_or(position);
+        let simulation_id = self.create_car(
+            world,
+            renderer,
+            scene,
+            center,
+            kind,
+            lane,
+            distance,
+            ty,
+            seed,
+            scheme,
+            None,
+            Some(speed),
+            None,
+        );
+        self.cars
+            .iter()
+            .find(|c| c.id == simulation_id)
+            .map(|c| c.api_id)
+            .ok_or_else(|| "native traffic creation did not produce a vehicle".into())
+    }
+
     pub fn set_light_state(&mut self, object: i64, time: f64, held: bool) {
         if let Some(ctl) = self
             .controller_of_object
@@ -7244,6 +7508,103 @@ mod junction_arrival_tests {
         assert_eq!(crossing_arrival(&st, 10.0, false, true, false), f32::MAX);
         assert!(crossing_arrival(&st, 10.0, true, false, false) < 5.0);
         assert_eq!(crossing_arrival(&st, 10.0, false, false, false), 5.0);
+    }
+}
+
+#[cfg(test)]
+mod api_light_tests {
+    use super::*;
+
+    #[test]
+    fn native_weather_is_present_before_ai_script_initialization() {
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "openomsi-ai-weather-{}-{nonce}",
+            std::process::id()
+        )));
+        std::fs::create_dir_all(&fixture.0).unwrap();
+        std::fs::write(fixture.0.join("car.ovh"),"[model]\nmodel.cfg\n[varnamelist]\n1\nvars.txt\n[script]\n1\nscript.osc\n[mass]\n1000\n").unwrap();
+        std::fs::write(fixture.0.join("model.cfg"), "").unwrap();
+        std::fs::write(
+            fixture.0.join("vars.txt"),
+            "init_precip_system\ninit_precip_local\ninit_street\nPrecipRate\nStreetCond\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.0.join("script.osc"),
+            concat!(
+                "{init}\n(L.S.PrecipRate) (S.L.init_precip_system)\n",
+                "(L.L.PrecipRate) (S.L.init_precip_local)\n",
+                "(L.L.StreetCond) (S.L.init_street)\n{end}\n"
+            ),
+        )
+        .unwrap();
+        let ty = Arc::new(VehicleType::load_ai(&fixture.0, &fixture.0.join("car.ovh")).unwrap());
+        let weather = omsi_content::weather::Weather {
+            precip: vec![1.0, 127.5],
+            temp: (7.0, 4.0),
+            ..Default::default()
+        };
+        let weather = crate::weather_setup::VehicleWeather::from_weather(&weather, 0.75);
+        let mut car = initialize_ai_vehicle(
+            ty,
+            omsi_sim::VehicleHost::new(omsi_sim::SimClock::default()),
+            Some(weather),
+        );
+        assert_eq!(car.var("init_precip_system"), Some(0.5));
+        assert_eq!(car.var("init_precip_local"), Some(0.5));
+        assert_eq!(car.var("init_street"), Some(0.75));
+        assert_eq!(car.host.temperature, 7.0);
+        let dry = crate::weather_setup::VehicleWeather::from_weather(
+            &omsi_content::weather::Weather::default(),
+            0.0,
+        );
+        dry.apply_vehicle(&mut car);
+        assert_eq!(car.host.precip_rate, 0.0);
+        assert_eq!(car.var("PrecipRate"), Some(0.0));
+        assert_eq!(car.host.street_cond, 0.0);
+    }
+
+    #[test]
+    fn native_demand_is_used_after_traffic_resets_requests() {
+        let mut controller = TrafficLightController::new(vec![vec![(0, 30.0)]], 30.0);
+        controller.stops.push(omsi_sim::traffic::LightStop {
+            light: 0,
+            time: 1.0,
+            if_request: true,
+            jump_to: None,
+        });
+        controller.seek(0.0);
+        controller.request.fill(false);
+        advance_light_with_api(&mut controller, 0.0, 2.0, Some(&[true]), false);
+        assert_eq!(controller.time, 2.0);
+        assert!(!controller.held);
+        controller.seek(0.0);
+        controller.request.fill(false);
+        advance_light_with_api(&mut controller, 0.0, 2.0, None, false);
+        assert_eq!(controller.time, 1.0);
+        assert!(controller.held);
+    }
+
+    #[test]
+    fn native_hold_pauses_one_step_then_normal_program_resumes() {
+        let mut controller = TrafficLightController::new(vec![vec![(0, 30.0)]], 30.0);
+        controller.seek(10.0);
+        advance_light_with_api(&mut controller, 0.0, 2.0, None, true);
+        assert_eq!(controller.time, 10.0);
+        assert!(controller.held);
+        advance_light_with_api(&mut controller, 0.0, 2.0, None, false);
+        assert_eq!(controller.time, 12.0);
+        assert!(!controller.held);
     }
 }
 
