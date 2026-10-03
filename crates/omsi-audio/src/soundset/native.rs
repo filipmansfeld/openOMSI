@@ -42,6 +42,12 @@ fn params(
 ) -> VoiceParams {
     let evaluated = ctx.eval(s, var, transform);
     let mut result = ctx.params(s, &evaluated, s.control == PlaybackControl::Loop, transform);
+    // An explicit voice starts even during a silent fade-in. DirectSound may
+    // retain the previous gain below its volume range, but native playback would
+    // not start that buffer until it is audible; do not emit that retained gain.
+    if !evaluated.audible {
+        result.gain = 0.0;
+    }
     result.pitch = result.pitch.clamp(0.001, 64.0);
     result
 }
