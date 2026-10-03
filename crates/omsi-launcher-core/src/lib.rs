@@ -1680,6 +1680,7 @@ fn mirror_refresh(x: &str) -> &'static str {
 pub fn settings_from_text(text: Option<&str>) -> Value {
     let mut v = json!({ "msaa": 4, "anisotropy": 8, "ssao": true, "shadows": true, "shadow_size": 2048, "navigator": true, "ui_opacity": 0.85, "navigator_corner": "bottom-left", "boarding": "auto", "detail_textures": true, "exact_fare": true, "enhanced": false, "graphics": "vanilla_plus", "fullscreen": false, "vsync": true, "volume": 0.6, "drive_keys": "simple", "render_scale": "auto", "view_distance": "auto", "language": "ENG", "texture_memory": 0, "texture_compression": true, "chat": true, "tooltips": true, "name_tags": true, "show_fps": false, "clouds": true, "pax_density": 1.0, "vol_ai": 1.0, "vol_scenery": 1.0, "mirror_size": 256, "doppler": true, "driver": true, "max_fps": 0, "min_obj_size": 0.013, "max_obj_dist": "auto" });
     v["vr"] = json!(false);
+    v["height_parallax"] = json!(true);
     v["vr_scale"] = json!(0.65);
     v["vr_head_smoothing_ms"] = json!(0);
     v["vr_mirror_rate"] = json!(16);
@@ -1717,6 +1718,7 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
         let (k, val) = (setting_key(k), val.trim());
         let b = |x: &str| matches!(x.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
         match k.as_str() {
+            "height_parallax" => v[&k] = json!(b(val)),
             "anisotropy" => v[&k] = json!(val.parse::<i64>().unwrap_or(8).clamp(1, 16)),
             "msaa" | "shadow_size" => v[&k] = json!(val.parse::<i64>().unwrap_or(0)),
             "ui_opacity" | "volume" | "vol_ai" | "vol_scenery" | "min_obj_size" => v[&k] = json!(val.parse::<f64>().unwrap_or(0.0)),
@@ -1877,9 +1879,10 @@ pub fn save_settings(v: &Value) -> Result<()> {
 
 /// The settings a graphics profile holds: what the Graphics tab shows, except the machine's
 /// own (fullscreen, graphics API).
-pub const GRAPHICS_PROFILE_KEYS: [&str; 21] = [
+pub const GRAPHICS_PROFILE_KEYS: [&str; 22] = [
     "graphics", "msaa", "render_scale", "anisotropy", "shadow_size", "ssao", "shadows", "shadow_casters", "detail_textures", "led_glow", "led_mips", "reflections", "clouds",
     "vsync", "max_fps", "view_distance", "max_obj_dist", "min_obj_size", "mirror_size", "texture_memory", "texture_compression",
+    "height_parallax",
 ];
 
 fn graphics_profiles_path() -> PathBuf {
@@ -1891,6 +1894,16 @@ pub fn graphics_profiles() -> std::collections::BTreeMap<String, Value> {
     std::fs::read_to_string(graphics_profiles_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
+fn graphics_profile_settings(settings: &Value) -> Value {
+    let mut profile = serde_json::Map::new();
+    for k in GRAPHICS_PROFILE_KEYS {
+        if let Some(x) = settings.get(k) {
+            profile.insert(k.to_string(), x.clone());
+        }
+    }
+    Value::Object(profile)
+}
+
 /// Keep the graphics of `settings` as profile `name` (an existing one of that name is
 /// replaced). Returns the name as kept.
 pub fn save_graphics_profile(name: &str, settings: &Value) -> Result<String> {
@@ -1898,14 +1911,8 @@ pub fn save_graphics_profile(name: &str, settings: &Value) -> Result<String> {
     if name.is_empty() {
         return Err(anyhow!("Give the profile a name."));
     }
-    let mut profile = serde_json::Map::new();
-    for k in GRAPHICS_PROFILE_KEYS {
-        if let Some(x) = settings.get(k) {
-            profile.insert(k.to_string(), x.clone());
-        }
-    }
     let mut all = graphics_profiles();
-    all.insert(name.clone(), Value::Object(profile));
+    all.insert(name.clone(), graphics_profile_settings(settings));
     std::fs::write(graphics_profiles_path(), serde_json::to_string_pretty(&all)?)?;
     Ok(name)
 }
@@ -2071,6 +2078,7 @@ pub fn settings_to_text(v: &Value, old: Option<&str>) -> String {
     // was in the file; other spellings of the keys just written go
     let mut text = text;
     text.push_str(&format!("mirror_refresh={}\n", mirror_refresh(v.get("mirror_refresh").and_then(|x| x.as_str()).unwrap_or("full"))));
+    text.push_str(&format!("height_parallax={}\n", b("height_parallax", true)));
     text.push_str(&format!("look_sens={}\nsteer_look_angle={}\nsteer_look_response={}\ntime_sync={}\nmetar_sync={}\nmetar_station={}\n", f("look_sens", 1.0).clamp(0.1, 2.0), f("steer_look_angle", 30.0).clamp(0.0, 60.0), f("steer_look_response", 0.25).clamp(0.05, 1.0), b("time_sync", false), b("metar_sync", false), v.get("metar_station").and_then(|x| x.as_str()).unwrap_or("").chars().filter(|c| c.is_ascii_alphabetic()).take(4).collect::<String>().to_ascii_uppercase()));
     let written: Vec<String> = text.lines().filter_map(|l| l.split_once('=')).map(|(k, _)| k.trim().to_ascii_lowercase()).collect();
     for line in old.unwrap_or("").lines() {
@@ -2676,6 +2684,36 @@ mod tests {
         assert_eq!(v["mirror_size"], 0);
         let text = settings_to_text(&v, None);
         assert!(text.lines().any(|l| l == "mirror_size=0"), "{text}");
+    }
+
+    #[test]
+    fn parallax_settings_and_saved_graphics_profiles_round_trip() {
+        assert_eq!(settings_from_text(None)["height_parallax"], json!(true));
+        let old = "height_parallax=0\nheight_parallax=0\nfuture_option=keep\n";
+        for enabled in [false, true] {
+            let mut settings = settings_from_text(Some(old));
+            settings["height_parallax"] = json!(enabled);
+            let text = settings_to_text(&settings, Some(old));
+            assert_eq!(text.lines().filter(|line| line.starts_with("height_parallax=")).count(), 1);
+            assert!(text.lines().any(|line| line == "future_option=keep"));
+            let saved = settings_from_text(Some(&text));
+            assert_eq!(saved["height_parallax"], json!(enabled));
+
+            let profile = graphics_profile_settings(&saved);
+            let json = serde_json::to_string(&profile).unwrap();
+            let loaded: Value = serde_json::from_str(&json).unwrap();
+            let mut target = settings_from_text(None);
+            target["height_parallax"] = json!(!enabled);
+            target["volume"] = json!(0.9);
+            apply_graphics_profile(&loaded, &mut target);
+            assert_eq!(target["height_parallax"], json!(enabled));
+            assert_eq!(target["volume"], json!(0.9));
+            assert_eq!(settings_from_text(Some(&settings_to_text(&target, None)))["height_parallax"], json!(enabled));
+        }
+        let mut settings = settings_from_text(Some("height_parallax=0\n"));
+        apply_graphics_profile(&json!({"msaa": 2}), &mut settings);
+        assert_eq!(settings["height_parallax"], json!(false));
+        assert_eq!(settings["msaa"], json!(2));
     }
 
     #[test]

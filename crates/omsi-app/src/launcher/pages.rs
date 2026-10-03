@@ -545,6 +545,9 @@ fn graphics_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) ->
         toggle_setting(ui, s, dirty, c.row(), "Sun shadows", "shadows");
         sel_setting(ui, s, dirty, "s-casters", c.row(), "Shadows cast by", "shadow_casters", &[("all", "Every solid mesh"), ("omsi", "[shadow] meshes, as OMSI")]);
         toggle_setting(ui, s, dirty, c.row(), "Detail texturing up close", "detail_textures");
+        if get(s, "graphics").as_str() == Some("enhanced") {
+            toggle_setting(ui, s, dirty, c.row(), "Parallax", "height_parallax");
+        }
         // (an LED panel's dots are its own light: how bright they burn, and how much of the
         // mip chain the panel's picture and its mask are held at - 0 point-samples them,
         // the sharpest dots and the worst shimmer; higher holds them at the level the
@@ -2277,6 +2280,7 @@ mod settings_tests {
         let mut graphics = vec![
             "s-gp-sel", "s-gp-load", "s-gp-del", "s-gp-name", "s-gp-save",
             "s-preset", "s-graphics", "s-msaa", "s-scale", "s-af", "s-shadow", "set-ssao", "set-shadows", "s-casters", "set-detail_textures", "s-led", "s-led-mip", "set-shadow_blobs", "set-reflections", "set-clouds",
+            "set-height_parallax",
             "set-fullscreen", "set-vsync", "s-fps", "s-view", "s-maxobj", "s-minobj", "s-mirror", "s-mirror-refresh", "s-texmem", "set-texture_compression",
         ];
         if !cfg!(target_os = "macos") {
@@ -2365,6 +2369,19 @@ mod settings_tests {
         let mut s = all_rows();
         assert_eq!(click(1, "s-go-keys", &mut s).controls, Some(0));
         assert_eq!(click(1, "s-go-pads", &mut s).controls, Some(1));
+    }
+
+    #[test]
+    fn parallax_checkbox_saves_the_preference_for_the_renderer() {
+        let mut settings = all_rows();
+        assert_eq!(settings["height_parallax"], json!(true));
+        for enabled in [false, true] {
+            click(0, "set-height_parallax", &mut settings);
+            let text = core::settings_to_text(&settings, None);
+            let loaded = crate::settings::Settings::from_text(&text);
+            assert_eq!(loaded.height_parallax, enabled);
+            assert_eq!(loaded.render_options().height_parallax, enabled);
+        }
     }
 
     #[test]

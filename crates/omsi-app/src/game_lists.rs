@@ -1153,6 +1153,7 @@ fn toggle_now(app: &App, id: &str) -> Option<bool> {
         "collision_pedestrians" => s.collision_pedestrians,
         "ssao" => s.ssao,
         "detail_textures" => s.detail_textures,
+        "height_parallax" => s.height_parallax,
         "reflections" => s.reflections,
         "clouds" => s.clouds,
         "fullscreen" => s.fullscreen,
@@ -1341,6 +1342,10 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
         "detail_textures" => {
             app.settings.detail_textures = on;
             Some(("detail_textures", bit))
+        }
+        "height_parallax" => {
+            app.settings.height_parallax = on;
+            Some(("height_parallax", bit))
         }
         "reflections" => {
             app.settings.reflections = on;
@@ -1845,6 +1850,7 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "ssao", "Ambient occlusion", later),
         pick("shadow_casters", "Shadows cast by", later),
         switch_row(app, "detail_textures", "Detail texturing up close", "The ground and large walls get fine grain when close"),
+        (s.graphics == "enhanced").then(|| switch_row(app, "height_parallax", "Parallax", "Surface depth from height maps. Takes effect when the game starts the next time")).flatten(),
         slider_row(app, "led_glow", "LED glow", "How strongly the dots of LED destination displays glow", &|v| format!("{}/15", v as i64)),
         slider_row(app, "led_mips", "LED mask mipmaps", "Keep the mip chain of the LED masks (smoother from a distance).", &|v| format!("{v:.2}")),
         switch_row(app, "reflections", "Reflection maps (paint, chrome, glass)", later),
