@@ -114,10 +114,8 @@ fn mapped_splines_and_objects_use_uncut_base_while_ground_keeps_paint() {
         tx: 0,
         ty: 0,
         terrain: Some(triangle(0.0)),
-        hole_walls: triangle(-0.5),
         paint_masks: Vec::new(),
         paint: vec![(1, TextureData::from_image(Image::solid([255; 4])), 1.0)],
-        wall_paint: vec![(1, TextureData::from_image(Image::solid([255; 4])))],
         water: None,
         // Both upload paths must agree: a spatially batched mapped spline and one
         // left in the per-spline path (OMSI_NO_GROUND_SPLINE_BATCHING).
