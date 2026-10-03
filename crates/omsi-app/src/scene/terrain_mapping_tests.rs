@@ -153,8 +153,8 @@ fn mapped_splines_and_objects_use_uncut_base_while_ground_keeps_paint() {
         .collect();
     assert_eq!(
         terrain.len(),
-        4,
-        "the ground and its exposed sides retain their base and painted layers"
+        2,
+        "the ground retains its base and painted layers without generated side walls"
     );
     let ground_base = &scene.materials[terrain[0].materials[0]];
     assert_eq!(ground_base.texture, Some(base_texture));
@@ -162,23 +162,9 @@ fn mapped_splines_and_objects_use_uncut_base_while_ground_keeps_paint() {
         ground_base.transmap.is_some(),
         "the actual ground retains its road cut"
     );
-    let wall_base = &scene.materials[terrain[1].materials[0]];
-    assert_eq!(wall_base.texture, Some(base_texture));
-    assert_eq!(
-        wall_base.transmap, None,
-        "the hole mask must not erase its sides"
-    );
-    assert_eq!(wall_base.nightmap, ground_base.nightmap);
-    let paint = &scene.materials[terrain[2].materials[0]];
+    let paint = &scene.materials[terrain[1].materials[0]];
     assert_ne!(paint.texture, Some(base_texture));
-    assert!(terrain[2].ground_layer);
-    let wall_paint = &scene.materials[terrain[3].materials[0]];
-    assert_eq!(wall_paint.texture, paint.texture);
-    assert!(terrain[3].ground_layer);
-    assert_ne!(
-        wall_paint.transmap, paint.transmap,
-        "wall brush masks stay uncut"
-    );
+    assert!(terrain[1].ground_layer);
 
     let mapped: Vec<_> = scene
         .instances
