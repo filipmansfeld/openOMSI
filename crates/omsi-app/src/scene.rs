@@ -12084,11 +12084,16 @@ impl World {
                 renderer.set_roof(scene, i, vt.def.bounding_box.map(|b| b[5] + b[2] * 0.5));
                 i
             };
-            instances.push(if key.is_some() {
+            let inst = if key.is_some() {
                 gpu.instance(renderer, scene, inst)
             } else {
                 inst
-            });
+            };
+            // Shared MP/AI instances may reuse different GPU slots; those ids are not
+            // the authored order of the vehicle's glass and depth-writing body layers.
+            let group = instances.first().copied().unwrap_or(inst);
+            renderer.set_model_order(scene, inst, group, mi);
+            instances.push(inst);
         }
         // Omsi.exe draws a model mesh after mesh and each material subset in its turn, with
         // the subset's own blend and depth-write states (0x7c32c4 -> 0x7fd6c4), so a slot

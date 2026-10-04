@@ -1017,6 +1017,8 @@ pub struct Instance {
     /// `[matl_alpha] 2` listed before its interior hides the interior as in the original,
     /// instead of showing it through the paint's alpha).
     pub ordered: bool,
+    /// Vehicle instance group and authored mesh order, independent of recycled GPU slots.
+    pub model_order: Option<(usize, usize)>,
 }
 
 pub struct Scene {
@@ -5707,6 +5709,7 @@ impl Renderer {
             mirror_only: false,
             omsi_caster: false,
             ordered: false,
+            model_order: None,
             casts_shadow: true,
             roof: None,
         });
@@ -5758,6 +5761,7 @@ impl Renderer {
             mirror_only: false,
             omsi_caster: false,
             ordered: false,
+            model_order: None,
             casts_shadow: false,
             roof: None,
         });
@@ -5845,6 +5849,13 @@ impl Renderer {
     pub fn set_omsi_caster(&self, scene: &mut Scene, instance: usize, on: bool) {
         if let Some(i) = scene.instances.get_mut(instance) {
             i.omsi_caster = on;
+        }
+    }
+
+    /// Keep a vehicle's mesh order even when its instance takes a previously freed slot.
+    pub fn set_model_order(&self, scene: &mut Scene, instance: usize, group: usize, order: usize) {
+        if let Some(i) = scene.instances.get_mut(instance) {
+            i.model_order = Some((group, order));
         }
     }
 
@@ -8720,7 +8731,7 @@ impl Renderer {
                 // (a total order even where a distance is NaN - an instance at a NaN position:
                 // partial_cmp's "equal" for it broke the sort's order, and since Rust 1.81 the
                 // sort panics on that, which ended the game)
-                keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)).then(a.2.cmp(&b.2)));
+                sort_blended_instances(scene, &mut keyed);
                 items.clear();
                 for (rank, _, i) in keyed {
                     let inst = &scene.instances[i];
@@ -10848,6 +10859,19 @@ fn surface_instance_code(
     }
 }
 
+/// Preserve the authored mesh order within an object after GPU instance recycling.
+/// Distance/rank still determine the order between objects; ordinary scenery keeps its
+/// existing instance order when no authored mesh order was supplied.
+fn sort_blended_instances(scene: &Scene, keyed: &mut [(u8, f32, usize)]) {
+    keyed.sort_unstable_by(|a, b| {
+        let order = |i: usize| scene.instances[i].model_order.unwrap_or((i, 0));
+        a.0.cmp(&b.0)
+            .then(b.1.total_cmp(&a.1))
+            .then(order(a.2).cmp(&order(b.2)))
+            .then(a.2.cmp(&b.2))
+    });
+}
+
 /// OMSI's spline blend sort is horizontal in the x/z ground plane; Rust's vertical axis is z.
 fn horizontal_sort_distance(origin: DVec3, render_origin: DVec3, camera_relative: Vec3) -> f32 {
     let p = (origin - render_origin).as_vec3() - camera_relative;
@@ -12187,6 +12211,103 @@ mod tests {
                 assert!(c[0] < 80, "the flare behind a bus's window seen from outside: {c:?}");
             }
         }
+    }
+
+    #[test]
+    fn recycled_vehicle_instances_keep_authored_blend_order() {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = wgpu::Backends::NOOP;
+        descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
+        let instance = wgpu::Instance::new(descriptor);
+        let renderer = pollster::block_on(Renderer::new_with(
+            &instance, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions { msaa: 1, shadow_size: 1024, ..Default::default() },
+        )).expect("noop renderer");
+        let mut scene = renderer.new_scene();
+        let mesh = |slots| MeshData {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Z],
+            normals: vec![-Vec3::Y; 3], uvs: vec![glam::Vec2::ZERO; 3],
+            indices: vec![0, 1, 2],
+            ranges: (0..slots).map(|slot| (0, 3, slot)).collect(),
+            ..Default::default()
+        };
+        let single = renderer.add_mesh(&mut scene, &mesh(1));
+        let double = renderer.add_mesh(&mut scene, &mesh(2));
+        let material = renderer.add_material(&mut scene, None, AlphaMode::Blend, [1.0; 4], true);
+        // Free slots from unrelated old models: their slot counts reverse the new model's
+        // mesh order, exactly as GpuCache's per-slot-count free lists can do for MP/AI buses.
+        let old_double = renderer.add_instance(&mut scene, double, DVec3::ZERO, Mat4::IDENTITY, vec![material; 2]);
+        let old_single = renderer.add_instance(&mut scene, single, DVec3::ZERO, Mat4::IDENTITY, vec![material]);
+        renderer.remove_instance(&mut scene, old_double);
+        renderer.remove_instance(&mut scene, old_single);
+        let first = renderer.add_instance(&mut scene, single, DVec3::ZERO, Mat4::IDENTITY, vec![material]);
+        renderer.set_model_order(&mut scene, first, old_single, 0);
+        let first = renderer.recycle_instance(&mut scene, first, old_single);
+        let second = renderer.add_instance(&mut scene, double, DVec3::ZERO, Mat4::IDENTITY, vec![material; 2]);
+        renderer.set_model_order(&mut scene, second, old_single, 1);
+        let second = renderer.recycle_instance(&mut scene, second, old_double);
+        assert!(first > second, "fixture must actually reverse GPU slot order");
+        let mut draws = vec![(0, 10.0, second), (0, 10.0, first)];
+        sort_blended_instances(&scene, &mut draws);
+        assert_eq!(draws.iter().map(|d| d.2).collect::<Vec<_>>(), vec![first, second]);
+        let other = renderer.add_instance(&mut scene, single, DVec3::ZERO, Mat4::IDENTITY, vec![material]);
+        let mut tied = vec![(0, 10.0, other), (0, 10.0, second), (0, 10.0, first)];
+        sort_blended_instances(&scene, &mut tied);
+        assert_eq!(tied.iter().map(|d| d.2).collect::<Vec<_>>(), vec![first, second, other]);
+        // Camera containment and distance still take precedence over model order.
+        let mut draws = vec![(1, 10.0, first), (0, 2.0, second), (0, 20.0, first)];
+        sort_blended_instances(&scene, &mut draws);
+        assert_eq!(draws, vec![(0, 20.0, first), (0, 2.0, second), (1, 10.0, first)]);
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter; run with --ignored on a GPU host"]
+    fn recycled_ordered_vehicle_keeps_interior_visible_through_its_pane() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = pollster::block_on(Renderer::new_with(
+            &instance, None, Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            RenderOptions { msaa: 1, ssao: false, shadow_size: 1024, fxaa: false, render_scale: 1.0, ..Default::default() },
+        )).expect("test renderer");
+        let camera = Camera { position: DVec3::ZERO, yaw: 0.0, pitch: 0.0, roll: 0.0, fov_deg: 90.0, near: 0.1, far: 100.0 };
+        let lighting = Lighting { shadows: false, fog_density: 0.0, ..Default::default() };
+        let mut pixels = Vec::new();
+        for recycled in [false, true] {
+            let mut scene = renderer.new_scene();
+            let quad = |y, slots| MeshData {
+                positions: vec![Vec3::new(-4.0, y, -4.0), Vec3::new(4.0, y, -4.0), Vec3::new(4.0, y, 4.0), Vec3::new(-4.0, y, 4.0)],
+                normals: vec![-Vec3::Y; 4], uvs: vec![glam::Vec2::ZERO; 4],
+                indices: vec![0, 1, 2, 0, 2, 3],
+                ranges: if slots == 1 { vec![(0, 6, 0)] } else { vec![(0, 6, 0), (6, 0, 1)] },
+                one_sided: false,
+            };
+            let cabin = renderer.add_mesh(&mut scene, &quad(4.0, 1));
+            let pane = renderer.add_mesh(&mut scene, &quad(2.0, 2));
+            let red = renderer.add_material(&mut scene, None, AlphaMode::Opaque, [1.0, 0.0, 0.0, 1.0], true);
+            let half = renderer.add_texture(&mut scene, &omsi_texture::Image { width: 1, height: 1, rgba: vec![255, 255, 255, 128], has_alpha: true }, false);
+            let glass = renderer.add_material(&mut scene, Some(half), AlphaMode::Blend, [0.0, 1.0, 0.0, 1.0], true);
+            scene.materials[glass].no_z_write = true;
+            scene.materials[glass].writes_depth = true;
+            let old = if recycled {
+                let two = renderer.add_instance(&mut scene, pane, DVec3::ZERO, Mat4::IDENTITY, vec![glass; 2]);
+                let one = renderer.add_instance(&mut scene, cabin, DVec3::ZERO, Mat4::IDENTITY, vec![red]);
+                renderer.remove_instance(&mut scene, two);
+                renderer.remove_instance(&mut scene, one);
+                Some((one, two))
+            } else { None };
+            let inside = renderer.add_instance(&mut scene, cabin, DVec3::ZERO, Mat4::IDENTITY, vec![red]);
+            let inside = old.map(|slots| renderer.recycle_instance(&mut scene, inside, slots.0)).unwrap_or(inside);
+            renderer.set_model_order(&mut scene, inside, inside, 0);
+            let window = renderer.add_instance(&mut scene, pane, DVec3::ZERO, Mat4::IDENTITY, vec![glass; 2]);
+            let window = old.map(|slots| renderer.recycle_instance(&mut scene, window, slots.1)).unwrap_or(window);
+            renderer.set_model_order(&mut scene, window, inside, 1);
+            renderer.set_ordered(&mut scene, inside, true);
+            renderer.set_ordered(&mut scene, window, true);
+            if recycled { assert!(inside > window); }
+            let rgba = renderer.render_to_image(&mut scene, 64, 64, &camera, &lighting).unwrap();
+            pixels.push(rgba[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 3].to_vec());
+        }
+        assert!(pixels[0][0] > 80 && pixels[0][1] > 80, "reference must contain both cabin and pane: {:?}", pixels[0]);
+        assert!(pixels[0].iter().zip(&pixels[1]).all(|(a, b)| a.abs_diff(*b) <= 1), "recycling must not replace the cabin with sky: {pixels:?}");
     }
 
     #[test]
