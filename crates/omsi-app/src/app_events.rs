@@ -68,6 +68,17 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
+        if let Some(panel) = self.module_panel.as_mut() {
+            let was_open = panel.open;
+            if panel.input(&event, scale) {
+                if was_open && !panel.open {
+                    self.paused = self.menu_prev_pause;
+                    if let Some(window) = self.window.as_ref() { window.set_ime_allowed(false); }
+                }
+                return;
+            }
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.finish_vr_nav_edit();
@@ -267,6 +278,7 @@ impl ApplicationHandler for App {
             // a finger (a phone; see touch.rs)
             WindowEvent::Touch(t) => self.on_touch(event_loop, t),
             WindowEvent::RedrawRequested => {
+                if let Some(panel) = self.module_panel.as_mut() { panel.tick(); }
                 if self.vr_nav_edit.is_some() && (!self.vr_active() || self.view != "driver") {
                     self.finish_vr_nav_edit();
                 }
@@ -666,6 +678,7 @@ impl ApplicationHandler for App {
                 #[cfg(not(windows))]
                 let vr_on = false;
                 let needs_mouse = self.mouse_drive
+                    || self.module_panel.as_ref().is_some_and(|p| p.open)
                     || self.game_menu.is_some()
                     || self.chooser.is_some()
                     || self.list_kind.is_some()
@@ -2055,6 +2068,7 @@ impl ApplicationHandler for App {
                         let (cx, cy) = self.cursor;
                         let map_open = self.navigator.as_ref().is_some_and(|n| n.map_open());
                         let covered = self.game_menu.is_some()
+                            || self.module_panel.as_ref().is_some_and(|p| p.open)
                             || self.vr_nav_edit.is_some()
                             || self.chooser.is_some()
                             || ui.chat.hovered
@@ -2117,6 +2131,15 @@ impl ApplicationHandler for App {
                             tags,
                         };
                         ui.draw(r, scene, &frame, dt);
+                    }
+                    if let (Some(panel), Some(surface)) = (self.module_panel.as_mut(), self.surface.as_ref()) {
+                        let was_open = panel.open;
+                        let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
+                        panel.draw(r, scene, surface.config.width, surface.config.height, scale, dt);
+                        if was_open && !panel.open {
+                            self.paused = self.menu_prev_pause;
+                            if let Some(window) = self.window.as_ref() { window.set_ime_allowed(false); }
+                        }
                     }
                     *self.profile.entry("hud").or_default() += __t.elapsed().as_secs_f64();
                 }
@@ -2623,6 +2646,7 @@ impl ApplicationHandler for App {
             }
         }
         if let DeviceEvent::MouseMotion { delta } = event {
+            if self.module_panel.as_ref().is_some_and(|p| p.open) { return; }
             if self.vr_nav_edit.is_some() {
                 if self.window_focused { self.vr_nav_drag(delta.0 as f32, delta.1 as f32); }
                 return;

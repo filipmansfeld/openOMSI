@@ -21,6 +21,7 @@ pub(crate) use state::crash_of;
 mod theme;
 mod timetable;
 mod ui;
+pub(crate) mod ui_module;
 mod update;
 
 use glam::Vec2;
@@ -47,12 +48,13 @@ pub enum Page {
     Controls,
     Sessions,
     Mods,
+    Downloads,
     Tutorials,
     Timetable,
     Setup,
 }
 
-const PAGES: [(Page, &str, &str); 10] = [
+const PAGES: [(Page, &str, &str); 11] = [
     (Page::Drive, "Drive", "directions_bus"),
     (Page::Multiplayer, "Multiplayer", "groups"),
     (Page::Profile, "Profile", "badge"),
@@ -60,6 +62,7 @@ const PAGES: [(Page, &str, &str); 10] = [
     (Page::Controls, "Controls", "keyboard"),
     (Page::Sessions, "Sessions", "sports_esports"),
     (Page::Mods, "Mods", "extension"),
+    (Page::Downloads, "Downloads", "download"),
     (Page::Tutorials, "Tutorials", "help"),
     (Page::Timetable, "Timetable", "schedule"),
     (Page::Setup, "Setup", "folder_open"),
@@ -100,6 +103,7 @@ pub struct Launcher {
     renderer: Option<Renderer>,
     gpu: Option<omsi_ui::Gpu>,
     ui: Ui,
+    pub(crate) ui_module: Option<ui_module::Module>,
     state: state::State,
     showroom: showroom::Showroom,
     page: Page,
@@ -175,6 +179,7 @@ impl Launcher {
         renderer: None,
         gpu: None,
         ui: Ui::new(),
+        ui_module: ui_module::Module::from_env(ui_module::Context::Launcher),
         state: state::State::new(),
         showroom: showroom::Showroom::new(),
         page: Page::Drive,
@@ -692,6 +697,7 @@ impl Launcher {
     }
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(module) = self.ui_module.as_mut() { module.tick(matches!(self.page, Page::Downloads | Page::Profile)); }
         if self.recover_device() {
             return;
         }
@@ -928,7 +934,7 @@ impl Launcher {
                 "focus" => self.set_focus(arg.trim() != "0"),
                 "page" => {
                     if let Some((pg, _, _)) = PAGES.iter().find(|(_, n, _)| n.eq_ignore_ascii_case(arg.trim())) {
-                        self.go(*pg);
+                        self.navigate(*pg);
                     }
                 }
                 _ => log::warn!("launcher input: what is '{cmd}'?"),
@@ -1019,6 +1025,9 @@ impl Launcher {
             Page::Controls => pages::controls(self, content),
             Page::Sessions => pages::sessions(self, content),
             Page::Mods => pages::mods(self, content),
+            Page::Downloads => {
+                if let Some(module) = self.ui_module.as_mut() { module.draw_page(&mut self.ui, content, "downloads"); }
+            }
             Page::Tutorials => pages::tutorials(self, content),
             Page::Timetable => timetable::draw(self, content),
             Page::Setup => pages::setup(self, content),
@@ -1110,6 +1119,15 @@ impl Launcher {
         }
     }
 
+    // User navigation to Drive means singleplayer. A successful Join uses go()
+    // directly so that its automatic transition keeps the server's world.
+    pub fn navigate(&mut self, p: Page) {
+        if p == Page::Drive {
+            self.state.leave_server();
+        }
+        self.go(p);
+    }
+
     pub fn go(&mut self, p: Page) {
         if self.page != p {
             self.page = p;
@@ -1142,11 +1160,12 @@ impl Launcher {
         let running = self.state.instances.iter().filter(|i| i.running).count();
         let jobs = self.state.jobs.iter().filter(|j| j.finished.is_none()).count();
         for (p, name, icon) in PAGES {
+            if p == Page::Downloads && self.ui_module.is_none() { continue; }
             let r = Rect::new(12.0, y, RAIL_W - 24.0, 38.0);
             let id = ui::id_of(&format!("nav-{name}"));
             let (h, _, clicked) = self.ui.interact(id, r);
             if clicked {
-                self.go(p);
+                self.navigate(p);
             }
             let sel = self.page == p;
             if sel {

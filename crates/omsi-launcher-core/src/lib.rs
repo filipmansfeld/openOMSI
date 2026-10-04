@@ -2391,6 +2391,12 @@ pub struct Launched {
 
 /// Start a game for the duty. Any number may run at once; each writes its own log.
 pub fn launch(d: &Duty) -> Result<Launched> {
+    launch_configured(d, |_| Ok(()))
+}
+
+/// Configure only the child process (for local module IPC, for example). Environment
+/// capabilities are never persisted in a Duty, instance record or logged command.
+pub fn launch_configured(d: &Duty, configure: impl FnOnce(&mut std::process::Command) -> Result<()>) -> Result<Launched> {
     if IN_PROCESS_GAMES {
         let args = duty_args(d)?;
         let command = args.join(" ");
@@ -2402,7 +2408,7 @@ pub fn launch(d: &Duty) -> Result<Launched> {
     let game = find_game(&c.game).context("the game binary was not found (set it under Setup)")?;
     let args = duty_args(d)?;
     let profile = d.profile.clone().filter(|p| !p.trim().is_empty()).unwrap_or(c.profile);
-    let s = instances::start(&game, &args, d, &profile)?;
+    let s = instances::start_configured(&game, &args, d, &profile, configure)?;
     Ok(Launched { pid: s.pid, log: s.log.to_string_lossy().to_string(), command: s.command, others: s.others })
 }
 

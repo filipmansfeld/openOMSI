@@ -279,6 +279,10 @@ fn configure_child_access(command: &mut std::process::Command, target: Option<&s
 
 /// Start the game with `args`; games already running keep running.
 pub fn start(game: &Path, args: &[String], d: &crate::Duty, profile: &str) -> Result<Started> {
+    start_configured(game, args, d, profile, |_| Ok(()))
+}
+
+pub fn start_configured(game: &Path, args: &[String], d: &crate::Duty, profile: &str, configure: impl FnOnce(&mut std::process::Command) -> Result<()>) -> Result<Started> {
     // A ticket is never part of the duty, arguments, registry or logged command. Each
     // child receives only the credential for the protected server it explicitly joins.
     let target = d.lan.as_deref().and_then(|lan| lan.strip_prefix("join:")).map(str::trim);
@@ -296,6 +300,7 @@ pub fn start(game: &Path, args: &[String], d: &crate::Duty, profile: &str) -> Re
     let mut command = std::process::Command::new(game);
     command.args(args).env("OMSI_INSTANCE", &id).stdout(file).stderr(err);
     configure_child_access(&mut command, target, ticket);
+    configure(&mut command)?;
     let child = command.spawn().with_context(|| format!("starting {}", game.display()))?;
     let pid = child.id();
     let process_started = process_start(pid);

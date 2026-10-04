@@ -2498,6 +2498,19 @@ impl App {
         }
         let Some(id) = self.game_menu_items().get(k).map(|m| m.0) else { return };
         match id {
+            "local_ui" => {
+                // Keep the pause state acquired by the menu until this panel closes.
+                self.game_menu = None;
+                self.menu_top = None;
+                self.keys.clear();
+                self.mouse_look = false;
+                self.mouse_drive = false;
+                self.buttons_held = (false, false);
+                self.cursor_hidden = None;
+                if let Some(p) = self.player.as_mut() { p.axes.release_all(); }
+                if let Some(panel) = self.module_panel.as_mut() { panel.toggle(); }
+                if let Some(window) = self.window.as_ref() { window.set_cursor_visible(true); window.set_ime_allowed(true); }
+            }
             "resume" => self.close_game_menu(),
             "options" => self.open_list(crate::game_lists::ListKind::Options(0)),
             "vehicle" => self.open_list(crate::game_lists::ListKind::Vehicle(0)),
@@ -3845,6 +3858,7 @@ impl crate::App {
     /// "Options", "Vehicle options" and "World options".
     pub(crate) fn game_menu_items(&self) -> Vec<(&'static str, &'static str)> {
         let mut v: Vec<(&'static str, &'static str)> = game_menu_for(&self.args).to_vec();
+        if self.module_panel.is_some() { v.insert(1, ("local_ui", "Driver and downloads...")); }
         let mut at = 1;
         if self.on_foot.is_some() && self.player.is_some() {
             v.insert(at, ("tobus", "Back to my bus"));

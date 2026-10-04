@@ -664,17 +664,17 @@ fn trip_duration(first: f64, last: f64) -> String {
 
 /// The name of the server the Drive page is joined to (see the Multiplayer page).
 fn joined_server_name(l: &Launcher) -> Option<String> {
-    let a = l.state.joined_server.as_ref()?;
-    let entry = l.state.servers.iter().find(|s| &s.address == a);
+    let a = l.state.active_joined_server()?;
+    let entry = l.state.servers.iter().find(|s| s.address == a);
     let info = l.state.server_info.get(a).and_then(|x| x.1.as_ref().ok());
-    Some(entry.map(|e| e.name.clone()).filter(|n| !n.is_empty()).or_else(|| info.map(|i| i.name.clone())).unwrap_or_else(|| a.clone()))
+    Some(entry.map(|e| e.name.clone()).filter(|n| !n.is_empty()).or_else(|| info.map(|i| i.name.clone())).unwrap_or_else(|| a.to_string()))
 }
 
 fn step_time(l: &mut Launcher, r: Rect) {
     let mut y = r.y;
     if let Some(name) = joined_server_name(l) {
         // the server's world: nothing to choose here
-        let info = l.state.joined_server.as_ref().and_then(|a| l.state.server_info.get(a)).and_then(|x| x.1.as_ref().ok()).cloned();
+        let info = l.state.active_joined_server().and_then(|a| l.state.server_info.get(a)).and_then(|x| x.1.as_ref().ok()).cloned();
         l.ui.heading(Rect::new(r.x, y, r.w, 28.0), &format!("Set by {name}"), Some("lock"));
         y += 36.0;
         let rows = [("Time", info.as_ref().map(|i| i.time.clone()).unwrap_or_default()), ("Weather", info.as_ref().map(|i| if i.weather.is_empty() { "the map's".to_string() } else { i.weather.clone() }).unwrap_or_default())];
@@ -1095,7 +1095,7 @@ fn summary(l: &mut Launcher, side: Rect) {
     let mut start_at = format!("{:02}:{:02}, {dd} {} {yy}", l.state.choice.time / 60, l.state.choice.time % 60, super::ui::MONTHS[(mm as usize).clamp(1, 12) - 1]);
     let mut weather = weather;
     // on a server: its clock and weather
-    if let Some(i) = l.state.joined_server.as_ref().and_then(|a| l.state.server_info.get(a)).and_then(|x| x.1.as_ref().ok()) {
+    if let Some(i) = l.state.active_joined_server().and_then(|a| l.state.server_info.get(a)).and_then(|x| x.1.as_ref().ok()) {
         start_at = format!("{} (the server's clock)", i.time);
         weather = if i.weather.is_empty() { "the map's (the server's)".into() } else { format!("{} (the server's)", i.weather) };
     }
@@ -1132,7 +1132,7 @@ fn summary(l: &mut Launcher, side: Rect) {
     let free = l.state.choice.free || l.state.choice.line.is_none();
     let label = if running > 0 && l.state.second_armed.map(|t| t.elapsed().as_secs() < 6).unwrap_or(false) {
         "Start another game"
-    } else if free && l.state.joined_server.is_none() {
+    } else if free && l.state.active_joined_server().is_none() {
         "Drive"
     } else {
         "Start the duty"
@@ -1142,7 +1142,7 @@ fn summary(l: &mut Launcher, side: Rect) {
     }
     // where the last game on this map was left (`laststn.osn`): a second way in
     // (with save slots of the map, #341: which one, beside the button)
-    if l.state.joined_server.is_none() && l.state.has_last_situation() {
+    if l.state.active_joined_server().is_none() && l.state.has_last_situation() {
         let saves: Vec<String> = l.state.saved_situations().iter().map(|s| s.name.clone()).collect();
         let cont = Rect::new(btn.x, btn.y - 44.0, pw, 38.0);
         if saves.len() > 1 {

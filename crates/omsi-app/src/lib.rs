@@ -431,6 +431,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
     let mut app = new_app(args, settings);
     app.radio = radio;
     app.native_bridge = native_bridge;
+    app.module_panel = launcher::ui_module::GamePanel::from_env();
     app.lan = lan;
     app.remotes = lan_game;
     // mouse steering as the player left it (the wheel eases to the cursor for a second)
@@ -453,6 +454,7 @@ fn new_app(args: Args, settings: settings::Settings) -> App {
     App {
         args,
         native_bridge: None,
+        module_panel: None,
         plugin_api: Some(plugin_api::ApiState::default()),
         instance: graphics_instance(),
         window: None,

@@ -7,6 +7,7 @@ const SLOW_UPLOAD_MB_S: f64 = 300.0;
 pub(crate) struct App {
     pub(crate) args: Args,
     pub(crate) native_bridge: Option<crate::native_bridge::Bridge>,
+    pub(crate) module_panel: Option<crate::launcher::ui_module::GamePanel>,
     pub(crate) plugin_api: Option<crate::plugin_api::ApiState>,
     pub(crate) instance: wgpu::Instance,
     pub(crate) window: Option<Arc<Window>>,
@@ -428,6 +429,7 @@ impl App {
         self.surface = Some(surface);
         self.renderer = Some(renderer);
         self.scene = Some(scene);
+        if let Some(panel) = self.module_panel.as_mut() { panel.drop_gpu(); }
         // fully specified runs skip the menu
         if self.args.bus.is_some() || self.args.cam.is_some() || self.args.no_menu {
             self.load_world_now(event_loop);
@@ -498,6 +500,7 @@ impl App {
             }
             self.renderer = Some(renderer);
             self.scene = Some(scene);
+            if let Some(panel) = self.module_panel.as_mut() { panel.drop_gpu(); }
             self.last = Instant::now();
             return;
         }
@@ -510,6 +513,7 @@ impl App {
         }
         self.renderer = Some(renderer);
         self.scene = Some(scene);
+        if let Some(panel) = self.module_panel.as_mut() { panel.drop_gpu(); }
         self.last = Instant::now();
     }
 
@@ -778,6 +782,7 @@ impl App {
             self.start_world(w, cam, &renderer, &mut scene);
             self.renderer = Some(renderer);
             self.scene = Some(scene);
+            if let Some(panel) = self.module_panel.as_mut() { panel.drop_gpu(); }
             return true;
         };
         let name = self
@@ -860,6 +865,7 @@ impl App {
             }
         }
         self.scene = Some(scene);
+        if let Some(panel) = self.module_panel.as_mut() { panel.drop_gpu(); }
         self.starting = Some(cam);
         if let Some(limit) = self.args.exit_after {
             if self.started.elapsed().as_secs_f32() > limit {

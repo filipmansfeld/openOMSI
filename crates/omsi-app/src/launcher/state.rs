@@ -163,7 +163,15 @@ impl Choice {
         if c.hof.to_ascii_lowercase().contains(".bus") || c.hof.to_ascii_lowercase().contains(".ovh") {
             c.hof.clear();
         }
+        c.reset_restored_connection();
         c
+    }
+
+    fn reset_restored_connection(&mut self) {
+        // A saved address is a preference, not a request to join on startup.
+        if self.lan_mode == "join" {
+            self.lan_mode = "off".into();
+        }
     }
     pub fn save(&self) {
         if let Ok(t) = serde_json::to_string_pretty(self) {
@@ -352,7 +360,11 @@ impl State {
     pub fn spawn_launch(&mut self, d: core::Duty) {
         self.launch_hold = Some(std::time::Instant::now());
         self.launched_pid = None;
-        self.spawn(move || Msg::Launched(core::launch(&d).map_err(|e| format!("{e:#}"))));
+        self.spawn(move || {
+            let result = core::launch_configured(&d, super::ui_module::configure_game_environment).map_err(|e| format!("{e:#}"));
+            if result.is_ok() { super::ui_module::game_started(); }
+            Msg::Launched(result)
+        });
     }
 
     fn spawn(&self, f: impl FnOnce() -> Msg + Send + 'static) {
@@ -619,6 +631,10 @@ impl State {
         self.joined_server = None;
         self.choice.lan_mode = "off".into();
         self.touched();
+    }
+
+    pub fn active_joined_server(&self) -> Option<&str> {
+        if self.choice.lan_mode == "join" { self.joined_server.as_deref() } else { None }
     }
 
     pub fn poll_now(&mut self) {
@@ -1398,6 +1414,21 @@ mod choice_tests {
         let back: super::Choice = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back.plate, "B-AB 1234");
     }
+
+    #[test]
+    fn restoring_a_join_starts_offline_and_keeps_the_saved_duty() {
+        let mut c: super::Choice = serde_json::from_str(r#"{"lan_mode":"join","lan_addr":"https://server.example","map":"maps/Other/global.cfg","bus":"Vehicles/example.bus","line":"42","tour":"3"}"#).unwrap();
+        c.reset_restored_connection();
+        assert_eq!(c.lan_mode, "off");
+        assert_eq!(c.lan_addr, "https://server.example");
+        assert_eq!(c.map, "maps/Other/global.cfg");
+        assert_eq!(c.bus, "Vehicles/example.bus");
+        assert_eq!(c.line.as_deref(), Some("42"));
+        assert_eq!(c.tour.as_deref(), Some("3"));
+        c.lan_mode = "host".into();
+        c.reset_restored_connection();
+        assert_eq!(c.lan_mode, "host");
+    }
 }
 
 #[cfg(test)]
@@ -1548,6 +1579,44 @@ mod map_switch_tests {
         s.server_info.insert(SERVER.into(), (Instant::now(), Ok(server_info(file))));
     }
 
+    #[test]
+    fn singleplayer_keeps_all_maps_and_ignores_late_server_replies() {
+        let mut s = state_on_brno();
+        s.choice.map = PRAHA.into();
+        s.choice.lan_mode = "join".into();
+        s.choice.lan_addr = SERVER.into();
+        s.joined_server = Some(SERVER.into());
+        let cancel = pending_protected_join(&mut s);
+        let files: Vec<_> = s.maps.iter().map(|m| m.file.clone()).collect();
+        s.leave_server();
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(s.pending_join.is_none());
+        assert!(s.active_joined_server().is_none());
+        assert!(s.joined_server.is_none());
+        assert_eq!(s.duty().lan.as_deref(), Some("off"));
+        assert_eq!(s.maps.iter().map(|m| m.file.clone()).collect::<Vec<_>>(), files);
+        s.select_map(BRNO);
+        s.handle(Msg::Server { address: SERVER.into(), info: Ok(server_info(PRAHA)) });
+        s.handle(Msg::JoinReady { generation: 7, address: core::TANGENTA_ACCESS_ORIGIN.into(), info: Ok(server_info(PRAHA)) });
+        assert_eq!(s.choice.map, BRNO);
+        assert_eq!(s.choice.lan_mode, "off");
+        assert!(!s.join_completed);
+        assert!(s.active_joined_server().is_none());
+    }
+
+    #[test]
+    fn stale_joined_state_does_not_lock_an_offline_or_host_map() {
+        let mut s = state_on_brno();
+        s.joined_server = Some(SERVER.into());
+        for mode in ["off", "host"] {
+            s.choice.lan_mode = mode.into();
+            assert!(s.active_joined_server().is_none());
+            assert!(s.host_vehicles().is_none());
+        }
+        s.choice.lan_mode = "join".into();
+        assert_eq!(s.active_joined_server(), Some(SERVER));
+    }
+
     fn assert_praha_loading(s: &State) {
         assert_eq!(s.choice.map, PRAHA);
         assert!(s.choice.line.is_none());
@@ -1568,6 +1637,7 @@ mod map_switch_tests {
         assert_praha_loading(&s);
         assert_eq!(s.joined_server.as_deref(), Some(SERVER));
         assert_eq!(s.choice.lan_mode, "join");
+        assert_eq!(s.active_joined_server(), Some(SERVER));
     }
 
     #[test]

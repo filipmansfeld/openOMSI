@@ -635,6 +635,15 @@ impl Ui {
 
     /// A text field. Returns true when the text changed.
     pub fn text_input(&mut self, name: &str, r: Rect, value: &mut String, placeholder: &str, icon: Option<&str>) -> bool {
+        self.text_input_inner(name, r, value, placeholder, icon, false)
+    }
+
+    /// Passwords use the same editor, but neither glyphs nor clipboard expose the value.
+    pub fn password_input(&mut self, name: &str, r: Rect, value: &mut String, placeholder: &str) -> bool {
+        self.text_input_inner(name, r, value, placeholder, None, true)
+    }
+
+    fn text_input_inner(&mut self, name: &str, r: Rect, value: &mut String, placeholder: &str, icon: Option<&str>, secret: bool) -> bool {
         let id = id_of(name);
         let (h, _, _) = self.interact(id, r);
         if h {
@@ -706,14 +715,15 @@ impl Ui {
                         self.selection.insert(id, (0, value.chars().count()));
                         caret = value.chars().count();
                     }
-                    Key::Copy => self.clipboard_out = Some(value.clone()),
+                    Key::Copy if !secret => self.clipboard_out = Some(value.clone()),
                     Key::Cut => {
-                        self.clipboard_out = Some(value.clone());
+                        if !secret { self.clipboard_out = Some(value.clone()); }
                         value.clear();
                         caret = 0;
                     }
                     Key::Paste => {
                         if let Some(t) = self.clipboard_in.clone() {
+                            if secret { self.clipboard_in = None; }
                             let t: String = t.chars().filter(|c| !c.is_control()).collect();
                             let b = byte(value, caret);
                             value.insert_str(b, &t);
@@ -758,6 +768,7 @@ impl Ui {
         let inner = Rect::new(x, r.y, r.right() - x - 10.0, r.h);
         self.push_clip(inner, 0.0);
         let px = 13.0;
+        let shown = if secret { "•".repeat(value.chars().count()) } else { value.clone() };
 
         if let Some(click_x) = click_x {
                 let local_x = (click_x - inner.x).clamp(0.0, inner.w);
@@ -766,7 +777,7 @@ impl Ui {
                 let mut best_dist = f32::MAX;
 
                 for i in 0..=value.chars().count() {
-                    let upto: String = value.chars().take(i).collect();
+                    let upto: String = shown.chars().take(i).collect();
                     let cx = self.width(&upto, px, Weight::Regular);
                     let dist = (cx - local_x).abs();
                     
@@ -787,7 +798,7 @@ impl Ui {
             let mut best_dist = f32::MAX;
 
             for i in 0..=value.chars().count() {
-                let upto: String = value.chars().take(i).collect();
+                let upto: String = shown.chars().take(i).collect();
                 let cx = self.width(&upto, px, Weight::Regular);
                 let dist = (cx - local_x).abs();
             
@@ -806,15 +817,15 @@ impl Ui {
             self.text_in(placeholder, inner, px, Weight::Regular, TEXT_FAINT, Align::Left);
         } else {
             let (caret, moved) = self.caret.get(&id).copied().unwrap_or((0, 0.0));
-            let upto: String = value.chars().take(caret).collect();
+            let upto: String = shown.chars().take(caret).collect();
             let cw = self.width(&upto, px, Weight::Regular);
             if let Some(&(a, b)) = self.selection.get(&id) {
                 let start = a.min(b);
                 let end = a.max(b);
 
                 if start != end {
-                    let before: String = value.chars().take(start).collect();
-                    let selected: String = value.chars().skip(start).take(end - start).collect();
+                    let before: String = shown.chars().take(start).collect();
+                    let selected: String = shown.chars().skip(start).take(end - start).collect();
 
                     let sx = self.width(&before, px, Weight::Regular);
                     let sw = self.width(&selected, px, Weight::Regular);
@@ -827,7 +838,7 @@ impl Ui {
             }
             // keep the caret in view
             let shift = (cw - inner.w + 4.0).max(0.0);
-            self.text_in(value, Rect::new(inner.x - shift, inner.y, inner.w + shift + 2000.0, inner.h), px, Weight::Regular, TEXT, Align::Left);
+            self.text_in(&shown, Rect::new(inner.x - shift, inner.y, inner.w + shift + 2000.0, inner.h), px, Weight::Regular, TEXT, Align::Left);
             if focused 
                 && self.selection.get(&id).is_none_or(|&(a, b)| a == b)
                 && ((self.time - moved) % 1.0) < 0.55
@@ -1285,6 +1296,28 @@ pub fn weekday(y: i32, m: u32, d: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn password_editor_never_copies_secrets_and_consumes_paste_buffer() {
+        let mut ui = super::Ui::new();
+        let rect = omsi_ui::Rect::new(20.0, 20.0, 240.0, 36.0);
+        let mut value = "private-test".to_string();
+        ui.focus = Some(super::id_of("password"));
+        for key in [super::Key::Copy, super::Key::Cut] {
+            ui.begin(glam::Vec2::new(400.0, 200.0), 1.0, 1.0 / 60.0);
+            ui.input.keys.push(key);
+            ui.password_input("password", rect, &mut value, "");
+            assert!(ui.clipboard_out.is_none());
+            ui.finish();
+        }
+        assert!(value.is_empty());
+        ui.begin(glam::Vec2::new(400.0, 200.0), 1.0, 1.0 / 60.0);
+        ui.clipboard_in = Some("žluťoučký".into());
+        ui.input.keys.push(super::Key::Paste);
+        ui.password_input("password", rect, &mut value, "");
+        assert_eq!(value, "žluťoučký");
+        assert!(ui.clipboard_in.is_none());
+        assert!(ui.clipboard_out.is_none());
+    }
     use super::*;
 
     #[test]

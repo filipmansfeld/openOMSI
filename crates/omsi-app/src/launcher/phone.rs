@@ -50,8 +50,9 @@ pub enum Sheet {
 }
 
 /// The pages More opens.
-const MORE: [(Page, &str, &str, &str); 7] = [
+const MORE: [(Page, &str, &str, &str); 8] = [
     (Page::Profile, "Profile", "badge", "Your driver, level and records"),
+    (Page::Downloads, "Downloads", "download", "Downloads from the local UI module"),
     (Page::Settings, "Settings", "tune", "Graphics, sound, gameplay"),
     (Page::Controls, "Controls", "sports_esports", "Touch, wheels and gamepads"),
     (Page::Sessions, "Sessions", "terminal", "Games running and their logs"),
@@ -109,7 +110,7 @@ fn tab_bar(l: &mut Launcher, r: Rect) {
             l.page_scroll = 0.0;
             match tab {
                 Tab::Mods => l.go(Page::Mods),
-                Tab::Play => l.go(Page::Drive),
+                Tab::Play => l.navigate(Page::Drive),
                 Tab::Online => l.go(Page::Multiplayer),
                 Tab::More => {}
             }
@@ -242,7 +243,7 @@ fn play(l: &mut Launcher, body: Rect) {
         }
     }
     // on a server: which (and the way back to driving alone)
-    if let Some(sn) = l.state.joined_server.clone() {
+    if let Some(sn) = l.state.active_joined_server().map(str::to_owned) {
         let title = l.state.server_info.get(&sn).and_then(|x| x.1.as_ref().ok()).map(|i| i.name.clone()).unwrap_or(sn);
         let b = Rect::new(pr.x + 10.0, pr.y + 10.0, (l.ui.width(&title, 12.5, Weight::Bold) + 70.0).min(pr.w - 20.0), 34.0);
         l.ui.p().rounded(b, 17.0, Color::rgba(0, 0, 0, 0.6));
@@ -274,7 +275,7 @@ fn play(l: &mut Launcher, body: Rect) {
     ];
     for (id, icon, label, value, warn, s) in cards {
         if card(l, id, Rect::new(col.x, y, col.w, card_h), icon, label, &value, warn) {
-            if s == Sheet::Time && l.state.joined_server.is_some() {
+            if s == Sheet::Time && l.state.active_joined_server().is_some() {
                 l.state.set_status("On a server its clock and weather are the server's", false);
             } else {
                 open(l, s);
@@ -284,7 +285,7 @@ fn play(l: &mut Launcher, body: Rect) {
     }
     // Start, and "continue where you left off" beside it when there is a game to continue
     let btn = Rect::new(col.x, col.bottom() - start_h, col.w, start_h);
-    let cont = l.state.joined_server.is_none() && l.state.has_last_situation();
+    let cont = l.state.active_joined_server().is_none() && l.state.has_last_situation();
     let (start, rest) = if cont { (Rect::new(btn.x + btn.w * 0.34 + 8.0, btn.y, btn.w * 0.66 - 8.0, btn.h), Some(Rect::new(btn.x, btn.y, btn.w * 0.34, btn.h))) } else { (btn, None) };
     if let Some(c) = rest {
         if l.ui.button("p-continue", c, "Continue", Some("history"), ButtonKind::Normal) {
@@ -292,7 +293,7 @@ fn play(l: &mut Launcher, body: Rect) {
         }
     }
     let free = l.state.choice.free || l.state.choice.line.is_none();
-    let label = if l.state.joined_server.is_some() { "Join and drive" } else if free { "Drive" } else { "Start the duty" };
+    let label = if l.state.active_joined_server().is_some() { "Join and drive" } else if free { "Drive" } else { "Start the duty" };
     if l.ui.button("p-start", start, label, Some("play_arrow"), ButtonKind::Primary) {
         super::drive::start_from_phone(l);
     }
@@ -576,7 +577,7 @@ fn start_sheet(l: &mut Launcher, r: Rect) -> bool {
 
     // A joined server owns the world traffic/weather. The spawn point is still the local
     // bus's choice, just as on the desktop Drive page.
-    if l.state.joined_server.is_some() {
+    if l.state.active_joined_server().is_some() {
         l.ui.paragraph("Traffic, passengers and the world's clock are set by the server.", Vec2::new(inner.x, y), inner.w, 13.0, Weight::Regular, TEXT_DIM);
         return false;
     }
@@ -1165,11 +1166,12 @@ fn join(l: &mut Launcher, address: &str) {
 fn more(l: &mut Launcher, body: Rect) {
     let inner = body.pad(12.0, 12.0);
     let cols = if inner.w > 700.0 { 4 } else { 2 };
-    let rows = MORE.len().div_ceil(cols);
+    let shown: Vec<_> = MORE.iter().filter(|(page, _, _, _)| *page != Page::Downloads || l.ui_module.is_some()).collect();
+    let rows = shown.len().div_ceil(cols);
     let gap = 10.0;
     let tw = (inner.w - gap * (cols as f32 - 1.0)) / cols as f32;
     let th = ((inner.h - gap * (rows as f32 - 1.0)) / rows as f32).clamp(64.0, 120.0);
-    for (k, (page, name, icon, sub)) in MORE.iter().enumerate() {
+    for (k, (page, name, icon, sub)) in shown.into_iter().enumerate() {
         let (c, rw) = (k % cols, k / cols);
         let r = Rect::new(inner.x + (tw + gap) * c as f32, inner.y + (th + gap) * rw as f32, tw, th);
         let (h, down, clicked) = l.ui.interact(id_of(&format!("pmore-{name}")), r);
@@ -1202,6 +1204,9 @@ fn embedded(l: &mut Launcher, page: Page, body: Rect, back: bool) {
         Page::Controls => super::pages::controls(l, content),
         Page::Sessions => super::pages::sessions(l, content),
         Page::Mods => super::pages::mods(l, content),
+        Page::Downloads => {
+            if let Some(module) = l.ui_module.as_mut() { module.draw_page(&mut l.ui, content, "downloads"); }
+        }
         Page::Tutorials => super::pages::tutorials(l, content),
         Page::Timetable => super::timetable::draw(l, content),
         Page::Setup => super::pages::setup(l, content),

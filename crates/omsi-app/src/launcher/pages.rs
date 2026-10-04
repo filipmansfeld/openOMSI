@@ -90,7 +90,15 @@ pub fn profile(l: &mut Launcher, area: Rect) {
     let body = l.page_title(area, "Profile", "The driver whose personnel file the game writes: hours, kilometres, punctuality, tickets.");
     let left_w = (body.w * 0.56).min(700.0);
     let left = Rect::new(body.x, body.y, left_w, body.h);
-    let right = Rect::new(body.x + left_w + GAP * 2.0, body.y, body.w - left_w - GAP * 2.0, body.h);
+    let mut right = Rect::new(body.x + left_w + GAP * 2.0, body.y, body.w - left_w - GAP * 2.0, body.h);
+    // Account and driver card remain part of the existing driver page; the offline
+    // profile chooser, name and driving records retain their original meaning.
+    if let Some(module) = l.ui_module.as_mut() {
+        let height = (right.h * 0.7).max(260.0).min((right.h - 120.0).max(1.0));
+        module.draw_page(&mut l.ui, Rect::new(right.x, right.y, right.w, height), "profile");
+        right.y += height + GAP;
+        right.h = (right.h - height - GAP).max(1.0);
+    }
     // driver chooser
     let top = Rect::new(left.x, left.y, left.w, 132.0);
     l.ui.panel(top);
