@@ -714,6 +714,11 @@ impl AudioEngine {
             .any(|v| v.id == id && !v.finished)
     }
 
+    #[cfg(test)]
+    pub(crate) fn render_offline(&self, output: &mut [f32]) {
+        self.shared.render(output);
+    }
+
     pub fn stop(&self, id: VoiceId) {
         if let Some(v) = self.shared.voices.lock().iter_mut().find(|v| v.id == id) {
             v.finished = true;

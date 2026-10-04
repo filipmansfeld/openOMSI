@@ -21,6 +21,16 @@ use protocol::{authenticated, read_frame, write_response, Request};
 const MAX_CLIENTS: usize = 4;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
+fn audio_args(receipt: &Value) -> Value {
+    let mut args = serde_json::Map::new();
+    for key in ["id", "generation", "session_id", "section", "audio_generation", "lease"] {
+        if let Some(value) = receipt.get(key) {
+            args.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(args)
+}
+
 struct Command {
     request: Request,
     binary: Vec<u8>,
@@ -30,11 +40,16 @@ struct Command {
     connected: Arc<AtomicBool>,
 }
 
-// A receipt belongs to the connection that submitted the upload. Reconnecting
-// (or another companion staying connected) must not keep an abandoned image alive.
-struct OwnedTexture {
+// A receipt belongs to its creating connection. Reconnecting, or another
+// companion staying connected, must not keep its abandoned resources alive.
+struct OwnedResource {
     connected: Arc<AtomicBool>,
     receipt: Value,
+}
+impl OwnedResource {
+    fn belongs_to(&self, connection: &Arc<AtomicBool>) -> bool {
+        Arc::ptr_eq(&self.connected, connection)
+    }
 }
 
 struct ClientLifetime {
@@ -52,7 +67,8 @@ pub(crate) struct Bridge {
     commands: mpsc::Receiver<Command>,
     snapshot: Arc<RwLock<Arc<Value>>>,
     stopped: Arc<AtomicBool>,
-    owned_textures: BTreeMap<String, OwnedTexture>,
+    owned_textures: BTreeMap<String, OwnedResource>,
+    owned_audio: BTreeMap<String, OwnedResource>,
     manifest: PathBuf,
     token: String,
     session: String,
@@ -76,6 +92,13 @@ impl Bridge {
     }
 
     fn start(game_root: &std::path::Path) -> io::Result<Self> {
+        if let Some(path) = std::env::var_os("OMSI_NATIVE_BRIDGE_MANIFEST") {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err(io::Error::other("native bridge manifest must be absolute"));
+            }
+            return Self::start_at_manifest(game_root, &path);
+        }
         let home = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .ok_or_else(|| io::Error::other("no user profile directory"))?;
@@ -110,6 +133,7 @@ impl Bridge {
             stopped: stopped.clone(),
             manifest,
             owned_textures: BTreeMap::new(),
+            owned_audio: BTreeMap::new(),
             token: token.clone(),
             session,
             port,
@@ -206,6 +230,7 @@ impl Bridge {
         let session = crate::plugin_api::session(app);
         if session != self.session {
             self.release_textures(app);
+            self.release_audio(app);
             self.session = session;
             // An older game instance must not replace a newer instance's discovery file.
             if self.owns_manifest() {
@@ -227,7 +252,7 @@ impl Bridge {
             {
                 // Scripts may change state before returning an error.
                 changed = true;
-                self.apply(app, &command.request, &command.binary)
+                self.apply(app, &command.request, &command.binary, &command.connected)
             } else {
                 Err(
                     "command was cancelled or expired before execution; no changes were applied"
@@ -244,7 +269,7 @@ impl Bridge {
                     if let Some(resource) = receipt["resource"].as_str() {
                         self.owned_textures.insert(
                             resource.to_string(),
-                            OwnedTexture {
+                            OwnedResource {
                                 connected: command.connected.clone(),
                                 receipt: receipt.clone(),
                             },
@@ -252,9 +277,23 @@ impl Bridge {
                     }
                 }
             }
+            if command.request.op == "audio.clip.play" {
+                if let Ok(receipt) = &result {
+                    if let Some(lease) = receipt["lease"].as_str() {
+                        self.owned_audio.insert(lease.to_string(), OwnedResource {
+                            connected: command.connected.clone(), receipt: audio_args(receipt),
+                        });
+                    }
+                }
+            } else if command.request.op == "audio.clip.release" && result.is_ok() {
+                if let Some(lease) = command.request.args.as_ref().and_then(|args| args["lease"].as_str()) {
+                    self.owned_audio.remove(lease);
+                }
+            }
             replies.push((command.reply, result));
         }
         changed |= self.release_disconnected_textures(app);
+        changed |= self.release_disconnected_audio(app);
         if changed || self.published.elapsed() >= Duration::from_millis(50) {
             let snapshot = crate::plugin_api::snapshot(app);
             *self.snapshot.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(snapshot);
@@ -267,7 +306,7 @@ impl Bridge {
         }
     }
 
-    fn apply(&self, app: &mut App, request: &Request, binary: &[u8]) -> Result<Value, String> {
+    fn apply(&self, app: &mut App, request: &Request, binary: &[u8], connected: &Arc<AtomicBool>) -> Result<Value, String> {
         if request.session_id != self.session {
             return Err("stale session; read a new snapshot".into());
         }
@@ -280,7 +319,34 @@ impl Bridge {
             .ok_or("API arguments must be an object")?;
         fields.remove("token");
         fields.insert("session_id".into(), json!(request.session_id));
+        if matches!(request.op.as_str(), "audio.clip.get" | "audio.clip.release") {
+            let lease = args["lease"].as_str().ok_or("announcement lease is required")?;
+            if !self.owned_audio.get(lease).is_some_and(|owned| owned.belongs_to(connected)) {
+                return Err("announcement lease belongs to another connection or has expired".into());
+            }
+        }
         crate::plugin_api::execute(app, &request.op, args, binary)
+    }
+
+    fn release_audio(&mut self, app: &mut App) {
+        for (_, owned) in std::mem::take(&mut self.owned_audio) {
+            let _ = crate::plugin_api::execute(app, "audio.clip.release", owned.receipt, &[]);
+        }
+    }
+
+    fn release_disconnected_audio(&mut self, app: &mut App) -> bool {
+        let mut changed = false;
+        self.owned_audio.retain(|_, owned| {
+            if crate::plugin_api::execute(app, "audio.clip.get", owned.receipt.clone(), &[]).is_err() {
+                return false;
+            }
+            if owned.connected.load(Ordering::Acquire) {
+                return true;
+            }
+            changed |= crate::plugin_api::execute(app, "audio.clip.release", owned.receipt.clone(), &[]).is_ok();
+            false
+        });
+        changed
     }
 
     fn release_textures(&mut self, app: &mut App) {
@@ -317,7 +383,7 @@ impl Bridge {
             .expect("upload receipt resource")
             .to_owned();
         self.owned_textures
-            .insert(resource, OwnedTexture { connected, receipt });
+            .insert(resource, OwnedResource { connected, receipt });
     }
 
     #[cfg(test)]
@@ -432,6 +498,30 @@ fn serve(
 mod connection_tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn announcement_cleanup_retains_only_the_exact_voice_identity() {
+        let receipt = json!({"id":"9007199254740993","generation":"18446744073709551614",
+            "session_id":"session","section":1,"audio_generation":"9876543210","lease":"opaque",
+            "index":5,"playing":true,"duration_seconds":3.0,"resource":"diagnostic"});
+        let arguments = audio_args(&receipt);
+        assert_eq!(arguments["id"], "9007199254740993");
+        assert_eq!(arguments["generation"], "18446744073709551614");
+        assert_eq!(arguments["lease"], "opaque");
+        assert_eq!(arguments.as_object().unwrap().len(), 6);
+        assert!(arguments.get("index").is_none());
+    }
+    #[test]
+    fn announcement_lease_is_not_transferred_to_a_reconnected_companion() {
+        let original = Arc::new(AtomicBool::new(true));
+        let resource = OwnedResource { connected: original.clone(), receipt: json!({}) };
+        assert!(resource.belongs_to(&original));
+        let other = Arc::new(AtomicBool::new(true));
+        assert!(!resource.belongs_to(&other));
+        original.store(false, Ordering::Release);
+        let reconnected = Arc::new(AtomicBool::new(true));
+        assert!(!resource.belongs_to(&reconnected));
+    }
 
     #[test]
     fn fragmented_frames_and_idle_gaps_keep_the_connection_usable() {

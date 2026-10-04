@@ -104,6 +104,9 @@ const NATIVE_OPERATIONS: &[&str] = &[
     "audio.play",
     "audio.stop",
     "audio.reset",
+    "audio.clip.play",
+    "audio.clip.get",
+    "audio.clip.release",
     "particles.emitters.list",
     "particles.emitters.get",
     "particles.emitters.set",
@@ -355,6 +358,7 @@ impl ApiState {
                     op,
                     "audio.list"
                         | "audio.get"
+                        | "audio.clip.get"
                         | "particles.emitters.list"
                         | "particles.emitters.get"
                         | "particles.list"
@@ -407,7 +411,13 @@ impl ApiState {
             _ => return Err(format!("unsupported game API operation: {operation}")),
         };
         if let Some(result) = crate::plugin_api_audio::execute(app, id, operation, args) {
-            return result;
+            let mut result = result?;
+            if operation.starts_with("audio.clip.") {
+                result["id"] = json!(id.to_string());
+                result["generation"] = json!(self.vehicles[&id].1.to_string());
+                result["session_id"] = json!(self.session);
+            }
+            return Ok(result);
         }
         if operation == "vehicle.input_events" {
             if args.get("generation").is_none()
@@ -808,7 +818,7 @@ fn snapshot_value(
         .as_ref()
         .map(|p| vehicle_snapshot(app, p, generation, hof));
     json!({"session_id":session,"sequence":sequence,
-        "capabilities":["variables","scenery_variables_source","script_texture","script_texture_release","invalidate_texture","hof","timetable_basic","set_clock","native_api","traffic_light_phase_precondition","vehicle_input_events"],
+        "capabilities":["variables","scenery_variables_source","script_texture","script_texture_release","invalidate_texture","hof","timetable_basic","set_clock","native_api","traffic_light_phase_precondition","vehicle_input_events","audio_clip"],
         "native_operations":NATIVE_OPERATIONS,
         "map_name":app.world.as_ref().map(|w|w.global.name.as_str()).unwrap_or(""),
         "game_root":app.args.root.to_string_lossy(),

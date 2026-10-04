@@ -30,6 +30,29 @@ z up; world x east, y north, z up. Distances are metres and times are seconds.
 | `audio.play` | `index`, optional `looping` | Start an actual one-shot or looping mixer voice under explicit control. |
 | `audio.stop` | `index` | Stop the voice and suppress automatic restarts until reset. |
 | `audio.reset` | `index` | Stop explicit playback, restore the authored definition and return to ordinary script-driven control. |
+| `audio.clip.play` | `file_name`, optional `volume`, `position_local`, `range_metres` | Create a leased one-shot voice without replacing an SCF entry. |
+| `audio.clip.get` | `lease`, `audio_generation` | Observe the owned voice's actual `playing` state and duration. |
+| `audio.clip.release` | `lease`, `audio_generation` | Stop and release that voice. |
+
+Announcement clips use a WAV path relative to the actual game content root, with
+no drive, network path or parent traversal. The canonical file must remain inside
+that root and be at most 64 MiB. Creation requires the current vehicle/session
+identity; it returns `audio_generation`, an opaque `lease`, `index`, `section`,
+`duration_seconds`, `playing`, `output_enabled` and the exact vehicle/session
+identity. Unlike changes to existing SCF entries, creation does not require prior
+sound enumeration. Volume defaults to 1 and accepts 0–1; the default voice is
+nonspatial, with ordinary sound-set master volume and cabin attenuation. A supplied
+local position enables the existing spatial mixer. No output device means creation
+fails before starting a voice.
+
+Up to eight unreleased announcement voices may exist per loaded section. Released
+slots are reused with a fresh lease; native SCF indices and triggers are preserved.
+These slots cannot be changed through ordinary indexed sound operations. Poll
+`audio.clip.get` until `playing` becomes false, then release the lease. On the local
+native bridge, only the creating connection can inspect or release a clip, and its
+disconnect releases its clips. A stale session, vehicle, sound set or lease cannot
+control a replacement voice. These operations provide native playback, without
+assuming a particular OIS, voice selection rule or GPS mode.
 
 `audio.set` supports `file_name`, `volume`, `pitch_multiplier`, `sample_rate`,
 `pitch_reference`, `pitch_variable`, `loop_sound`, `no_loop`, `only_one`,

@@ -28,6 +28,9 @@ struct RuntimeSound {
     original: Option<SoundEntry>,
     control: PlaybackControl,
     pitch_multiplier: f32,
+    /// Extra voices have their own lease and never replace an authored SCF entry.
+    external: bool,
+    lease: Option<String>,
 }
 
 impl RuntimeSound {
@@ -36,6 +39,7 @@ impl RuntimeSound {
             def, clip, voice: None, held: false, active_since: None, peak: 0.0,
             last_gain: 1.0, last_pitch: 1.0, original: None,
             control: PlaybackControl::Native, pitch_multiplier: 1.0,
+            external: false, lease: None,
         }
     }
 }

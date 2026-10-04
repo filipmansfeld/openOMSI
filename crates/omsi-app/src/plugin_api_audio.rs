@@ -64,6 +64,29 @@ fn vector(value: &Value, name: &str) -> Result<Option<[f32; 3]>, String> {
     ]))
 }
 
+fn clip_path(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
+    let name = name.replace('\\', "/");
+    if name.len() > 512 || name.contains(':') || name.starts_with('/')
+        || name.split('/').any(|part| part.is_empty() || part == ".." || part == ".")
+    {
+        return Err("announcement file must be content-root-relative".into());
+    }
+    let path = std::path::Path::new(&name);
+    if !path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("wav")) {
+        return Err("announcement file must be a WAV".into());
+    }
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let path = root.join(path).canonicalize().map_err(|e| e.to_string())?;
+    if !path.starts_with(&root) {
+        return Err("announcement file resolves outside the content root".into());
+    }
+    let metadata = path.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 {
+        return Err("announcement WAV must be a regular file of at most 64 MiB".into());
+    }
+    Ok(path)
+}
+
 fn patch(
     def: &SoundEntry,
     pitch: f32,
@@ -252,10 +275,12 @@ pub(crate) fn execute(
             "audio.set" => &["index", "values"],
             "audio.play" => &["index", "looping"],
             "audio.trigger" => &["name"],
+            "audio.clip.play" => &["file_name", "volume", "position_local", "range_metres"],
+            "audio.clip.get" | "audio.clip.release" => &["lease"],
             _ => return Err(format!("unsupported audio operation: {operation}")),
         };
         keys(args, allowed)?;
-        let writing = !matches!(operation, "audio.list" | "audio.get");
+        let writing = !matches!(operation, "audio.list" | "audio.get" | "audio.clip.get");
         if writing && !args.get("session_id").is_some_and(Value::is_string) {
             return Err("session_id is required for audio writes".into());
         }
@@ -295,8 +320,40 @@ pub(crate) fn execute(
             if g.as_str().and_then(|s| s.parse::<u64>().ok()) != Some(sounds.native_id()) {
                 return Err("stale audio generation; enumerate sounds again".into());
             }
-        } else if writing {
+        } else if (writing || operation == "audio.clip.get") && operation != "audio.clip.play" {
             return Err("audio_generation from audio.list is required for writes".into());
+        }
+        if operation == "audio.clip.play" {
+            if !engine.enabled {
+                return Err("audio output is unavailable; no announcement was started".into());
+            }
+            let file = args["file_name"].as_str().ok_or("file_name is required")?;
+            let path = clip_path(&app.args.root, file)?;
+            let volume = args.get("volume").map(|v| number(v, "volume", 0.0, 1.0)).transpose()?.unwrap_or(1.0);
+            let position = args.get("position_local").map(|v| vector(v, "position_local")).transpose()?.flatten();
+            let range = args.get("range_metres").map(|v| number(v, "range_metres", 0.0, 1e6)).transpose()?.unwrap_or(5.0);
+            let clip = engine.load_clip(&path).ok_or("announcement WAV could not be decoded")?;
+            let duration = clip.frames() as f64 / clip.sample_rate.max(1) as f64;
+            let lease = crate::plugin_api::random_id();
+            let index = sounds.play_owned_clip(engine, SoundEntry {
+                file: file.to_string(), volume, pos: position, range,
+                important: true, ..Default::default()
+            }, clip, lease.clone(), &|n| vehicle.var(n), &transform)?;
+            return Ok(json!({"index":index,"section":section,"audio_generation":sounds.native_id().to_string(),
+                "lease":lease,"resource":format!("audio:{}:{}",sounds.native_id(),lease),
+                "duration_seconds":duration,"playing":true,"output_enabled":engine.enabled}));
+        }
+        if matches!(operation, "audio.clip.get" | "audio.clip.release") {
+            let lease = text(&args["lease"], "lease")?;
+            let index = sounds.clip_index(lease).ok_or("announcement lease is no longer active")?;
+            if operation == "audio.clip.release" {
+                sounds.release_owned_clip(engine, lease)?;
+                return Ok(json!({"released":true,"section":section,"lease":lease,"audio_generation":sounds.native_id().to_string()}));
+            }
+            let entry = sounds.entry(index, engine).ok_or("announcement voice is unavailable")?;
+            let duration = entry.clip.map(|c| c.frames() as f64 / c.sample_rate.max(1) as f64).unwrap_or(0.0);
+            return Ok(json!({"index":index,"section":section,"audio_generation":sounds.native_id().to_string(),
+                "lease":lease,"duration_seconds":duration,"playing":entry.voice.is_some(),"output_enabled":engine.enabled}));
         }
         if operation == "audio.list" {
             let offset = index(args, "offset", Some(0))?;
@@ -326,6 +383,9 @@ pub(crate) fn execute(
             return Ok(json!({"queued":true,"name":name}));
         }
         let index = index(args, "index", None)?;
+        if sounds.is_external(index) {
+            return Err("announcement voices require their owned audio.clip lease".into());
+        }
         if operation == "audio.get" {
             let mut result = record(sounds, engine, index, true)?;
             result["audio_generation"] = json!(sounds.native_id().to_string());
@@ -379,6 +439,17 @@ pub(crate) fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn announcement_paths_stay_inside_the_game_content_root() {
+        let root = std::env::temp_dir().join(format!("openomsi-audio-{}", crate::plugin_api::random_id()));
+        std::fs::create_dir_all(root.join("Announcements/voice")).unwrap();
+        std::fs::write(root.join("Announcements/voice/stop.WAV"), b"fixture").unwrap();
+        assert!(clip_path(&root, "Announcements\\voice\\stop.WAV").is_ok());
+        for path in ["../secret.wav", "Announcements/../secret.wav", "/tmp/secret.wav", "C:\\secret.wav", "\\\\server\\secret.wav", "Announcements/voice/stop.png"] {
+            assert!(clip_path(&root, path).is_err(), "{path}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn definition_batch_rejects_unknown_and_invalid_without_changing_original() {
         let original = SoundEntry {

@@ -119,6 +119,58 @@ impl SoundSet {
     pub fn directory(&self) -> &Path {
         &self.dir
     }
+    pub fn is_external(&self, index: usize) -> bool {
+        self.sounds.get(index).is_some_and(|s| s.external)
+    }
+    pub fn clip_index(&self, lease: &str) -> Option<usize> {
+        self.sounds.iter().position(|s| s.external && s.lease.as_deref() == Some(lease))
+    }
+
+    /// Append a bounded, leased announcement voice. Released slots are reused;
+    /// the authored entries retain their indices, triggers and definitions.
+    pub fn play_owned_clip(
+        &mut self,
+        engine: &AudioEngine,
+        definition: SoundEntry,
+        clip: Arc<Clip>,
+        lease: String,
+        var: &dyn Fn(&str) -> Option<f32>,
+        transform: &Mat4,
+    ) -> Result<usize, String> {
+        if clip.sample_rate == 0 || clip.channels == 0 || clip.frames() == 0 {
+            return Err("announcement clip has no audio frames".into());
+        }
+        if lease.is_empty() || self.clip_index(&lease).is_some() {
+            return Err("announcement lease is invalid".into());
+        }
+        if self.sounds.iter().filter(|s| s.external && s.lease.is_some()).count() >= 8 {
+            return Err("announcement voice limit reached".into());
+        }
+        let mut sound = RuntimeSound::new(definition, Some(clip));
+        sound.external = true;
+        sound.lease = Some(lease);
+        sound.control = PlaybackControl::Stopped;
+        let index = if let Some(index) = self.sounds.iter().position(|s| s.external && s.lease.is_none()) {
+            self.sounds[index] = sound;
+            index
+        } else {
+            self.sounds.push(sound);
+            self.sounds.len() - 1
+        };
+        self.play_entry(engine, index, false, var, transform)?;
+        Ok(index)
+    }
+
+    pub fn release_owned_clip(&mut self, engine: &AudioEngine, lease: &str) -> Result<(), String> {
+        let index = self.clip_index(lease).ok_or("announcement lease is no longer active")?;
+        self.stop_entry(engine, index)?;
+        let sound = &mut self.sounds[index];
+        sound.clip = None;
+        sound.lease = None;
+        sound.def = SoundEntry::default();
+        sound.active_since = None;
+        Ok(())
+    }
     pub fn entry(&self, index: usize, engine: &AudioEngine) -> Option<SoundInfo<'_>> {
         let s = self.sounds.get(index)?;
         Some(SoundInfo {
@@ -244,6 +296,51 @@ impl SoundSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn announcement() -> Arc<Clip> {
+        Arc::new(Clip { sample_rate: 48000, channels: 1, samples: vec![1024; 480] })
+    }
+    #[test]
+    fn owned_announcements_preserve_authored_sounds_and_finish_in_the_mixer() {
+        let mut engine = AudioEngine::new_silent();
+        engine.enabled = true; // Production mixer, without opening a speaker device.
+        let authored = SoundEntry { file: "0".into(), volume: 0.6, triggers: vec!["brake".into()], ..Default::default() };
+        let mut sounds = SoundSet::new(&engine, &SoundCfg { sounds: vec![authored.clone()], ..Default::default() }, Path::new("."));
+        sounds.master = 0.5;
+        let index = sounds.play_owned_clip(&engine, SoundEntry { volume: 0.4, important: true, ..Default::default() }, announcement(), "first".into(), &|_| None, &Mat4::IDENTITY).unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(sounds.entry(0, &engine).unwrap().definition, &authored);
+        let params = sounds.entry(index, &engine).unwrap().voice.unwrap().0;
+        assert!((params.gain - 0.2).abs() < 0.001);
+        assert!(!params.looping && params.important && params.position.is_none());
+        let mut output = vec![0.0; 2048];
+        engine.render_offline(&mut output);
+        assert!(output.iter().any(|sample| *sample != 0.0));
+        assert!(sounds.entry(index, &engine).unwrap().voice.is_none());
+        sounds.release_owned_clip(&engine, "first").unwrap();
+        let next = sounds.play_owned_clip(&engine, SoundEntry::default(), announcement(), "second".into(), &|_| None, &Mat4::IDENTITY).unwrap();
+        assert_eq!(next, index);
+        assert!(sounds.release_owned_clip(&engine, "first").is_err());
+        assert!(sounds.entry(next, &engine).unwrap().voice.is_some());
+        sounds.release_owned_clip(&engine, "second").unwrap();
+        assert!(sounds.entry(next, &engine).unwrap().voice.is_none());
+        assert!(sounds.has_trigger("brake"));
+    }
+    #[test]
+    fn owned_announcement_slots_are_bounded_and_bad_clips_do_not_mutate_them() {
+        let engine = AudioEngine::new_silent();
+        let mut sounds = SoundSet::new(&engine, &SoundCfg::default(), Path::new("."));
+        let empty = Arc::new(Clip { sample_rate: 48000, channels: 1, samples: Vec::new() });
+        assert!(sounds.play_owned_clip(&engine, SoundEntry::default(), empty, "empty".into(), &|_| None, &Mat4::IDENTITY).is_err());
+        assert_eq!(sounds.len(), 0);
+        for i in 0..8 {
+            sounds.play_owned_clip(&engine, SoundEntry::default(), announcement(), format!("lease-{i}"), &|_| None, &Mat4::IDENTITY).unwrap();
+        }
+        assert!(sounds.play_owned_clip(&engine, SoundEntry::default(), announcement(), "overflow".into(), &|_| None, &Mat4::IDENTITY).is_err());
+        assert_eq!(sounds.len(), 8);
+        sounds.release_owned_clip(&engine, "lease-3").unwrap();
+        assert_eq!(sounds.play_owned_clip(&engine, SoundEntry::default(), announcement(), "replacement".into(), &|_| None, &Mat4::IDENTITY).unwrap(), 3);
+        assert_eq!(sounds.len(), 8);
+    }
     #[test]
     fn manual_voice_control_uses_mixer_and_survives_native_updates() {
         let mut engine = AudioEngine::new_silent();
