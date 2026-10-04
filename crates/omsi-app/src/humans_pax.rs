@@ -442,6 +442,20 @@ pub(super) fn build_routes(n: usize, links: &[(i32, i32, bool)]) -> Vec<Vec<Rout
     adj
 }
 
+/// Whether passenger `x` keeps timetable bus `bus` at its stop (Omsi.exe 0x7d9e8b): on the
+/// way out of it (`Some(None)`, at whatever stop), or walking up to its doors from stop `s`
+/// (`Some(Some(s))`: only while the bus serves that stop). Anybody else, not.
+pub(super) fn holds_bus(x: &Pax, bus: BusId) -> Option<Option<i64>> {
+    if x.bus != Some(bus) {
+        return None;
+    }
+    match x.task {
+        Task::InBusToExit if x.inside == Some(bus) => Some(None),
+        Task::WalkingToBus => Some(x.stop),
+        _ => None,
+    }
+}
+
 /// sub_7f3a24: the distance with the height difference weighed by `w` (5 everywhere).
 fn weighted_dist(a: Vec3, b: Vec3, w: f32) -> f32 {
     let d = a - b;
@@ -718,28 +732,32 @@ impl Humans {
                 self.ai_requests.push((*id, e.clone(), x.clone()));
             }
         }
-        // timetable buses wait while people still get on or off - for somebody on the way
-        // to the gather point only while the bus stands in the stop's box: outside it
-        // nobody walks up to the doors (`Task::ToBus`), and the bus held for them waited
-        // for good
+        // timetable buses wait while people still get on or off (0x7d9e8b - 0x7d9f5e):
+        // somebody of this bus walking in it to an exit, or walking up to its doors from
+        // the stop the bus serves - the traffic checks the stop (`hold_boarding`). People
+        // still on their way to the gather point do not hold it: they walk up to the doors
+        // as soon as the bus has a place for them, and with the bus full they stood there
+        // and kept it at the stop with its doors open for good (#767)
         for bn in buses {
             let BusId::Ai(id) = bn.id else { continue };
             if bn.speed.abs() > 0.5 {
                 continue;
             }
-            let busy = self.people.iter().any(|p| match &p.state {
-                State::Pax(x) => {
-                    let coming = match x.task {
-                        Task::WalkingToBus => true,
-                        Task::ToBus => x.stop.is_some_and(|s| self.in_stop_box(s, bn.id)),
-                        _ => false,
-                    };
-                    x.bus == Some(bn.id) && (coming || (x.task == Task::InBusToExit && x.inside == Some(bn.id)))
+            let mut any_exit = false;
+            let mut stops: Vec<i64> = Vec::new();
+            for p in &self.people {
+                let State::Pax(x) = &p.state else { continue };
+                match holds_bus(x, bn.id) {
+                    Some(None) => any_exit = true,
+                    Some(Some(s)) if !stops.contains(&s) => stops.push(s),
+                    _ => {}
                 }
-                _ => false,
-            });
-            if busy {
-                self.holds.push((id, 2.5));
+            }
+            if any_exit {
+                self.holds.push((id, None, 2.5));
+            }
+            for s in stops {
+                self.holds.push((id, Some(s), 2.5));
             }
         }
     }
@@ -1279,6 +1297,11 @@ impl Humans {
                 };
                 let sp = stop.zip(spot).and_then(|(s, k)| self.stops.get(&s).and_then(|s| s.spots.get(k)).cloned());
                 let stop_pos = stop.and_then(|s| self.stops.get(&s)).map(|s| s.pos);
+                // (no place free: at the stop's point - spread along the kerb by who they
+                // are, or everybody without a place stood in one another there)
+                let along = ((self.people[i].id % 7) as f64 - 3.0) * 0.7;
+                let fwd = stop.and_then(|s| self.stops.get(&s)).map(|s| { let h = s.heading.to_radians(); DVec3::new(h.sin(), h.cos(), 0.0) }).unwrap_or(DVec3::ZERO);
+                let stop_pos = stop_pos.map(|q| q + fwd * along);
                 let p = self.pax_mut(i).unwrap();
                 p.spot = spot;
                 p.target_bus = false;
@@ -1367,7 +1390,27 @@ impl Humans {
 
     /// sub_61c8d8: a free waiting place of the stop, at random.
     pub(super) fn take_spot(&mut self, stop: i64) -> Option<usize> {
-        let free: Vec<usize> = self.stops.get(&stop)?.taken.iter().enumerate().filter(|(_, t)| !**t).map(|(k, _)| k).collect();
+        // Stops a few metres apart (both sides of a bus station's platform, a stop and its
+        // copy for another line) find the same objects' places, and each kept its own list of
+        // who stands where (as Omsi.exe's 0x61c8d8 does), so two or three people stood in
+        // one another. A place somebody of another stop stands on is not free (nor one of the
+        // stop's own a few centimetres from a taken one: objects placed twice).
+        let s = self.stops.get(&stop)?;
+        let (pos, reach) = (s.pos, 40.0_f64.max(s.length as f64 + 15.0) * 2.0);
+        let elsewhere: Vec<DVec3> = self
+            .stops
+            .iter()
+            .filter(|(_, o)| (o.pos - pos).length() < reach)
+            .flat_map(|(_, o)| o.spots.iter().zip(&o.taken).filter(|(_, t)| **t).map(|(sp, _)| sp.pos))
+            .collect();
+        let s = self.stops.get(&stop)?;
+        let free: Vec<usize> = s
+            .taken
+            .iter()
+            .enumerate()
+            .filter(|(k, t)| !**t && !elsewhere.iter().any(|q| (*q - s.spots[*k].pos).truncate().length() < 0.4))
+            .map(|(k, _)| k)
+            .collect();
         if free.is_empty() {
             return None;
         }
@@ -1397,7 +1440,15 @@ impl Humans {
         match p.task {
             Task::WaitingForBus => {
                 let Some(stop) = p.stop else { return };
-                let Some(b) = self.bus_for(i, stop, buses, bus_ix) else { return };
+                let Some(b) = self.bus_for(i, stop, buses, bus_ix) else {
+                    if super::debug_pax() && (self.time * 2.0).fract() < (dt as f64 * 2.0) {
+                        let s = &self.stops[&stop];
+                        let listed: Vec<String> = s.buses.iter().map(|(id, inbox)| format!("{id:?} box {inbox} shows {:?}", bus_ix.get(id).and_then(|k| buses[*k].terminus.clone()))).collect();
+                        let termini = p.line.and_then(|k| s.lines.get(k)).map(|l| l.1.iter().cloned().collect::<Vec<_>>());
+                        log::info!("t={:.1} pax {} at stop {stop} for {:?} (line {:?} termini {:?}): no bus; listed {:?}", self.time, self.people[i].label(), p.dest, p.line, termini, listed);
+                    }
+                    return;
+                };
                 let Some(bn) = bus_ix.get(&b).map(|k| &buses[*k]) else { return };
                 self.pax_mut(i).unwrap().bus = Some(b);
                 // still rolling in, or standing in the stop's box: to the gather point
@@ -2036,6 +2087,29 @@ impl Humans {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A timetable bus waits for the people walking up to its doors from its stop and for
+    /// those on their way out of it - not for the people still at the gather point, who
+    /// held a full bus at the stop for good (#767).
+    #[test]
+    fn who_keeps_a_timetable_bus_at_its_stop() {
+        let bus = BusId::Ai(7);
+        let mut x = Pax::new(1.1);
+        x.bus = Some(bus);
+        x.stop = Some(42);
+        x.task = Task::ToBus;
+        assert_eq!(holds_bus(&x, bus), None);
+        x.task = Task::WaitingForBus;
+        assert_eq!(holds_bus(&x, bus), None);
+        x.task = Task::WalkingToBus;
+        assert_eq!(holds_bus(&x, bus), Some(Some(42)));
+        assert_eq!(holds_bus(&x, BusId::Ai(8)), None);
+        x.task = Task::InBusToExit;
+        x.inside = Some(bus);
+        assert_eq!(holds_bus(&x, bus), Some(None));
+        x.task = Task::SittingInBus;
+        assert_eq!(holds_bus(&x, bus), None);
+    }
 
     /// Smooth driving upsets nobody; a hard stop, a fast bend and a jerky foot do, as in
     /// Omsi.exe (#862).

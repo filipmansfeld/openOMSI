@@ -233,7 +233,7 @@ pub fn vehicle_lights(
                     // shone every way, on the bus's own body and saloon)
                     lights.push(PointLight {
                         position: at,
-                        radius: vals[9].clamp(10.0, 45.0),
+                        radius: spot_reach(vals[9], 45.0),
                         color,
                         intensity: VANILLA_HEADLIGHT_INTENSITY / sides.len() as f32 * (0.3 + 0.7 * night),
                         direction: d,
@@ -244,7 +244,7 @@ pub fn vehicle_lights(
                     // enhanced: falling off with the square of the distance from a one-metre core
                     lights.push(PointLight {
                         position: at,
-                        radius: vals[9].clamp(10.0, 60.0),
+                        radius: spot_reach(vals[9], 60.0),
                         color,
                         intensity: HEADLIGHT_INTENSITY / sides.len() as f32,
                         direction: d,
@@ -262,6 +262,31 @@ pub fn vehicle_lights(
     // [interiorlight]s light only the meshes listing them and the passengers (per-instance
     // term, see MeshProps::interior); they do not shine on the outside world.
     let _ = &ty.model.interior_lights;
+}
+
+/// How far a `[spotlight]` reaches in the picture, from its declared range (value 9):
+/// up to `low` metres as declared, as before, and a range past the stock low beam's 100 in
+/// proportion to it (`low` metres for 100), at most five times `low`. The stock buses' full beam declares 500 against the low beam's 100; both
+/// cut at the same 45 m (60 in Enhanced), the full beam lit no further than the low beam
+/// (#941). (The light's core grows with it - a fixed share of the reach - so the full beam
+/// is also brighter ahead, as one is.)
+fn spot_reach(range: f32, low: f32) -> f32 {
+    range.clamp(10.0, low).max(range * low / 100.0).min(low * 5.0)
+}
+
+#[cfg(test)]
+mod spot_tests {
+    #[test]
+    fn a_full_beam_reaches_further_than_the_low_beam() {
+        // the stock buses: low beam 100, full beam 500 (#941)
+        assert_eq!(super::spot_reach(100.0, 45.0), 45.0);
+        assert_eq!(super::spot_reach(500.0, 45.0), 225.0);
+        assert_eq!(super::spot_reach(500.0, 60.0), 300.0);
+        // short ranges as declared, as before
+        assert_eq!(super::spot_reach(30.0, 45.0), 30.0);
+        assert_eq!(super::spot_reach(2.0, 45.0), 10.0);
+        assert_eq!(super::spot_reach(5000.0, 45.0), 225.0);
+    }
 }
 
 /// Map lights and scenery coronas are only drawn this close to the camera.

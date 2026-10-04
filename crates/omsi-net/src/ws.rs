@@ -495,6 +495,24 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     head.lines().skip(1).find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| v.trim()))
 }
 
+/// Where a WebSocket comes from: its peer's address, or - from the loopback, as through a
+/// reverse proxy (Caddy, nginx) or a tunnel on the same machine - the client's address that
+/// proxy forwards (`X-Forwarded-For`'s first entry, `X-Real-IP`, `CF-Connecting-IP`).
+fn client_addr(head: &str, peer: Option<SocketAddr>) -> String {
+    let Some(peer) = peer else { return "?".into() };
+    if peer.ip().is_loopback() {
+        let forwarded = header(head, "cf-connecting-ip")
+            .or_else(|| header(head, "x-forwarded-for").and_then(|v| v.split(',').next()))
+            .or_else(|| header(head, "x-real-ip"))
+            .map(str::trim)
+            .and_then(|v| v.parse::<std::net::IpAddr>().ok());
+        if let Some(ip) = forwarded {
+            return ip.to_string();
+        }
+    }
+    peer.ip().to_string()
+}
+
 /// Compare two secrets in a time that does not tell how much of them matched.
 fn same_secret(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -608,6 +626,11 @@ fn serve(stream: TcpStream, target: SocketAddr, info: &Mutex<ServerInfo>, stop: 
     // released when this authenticated connection is revoked or goes away).
     udp.connect(target).map_err(|e| e.to_string())?;
     udp.set_nonblocking(true).map_err(|e| e.to_string())?;
+    // the session sees this player at the socket's 127.0.0.1 address ("joined from
+    // 127.0.0.1:<port>"): say who that is, for a server's operator
+    if let Ok(local) = udp.local_addr() {
+        log::info!("gateway: player WebSocket from {} on {local}", client_addr(&req, peer));
+    }
     ws.get_mut().set_read_timeout(Some(Duration::from_millis(5))).map_err(|e| e.to_string())?;
     connected.fetch_add(1, Ordering::Relaxed);
     let mut admitted_id = None;
@@ -785,6 +808,66 @@ pub struct WsClient {
     pub local: SocketAddr,
     stop: Arc<AtomicBool>,
     pub alive: Arc<AtomicBool>,
+    /// How often the bridge opened a new WebSocket after a break (the game says hello again
+    /// at once instead of waiting for the host to be missed).
+    reconnects: Arc<AtomicUsize>,
+    terminal_failure: Arc<Mutex<Option<WsAccessFailure>>>,
+}
+
+/// A refusal is different from a broken network. It needs an explicit new join,
+/// authorization or reconnect action; automatic retries must not override it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WsAccessFailure {
+    SignInRequired,
+    AccessDenied,
+    SessionRejected,
+}
+
+impl WsAccessFailure {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::SignInRequired => "Server sign-in has expired. Sign in again to reconnect; local driving continues.",
+            Self::AccessDenied => "The server denied access. Automatic reconnect is stopped; local driving continues.",
+            Self::SessionRejected => "The server ended your access to this session. Automatic reconnect is stopped; local driving continues.",
+        }
+    }
+}
+
+enum WsFailure {
+    Transient(String),
+    Denied(WsAccessFailure),
+    Stopped,
+}
+
+impl WsFailure {
+    fn connection(error: tungstenite::Error) -> Self {
+        match error {
+            tungstenite::Error::Http(response) => match response.status().as_u16() {
+                401 => Self::Denied(WsAccessFailure::SignInRequired),
+                403 => Self::Denied(WsAccessFailure::AccessDenied),
+                status => Self::Transient(format!("WebSocket handshake returned HTTP {status}")),
+            },
+            error => Self::Transient(error.to_string()),
+        }
+    }
+
+    fn text(&self) -> &str {
+        match self {
+            Self::Transient(message) => message,
+            Self::Denied(reason) => reason.message(),
+            Self::Stopped => "connection cancelled",
+        }
+    }
+}
+
+type AccessProvider = Arc<dyn Fn() -> Result<Option<String>, String> + Send + Sync>;
+
+fn retry_pause(stop: &AtomicBool, delay: Duration) -> bool {
+    let until = Instant::now() + delay;
+    while !stop.load(Ordering::Relaxed) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20).min(until.saturating_duration_since(Instant::now())));
+    }
+    !stop.load(Ordering::Relaxed)
 }
 
 impl Drop for WsClient {
@@ -794,33 +877,66 @@ impl Drop for WsClient {
 }
 
 impl WsClient {
-    /// Connect to `url` (`wss://…/ws`) and give the local address to join.
-    pub fn connect(url: &str) -> Result<WsClient, String> {
-        Self::connect_authorized(url, access_header(url)?)
-    }
-
-    fn connect_authorized(url: &str, authorization: Option<String>) -> Result<WsClient, String> {
-        let request = ws_request(url, authorization.as_deref())?;
+    /// One WebSocket to `url`, with the short read timeout the bridge loop needs (a dead
+    /// tunnel must not hold the game for ever).
+    fn open(url: &str, access: &AccessProvider, stop: &AtomicBool) -> Result<WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, WsFailure> {
+        let authorization = access().map_err(|_| WsFailure::Denied(WsAccessFailure::SignInRequired))?;
+        let request = ws_request(url, authorization.as_deref()).map_err(WsFailure::Transient)?;
         let redirects = if authorization.is_some() { 0 } else { 3 };
-        // (a dead tunnel must not hold the game's start for ever)
         let (tx, rx) = std::sync::mpsc::channel();
-        let u = url.to_string();
         std::thread::spawn(move || {
-            let _ = tx.send(tungstenite::client::connect_with_config(request, None, redirects).map(|x| x.0).map_err(|e| format!("{u}: {e}")));
+            let _ = tx.send(tungstenite::client::connect_with_config(request, None, redirects).map(|x| x.0).map_err(WsFailure::connection));
         });
-        let mut ws = rx.recv_timeout(Duration::from_secs(12)).map_err(|_| format!("{url}: no answer within 12 s"))??;
+        let started = Instant::now();
+        let mut ws = loop {
+            if stop.load(Ordering::Relaxed) { return Err(WsFailure::Stopped); }
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(result) => break result?,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if started.elapsed() < Duration::from_secs(12) => {},
+                _ => return Err(WsFailure::Transient("WebSocket connection did not answer within 12 s".into())),
+            }
+        };
         match ws.get_mut() {
             tungstenite::stream::MaybeTlsStream::Plain(s) => s.set_read_timeout(Some(Duration::from_millis(5))),
             tungstenite::stream::MaybeTlsStream::Rustls(s) => s.get_mut().set_read_timeout(Some(Duration::from_millis(5))),
             _ => Ok(()),
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| WsFailure::Transient(e.to_string()))?;
+        Ok(ws)
+    }
+
+    /// Connect to `url` (`wss://…/ws`) and give the local address to join. When the
+    /// connection breaks later, the bridge opens a new one by itself and keeps the local
+    /// address: the game's session finds its way back without a restart (the server knows
+    /// the player again by its nonce).
+    pub fn connect(url: &str) -> Result<WsClient, String> {
+        let requires_access = access_header(url)?.is_some();
+        let origin = url.to_owned();
+        Self::connect_with_access(url, Arc::new(move || {
+            let current = access_header(&origin)?;
+            if requires_access && current.is_none() {
+                return Err("the access credential has expired".into());
+            }
+            Ok(current)
+        }))
+    }
+
+    #[cfg(test)]
+    fn connect_authorized(url: &str, authorization: Option<String>) -> Result<WsClient, String> {
+        Self::connect_with_access(url, Arc::new(move || Ok(authorization.clone())))
+    }
+
+    fn connect_with_access(url: &str, access: AccessProvider) -> Result<WsClient, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut ws = Self::open(url, &access, &stop).map_err(|e| e.text().to_owned())?;
         let udp = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
         udp.set_nonblocking(true).map_err(|e| e.to_string())?;
         let local = udp.local_addr().map_err(|e| e.to_string())?;
-        let stop = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
-        let (st, al) = (stop.clone(), alive.clone());
+        let reconnects = Arc::new(AtomicUsize::new(0));
+        let terminal_failure = Arc::new(Mutex::new(None));
+        let failure = terminal_failure.clone();
+        let (st, al, rc) = (stop.clone(), alive.clone(), reconnects.clone());
         let url = url.to_string();
         std::thread::Builder::new()
             .name("ws client".into())
@@ -834,64 +950,126 @@ impl WsClient {
                 let mut buf = vec![0u8; 2048];
                 let mut last_in = Instant::now();
                 let mut last_ping = Instant::now();
-                let r: Result<(), String> = (|| {
-                    while !st.load(Ordering::Relaxed) {
-                        let mut idle = true;
-                        loop {
-                            match ws.read() {
-                                Ok(Message::Binary(d)) => {
-                                    last_in = Instant::now();
-                                    idle = false;
-                                    if let Some(to) = *g2.lock().unwrap_or_else(|e| e.into_inner()) {
-                                        let _ = udp2.send_to(&d, to);
-                                    }
-                                }
-                                Ok(Message::Close(_)) => return Ok(()),
-                                Ok(_) => last_in = Instant::now(),
-                                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => break,
-                                Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => return Ok(()),
-                                Err(e) => return Err(e.to_string()),
-                            }
-                        }
-                        loop {
-                            match udp.recv_from(&mut buf) {
-                                Ok((n, from)) => {
-                                    idle = false;
-                                    *game.lock().unwrap_or_else(|e| e.into_inner()) = Some(from);
-                                    if let Err(e) = ws.send(Message::Binary(buf[..n].to_vec().into())) {
-                                        if !matches!(&e, tungstenite::Error::Io(io) if io.kind() == ErrorKind::WouldBlock) {
-                                            return Err(e.to_string());
+                while !st.load(Ordering::Relaxed) {
+                    let r: Result<(), WsFailure> = (|| {
+                        while !st.load(Ordering::Relaxed) {
+                            let mut idle = true;
+                            loop {
+                                match ws.read() {
+                                    Ok(Message::Binary(d)) => {
+                                        last_in = Instant::now();
+                                        idle = false;
+                                        if let Some(to) = *g2.lock().unwrap_or_else(|e| e.into_inner()) {
+                                            let _ = udp2.send_to(&d, to);
+                                        }
+                                        if d.starts_with(b"REJECT|") || d.starts_with(b"KICK|") {
+                                            return Err(WsFailure::Denied(WsAccessFailure::SessionRejected));
                                         }
                                     }
+                                    Ok(Message::Close(frame)) => {
+                                        if frame.as_ref().is_some_and(|f| matches!(u16::from(f.code), 1008 | 4001 | 4003)) {
+                                            return Err(WsFailure::Denied(WsAccessFailure::AccessDenied));
+                                        }
+                                        return Err(WsFailure::Transient("the server closed the connection".into()));
+                                    }
+                                    Ok(_) => last_in = Instant::now(),
+                                    Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => break,
+                                    Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => return Err(WsFailure::Transient("the connection was closed".into())),
+                                    Err(e) => return Err(WsFailure::connection(e)),
                                 }
-                                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                                Err(e) if e.kind() == ErrorKind::ConnectionReset => break,
-                                Err(e) => return Err(e.to_string()),
+                            }
+                            loop {
+                                match udp.recv_from(&mut buf) {
+                                    Ok((n, from)) => {
+                                        idle = false;
+                                        *game.lock().unwrap_or_else(|e| e.into_inner()) = Some(from);
+                                        if let Err(e) = ws.send(Message::Binary(buf[..n].to_vec().into())) {
+                                            if !matches!(&e, tungstenite::Error::Io(io) if io.kind() == ErrorKind::WouldBlock) {
+                                                return Err(WsFailure::connection(e));
+                                            }
+                                        }
+                                    }
+                                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                                    Err(e) if e.kind() == ErrorKind::ConnectionReset => break,
+                                    Err(e) => return Err(WsFailure::Transient(e.to_string())),
+                                }
+                            }
+                            let _ = ws.flush();
+                            if last_ping.elapsed() > Duration::from_secs(20) {
+                                last_ping = Instant::now();
+                                let _ = ws.send(Message::Ping(Vec::new().into()));
+                            }
+                            if last_in.elapsed() > Duration::from_secs(90) {
+                                return Err(WsFailure::Transient("the server has been silent for 90 s".into()));
+                            }
+                            if idle {
+                                std::thread::sleep(Duration::from_millis(2));
                             }
                         }
-                        let _ = ws.flush();
-                        if last_ping.elapsed() > Duration::from_secs(20) {
-                            last_ping = Instant::now();
-                            let _ = ws.send(Message::Ping(Vec::new().into()));
+                        let _ = ws.close(None);
+                        Ok(())
+                    })();
+                    if st.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Err(e) = r {
+                        if let WsFailure::Denied(reason) = &e {
+                            *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(*reason);
+                            let _ = ws.close(None);
                         }
-                        if last_in.elapsed() > Duration::from_secs(90) {
-                            return Err("the server has been silent for 90 s".into());
+                        log::warn!("ws client {url}: {}", e.text());
+                    }
+                    // a new connection, with a pause that grows to a few seconds
+                    let mut wait = 500u64;
+                    loop {
+                        if st.load(Ordering::Relaxed) {
+                            break;
                         }
-                        if idle {
-                            std::thread::sleep(Duration::from_millis(2));
+                        while failure.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                            if !retry_pause(&st, Duration::from_millis(20)) { break; }
+                        }
+                        if !retry_pause(&st, Duration::from_millis(wait)) { break; }
+                        match Self::open(&url, &access, &st) {
+                            Ok(w) => {
+                                ws = w;
+                                // what the game said while the way was down is stale
+                                while udp.recv_from(&mut buf).is_ok() {}
+                                last_in = Instant::now();
+                                last_ping = Instant::now();
+                                log::info!("ws client {url}: connected again");
+                                rc.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                            Err(e) => {
+                                if let WsFailure::Denied(reason) = &e {
+                                    *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(*reason);
+                                }
+                                log::info!("ws client: still no connection ({})", e.text());
+                                wait = (wait * 2).min(5000);
+                            }
                         }
                     }
-                    let _ = ws.close(None);
-                    Ok(())
-                })();
-                if let Err(e) = r {
-                    log::warn!("ws client {url}: {e}");
                 }
                 al.store(false, Ordering::Relaxed);
             })
             .map_err(|e| e.to_string())?;
         log::info!("ws client: the session is reached through {local}");
-        Ok(WsClient { local, stop, alive })
+        Ok(WsClient { local, stop, alive, reconnects, terminal_failure })
+    }
+
+    /// How many times the connection was made again after a break.
+    pub fn reconnects(&self) -> usize {
+        self.reconnects.load(Ordering::Relaxed)
+    }
+
+    pub fn terminal_failure(&self) -> Option<WsAccessFailure> {
+        *self.terminal_failure.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Called only for an explicit reconnect action, after any required sign-in.
+    /// It does not bypass authorization: the next handshake reads the scoped ticket again.
+    pub fn resume(&self) {
+        *self.terminal_failure.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -1076,6 +1254,21 @@ mod tests {
     }
 
     #[test]
+    fn a_websocket_behind_a_proxy_is_told_by_the_forwarded_address() {
+        let local: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let far: SocketAddr = "203.0.113.7:50000".parse().unwrap();
+        let req = |h: &str| format!("GET / HTTP/1.1\r\nHost: x\r\n{h}Upgrade: websocket\r\n\r\n");
+        assert_eq!(client_addr(&req("X-Forwarded-For: 198.51.100.4, 10.0.0.1\r\n"), Some(local)), "198.51.100.4");
+        assert_eq!(client_addr(&req("X-Real-IP: 2001:db8::1\r\n"), Some(local)), "2001:db8::1");
+        assert_eq!(client_addr(&req("CF-Connecting-IP: 192.0.2.9\r\nX-Forwarded-For: 198.51.100.4\r\n"), Some(local)), "192.0.2.9");
+        // no proxy: the peer; a header from the internet is not believed
+        assert_eq!(client_addr(&req(""), Some(local)), "127.0.0.1");
+        assert_eq!(client_addr(&req("X-Forwarded-For: 198.51.100.4\r\n"), Some(far)), "203.0.113.7");
+        assert_eq!(client_addr(&req("X-Forwarded-For: not-an-address\r\n"), Some(local)), "127.0.0.1");
+        assert_eq!(client_addr(&req(""), None), "?");
+    }
+
+    #[test]
     fn local_admin_door_is_shut_to_tunnels() {
         let info = Mutex::new(ServerInfo { local_admin_password: "s3cret".into(), ..Default::default() });
         let req = b"POST /admin HTTP/1.1\r\nX-Admin-Password: s3cret\r\nCf-Connecting-Ip: 203.0.113.9\r\nContent-Length: 6\r\n\r\nsay hi";
@@ -1117,6 +1310,215 @@ mod tests {
         assert!(j.contains("\"on_foot\":false,\"aboard\":null,\"lat\":52.535412,\"lon\":13.199642}"), "{j}");
         assert!(j.contains("\"id\":4,") && j.contains("\"x\":null") && j.ends_with("\"lat\":null,\"lon\":null}]"), "{j}");
         assert_eq!(players_json(&[]), "[]");
+    }
+
+    #[test]
+    fn the_client_connects_again_when_the_way_breaks() {
+        // a stand-in server: the first connection echoes one datagram and drops, the second
+        // is a good one
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for round in 0..2 {
+                let Ok((s, _)) = l.accept() else { return };
+                let Ok(mut ws) = tungstenite::accept(s) else { return };
+                loop {
+                    match ws.read() {
+                        Ok(Message::Binary(d)) => {
+                            let _ = ws.send(Message::Binary(d));
+                            if round == 0 {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        let client = WsClient::connect(&format!("ws://{addr}/ws")).unwrap();
+        let game = UdpSocket::bind("127.0.0.1:0").unwrap();
+        game.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        let mut got = [0u8; 64];
+        let mut first = false;
+        for _ in 0..20 {
+            game.send_to(b"ONE", client.local).unwrap();
+            if let Ok((n, _)) = game.recv_from(&mut got) {
+                first = &got[..n] == b"ONE";
+                break;
+            }
+        }
+        assert!(first, "the first connection works");
+        let mut again = false;
+        for _ in 0..40 {
+            game.send_to(b"TWO", client.local).unwrap();
+            if let Ok((n, _)) = game.recv_from(&mut got) {
+                if &got[..n] == b"TWO" {
+                    again = true;
+                    break;
+                }
+            }
+        }
+        assert!(again, "the datagram came back through the second connection");
+        assert!(client.alive.load(Ordering::Relaxed));
+        assert_eq!(client.reconnects(), 1);
+    }
+
+    #[test]
+    fn reconnect_refreshes_scoped_authorization_and_discards_stale_commands() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (lost_tx, lost_rx) = std::sync::mpsc::channel();
+        let (dialed_tx, dialed_rx) = std::sync::mpsc::channel();
+        let (allow_tx, allow_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for round in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                if round == 1 {
+                    dialed_tx.send(()).unwrap();
+                    allow_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+                }
+                stream.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+                let expected = if round == 0 { "Bearer first-ticket" } else { "Bearer renewed-ticket" };
+                let mut ws = tungstenite::accept_hdr(stream, |request: &tungstenite::handshake::server::Request, response| {
+                    assert_eq!(request.headers().get("Authorization").and_then(|h| h.to_str().ok()), Some(expected));
+                    Ok(response)
+                }).unwrap();
+                let data = loop {
+                    if let Message::Binary(data) = ws.read().unwrap() { break data; }
+                };
+                assert_eq!(&data[..], b"HELLO|same-nonce", "an old CMD must not replay after reconnection");
+                ws.send(Message::Binary(data)).unwrap();
+                ws.close(None).unwrap();
+                if round == 0 { lost_tx.send(()).unwrap(); }
+            }
+        });
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        let client = WsClient::connect_with_access(&format!("ws://{address}/ws"), Arc::new(move || {
+            Ok(Some(if count.fetch_add(1, Ordering::Relaxed) == 0 { "Bearer first-ticket" } else { "Bearer renewed-ticket" }.to_owned()))
+        })).unwrap();
+        let game = UdpSocket::bind("127.0.0.1:0").unwrap();
+        game.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+        let local = client.local;
+        game.send_to(b"HELLO|same-nonce", local).unwrap();
+        let mut reply = [0u8; 128];
+        assert_eq!(game.recv_from(&mut reply).unwrap().0, b"HELLO|same-nonce".len());
+        lost_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+        // The retry is in its handshake, so these datagrams remain in the UDP queue.
+        dialed_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+        game.send_to(b"CMD|ambiguous-old-command", local).unwrap();
+        allow_tx.send(()).unwrap();
+        let started = Instant::now();
+        while client.reconnects() == 0 && started.elapsed() < Duration::from_secs(4) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(client.reconnects(), 1);
+        assert_eq!(client.local, local, "the local transport address is preserved");
+        game.send_to(b"HELLO|same-nonce", local).unwrap();
+        let (n, _) = game.recv_from(&mut reply).unwrap();
+        assert_eq!(&reply[..n], b"HELLO|same-nonce");
+        let alive = client.alive.clone();
+        drop(client);
+        let stopped = Instant::now();
+        while alive.load(Ordering::Relaxed) && stopped.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!alive.load(Ordering::Relaxed), "dropping the client cancels backoff promptly");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn denied_reconnect_pauses_instead_of_repeating_authorization() {
+        for (status, expected) in [(401, WsAccessFailure::SignInRequired), (403, WsAccessFailure::AccessDenied)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                while !matches!(ws.read().unwrap(), Message::Binary(_)) {}
+                ws.close(None).unwrap();
+                let (mut denied, _) = listener.accept().unwrap();
+                denied.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+                let mut request = [0u8; 2048];
+                denied.read(&mut request).unwrap();
+                denied.write_all(format!("HTTP/1.1 {status} Denied\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+                drop(denied);
+                listener.set_nonblocking(true).unwrap();
+                std::thread::sleep(Duration::from_millis(700));
+                assert!(matches!(listener.accept(), Err(e) if e.kind() == ErrorKind::WouldBlock), "a refusal must not start another automatic handshake");
+            });
+            let client = WsClient::connect_authorized(&format!("ws://{address}/ws"), Some("Bearer fixture-ticket".into())).unwrap();
+            let game = UdpSocket::bind("127.0.0.1:0").unwrap();
+            game.send_to(b"HELLO", client.local).unwrap();
+            let started = Instant::now();
+            while client.terminal_failure().is_none() && started.elapsed() < Duration::from_secs(4) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(client.terminal_failure(), Some(expected));
+            assert_eq!(client.reconnects(), 0);
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_session_refusal_is_forwarded_and_stops_transport_retries() {
+        for rejection in [b"KICK|test".as_slice(), b"REJECT|1|test".as_slice()] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let data = rejection.to_owned();
+            let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                while !matches!(ws.read().unwrap(), Message::Binary(_)) {}
+                ws.send(Message::Binary(data.into())).unwrap();
+                let _ = ws.close(None);
+                listener.set_nonblocking(true).unwrap();
+                std::thread::sleep(Duration::from_millis(700));
+                assert!(matches!(listener.accept(), Err(e) if e.kind() == ErrorKind::WouldBlock));
+                paused_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+                listener.set_nonblocking(false).unwrap();
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let fresh = loop {
+                    if let Message::Binary(data) = ws.read().unwrap() { break data; }
+                };
+                assert_eq!(&fresh[..], b"HELLO|manual-reconnect");
+                ws.send(Message::Binary(fresh)).unwrap();
+            });
+            let client = WsClient::connect(&format!("ws://{address}/ws")).unwrap();
+            let game = UdpSocket::bind("127.0.0.1:0").unwrap();
+            game.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+            game.send_to(b"HELLO", client.local).unwrap();
+            let mut reply = [0u8; 128];
+            let (n, _) = game.recv_from(&mut reply).unwrap();
+            assert_eq!(&reply[..n], rejection);
+            let started = Instant::now();
+            while client.terminal_failure().is_none() && started.elapsed() < Duration::from_secs(1) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(client.terminal_failure(), Some(WsAccessFailure::SessionRejected));
+            paused_rx.recv_timeout(Duration::from_secs(4)).unwrap();
+            assert_eq!(client.reconnects(), 0);
+            client.resume();
+            resume_tx.send(()).unwrap();
+            let started = Instant::now();
+            while client.reconnects() == 0 && started.elapsed() < Duration::from_secs(4) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(client.reconnects(), 1, "only the explicit reconnect resumes admission");
+            game.send_to(b"HELLO|manual-reconnect", client.local).unwrap();
+            let (n, _) = game.recv_from(&mut reply).unwrap();
+            assert_eq!(&reply[..n], b"HELLO|manual-reconnect");
+            drop(client);
+            worker.join().unwrap();
+        }
     }
 
     #[test]

@@ -280,6 +280,7 @@ pub(crate) struct Module {
     transport: Transport, context: Context, pub page: String, state: Option<State>,
     values: BTreeMap<String, String>, ready: bool, failed: bool,
     next: Instant, pending: Option<Instant>, sequence: u64, error: Option<String>,
+    pending_action: bool, queued_action: Option<Request>,
     request_prefix: String,
 }
 impl Module {
@@ -296,13 +297,14 @@ impl Module {
         Some(Self { transport: Transport::start(origin), context, page: "downloads".into(), state: None,
             values: BTreeMap::new(), ready: false, failed: false, next: Instant::now(),
             pending: Some(Instant::now()), sequence: 0, error: None,
+            pending_action: false, queued_action: None,
             request_prefix: format!("{}-{:016x}", std::process::id(), rand::random::<u64>()) })
     }
     pub(crate) fn title(&self) -> &str { self.state.as_ref().map(|s| s.title.as_str()).unwrap_or("Extensions") }
     pub(crate) fn pages(&self) -> Vec<Page> { self.state.as_ref().map(|s| s.pages.clone()).unwrap_or_default() }
     pub(crate) fn select_page(&mut self, page: &str) {
         if self.page != page && valid_id(page) && (self.state.is_none() || self.pages().iter().any(|p| p.id == page)) {
-            self.clear_secrets(); self.values.clear(); self.page = page.into(); self.next = Instant::now();
+            self.clear_secrets(); self.values.clear(); self.queued_action = None; self.page = page.into(); self.next = Instant::now();
         }
     }
     pub(crate) fn clear_secrets(&mut self) {
@@ -311,12 +313,18 @@ impl Module {
     pub(crate) fn tick(&mut self, visible: bool) {
         while let Ok(event) = self.transport.rx.try_recv() {
             match event {
-                Event::Ready => { self.ready = true; self.pending = None; }
+                Event::Ready => { self.ready = true; self.pending = None; self.pending_action = false; }
                 Event::Reply(reply) => {
                     self.pending = None;
+                    self.pending_action = false;
                     self.error = reply.error.filter(|e| !e.is_empty()).map(|e| e.chars().take(2048).collect());
                     if let Some(state) = reply.state {
-                        if self.state.as_ref().is_some_and(|s| s.auth.state != state.auth.state || s.auth.display_name != state.auth.display_name) { self.clear_secrets(); }
+                        if self.state.as_ref().is_some_and(|s| s.auth.state != state.auth.state || s.auth.display_name != state.auth.display_name) {
+                            self.clear_secrets();
+                            if self.queued_action.take().is_some() {
+                                self.error = Some("The account state changed. Review the form before submitting again.".into());
+                            }
+                        }
                         if state.page == self.page {
                             let retained: HashSet<_> = state.items.iter().filter(|i| matches!(i.kind, Kind::Field | Kind::Choice)).map(|i| i.id.as_str()).collect();
                             self.values.retain(|id, _| retained.contains(id.as_str()));
@@ -330,6 +338,9 @@ impl Module {
             }
         }
         if self.pending.is_some_and(|t| t.elapsed() >= DEADLINE) { self.fail(); }
+        if !self.failed && self.ready && self.pending.is_none() {
+            if let Some(request) = self.queued_action.take() { self.submit(request); }
+        }
         if !self.failed && self.ready && self.pending.is_none() && self.next <= Instant::now()
             && (visible || self.state.is_none() || matches!(self.context, Context::Game)) {
             self.send(None);
@@ -337,12 +348,14 @@ impl Module {
         }
     }
     fn fail(&mut self) {
-        self.failed = true; self.ready = false; self.pending = None; self.clear_secrets();
+        self.failed = true; self.ready = false; self.pending = None; self.pending_action = false;
+        self.queued_action = None; self.clear_secrets();
         self.error = Some("The local UI module stopped responding. No action will be retried automatically.".into());
         self.transport.stop();
     }
     fn send(&mut self, action_id: Option<String>) {
-        if self.pending.is_some() || !self.ready || self.failed { return; }
+        if !self.ready || self.failed || self.queued_action.is_some()
+            || self.pending.is_some() && (action_id.is_none() || self.pending_action) { return; }
         self.sequence += 1;
         let action = action_id.is_some();
         let request = Request { v: 1, id: format!("{}-{}", self.request_prefix, self.sequence), op: if action { "ui.action" } else { "ui.get" }, capability: None,
@@ -353,9 +366,18 @@ impl Module {
         if serde_json::to_vec(&request).map_or(true, |bytes| bytes.len() > MAX_FRAME) {
             self.error = Some("The form is too large to submit.".into()); self.clear_secrets(); return;
         }
+        // A background refresh must neither make buttons disappear nor eat a click.
+        // Hold one explicit action until that read finishes, retaining the displayed
+        // revision so the backend still rejects a form that has since changed.
+        if self.pending.is_some() { self.queued_action = Some(request); }
+        else { self.submit(request); }
+        if action { self.clear_secrets(); }
+    }
+    fn submit(&mut self, request: Request) {
+        let action = request.op == "ui.action";
         if self.transport.tx.try_send(request).is_ok() {
             self.pending = Some(Instant::now()); self.next = Instant::now() + POLL;
-            if action { self.clear_secrets(); }
+            self.pending_action = action;
         } else { self.fail(); }
     }
     /// Native controls on the same toolkit and theme as all other launcher pages.
@@ -387,7 +409,7 @@ impl Module {
         };
         if !state.auth.display_name.is_empty() { ui.label(Rect::new(body.x, y, body.w, ROW), &state.auth.display_name); y += ROW; }
         if state.busy { ui.label(Rect::new(body.x, y, body.w, 24.0), "Working…"); y += 28.0; }
-        let enabled = !self.failed && self.pending.is_none();
+        let enabled = !self.failed && !self.pending_action && self.queued_action.is_none();
         let mut action = None;
         ui.scroll_area("module-body", Rect::new(body.x, y, body.w, (body.bottom() - y).max(1.0)), &mut |ui, r| {
             let mut y = r.y;
@@ -418,9 +440,8 @@ impl Module {
                     }
                     Kind::Button => {
                         let rect = Rect::new(r.x, y, r.w.min(620.0), ROW);
-                        if enabled && item.enabled && item.action_id.is_some() {
-                            if ui.button(&name, rect, &item.label, None, ButtonKind::Normal) { action = item.action_id.clone(); }
-                        } else { ui.text_in(&item.label, rect, 13.0, Weight::Medium, TEXT_DIM, Align::Center); }
+                        if ui.button_enabled(&name, rect, &item.label, None, ButtonKind::Normal,
+                            enabled && item.enabled && item.action_id.is_some()) { action = item.action_id.clone(); }
                         y += ROW + GAP;
                     }
                     Kind::Progress => {
@@ -544,6 +565,75 @@ impl GamePanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn module_fixture() -> (Module, mpsc::Receiver<Request>, mpsc::SyncSender<Event>) {
+        let (tx, requests) = mpsc::sync_channel(1);
+        let (events, rx) = mpsc::sync_channel(1);
+        let state: State = serde_json::from_str(r#"{"revision":"1","title":"Module","page":"downloads","pages":[{"id":"downloads","label":"Downloads"},{"id":"profile","label":"Profile"}],"auth":{"state":"verified","display_name":"Fixture"},"items":[{"kind":"choice","id":"product","options":[{"id":"fixture","label":"Fixture"}]},{"kind":"button","id":"install","action_id":"downloads.install"}]}"#).unwrap();
+        let module = Module {
+            transport: Transport { tx, rx, stopped: Arc::new(AtomicBool::new(false)), child: Arc::new(Mutex::new(None)) },
+            context: Context::Launcher, page: "downloads".into(), state: Some(state),
+            values: BTreeMap::from([("product".into(), "fixture".into())]), ready: true, failed: false,
+            next: Instant::now() + POLL, pending: None, sequence: 0, error: None,
+            pending_action: false, queued_action: None, request_prefix: "fixture".into(),
+        };
+        (module, requests, events)
+    }
+
+    #[test]
+    fn a_click_during_a_refresh_is_submitted_once_with_its_displayed_values() {
+        let (mut module, requests, events) = module_fixture();
+        module.send(None);
+        let poll = requests.try_recv().unwrap();
+        assert!(!module.pending_action);
+        module.send(Some("downloads.install".into()));
+        module.values.insert("product".into(), "changed-later".into());
+        module.send(Some("downloads.refresh".into()));
+        assert!(requests.try_recv().is_err());
+        let mut refreshed = module.state.clone().unwrap();
+        refreshed.revision = "2".into();
+        events.send(Event::Reply(Reply { v: 1, id: poll.id, ok: true, state: Some(refreshed), error: None })).unwrap();
+        module.tick(false);
+        let action = requests.try_recv().unwrap();
+        assert_eq!(action.op, "ui.action");
+        assert_eq!(action.params.action_id.as_deref(), Some("downloads.install"));
+        assert_eq!(action.params.revision.as_deref(), Some("1"));
+        assert_eq!(action.params.values.get("product").map(String::as_str), Some("fixture"));
+        assert!(module.pending_action);
+        // A rejection of that stale form is displayed, never resubmitted.
+        events.send(Event::Reply(Reply { v: 1, id: action.id, ok: false, state: module.state.clone(), error: Some("State changed".into()) })).unwrap();
+        module.tick(false);
+        assert!(requests.try_recv().is_err());
+        assert!(module.queued_action.is_none());
+        assert_eq!(module.error.as_deref(), Some("State changed"));
+    }
+
+    #[test]
+    fn changing_page_account_or_transport_discards_a_queued_action() {
+        for reason in ["page", "account", "transport"] {
+            let (mut module, requests, events) = module_fixture();
+            module.send(None);
+            let poll = requests.try_recv().unwrap();
+            module.send(Some("downloads.install".into()));
+            assert!(module.queued_action.is_some());
+            match reason {
+                "page" => {
+                    module.select_page("profile");
+                    events.send(Event::Reply(Reply { v: 1, id: poll.id, ok: true, state: module.state.clone(), error: None })).unwrap();
+                }
+                "account" => {
+                    let mut changed = module.state.clone().unwrap();
+                    changed.auth.state = "signed_out".into();
+                    events.send(Event::Reply(Reply { v: 1, id: poll.id, ok: true, state: Some(changed), error: None })).unwrap();
+                }
+                _ => { events.send(Event::Failed("Connection ended".into())).unwrap(); }
+            }
+            module.tick(false);
+            assert!(module.queued_action.is_none());
+            while let Ok(request) = requests.try_recv() { assert_eq!(request.op, "ui.get"); }
+        }
+    }
+
     #[test]
     fn bounded_frames_reject_length_and_mismatched_shape() {
         assert!(read_json::<Reply>(&mut std::io::Cursor::new((MAX_FRAME as u32 + 1).to_le_bytes())).is_err());

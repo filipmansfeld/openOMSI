@@ -11,6 +11,9 @@
 
 mod admin;
 mod discord;
+#[cfg(steam)]
+mod steam;
+mod voice;
 mod headtrack;
 #[cfg(windows)]
 mod openxr;
@@ -40,6 +43,7 @@ mod lan_world;
 mod lights;
 mod launcher;
 mod menu;
+mod mirror_hud;
 mod navigator;
 mod vr_navigator;
 mod money;
@@ -78,6 +82,7 @@ mod launcher_link;
 mod lan_mods;
 mod memory;
 mod offscreen;
+mod ground_gap;
 mod on_foot;
 mod route_arrows;
 mod server;
@@ -483,6 +488,7 @@ fn new_app(args: Args, settings: settings::Settings) -> App {
         navigator: None,
         vr_nav_profiles: crate::vr_navigator::Profiles::load(),
         vr_nav_edit: None,
+        spanned: false,
         ui: ui::Ui::new(),
         fps: 0.0,
         rain: rain::Rain::new(),
@@ -504,6 +510,7 @@ fn new_app(args: Args, settings: settings::Settings) -> App {
         mirrors_seen: 2,
         mirror_turn: 0,
         frozen_mirrors: None,
+        mirror_hud: Default::default(),
         hover_key: None,
         view,
         audio: None,
@@ -512,6 +519,8 @@ fn new_app(args: Args, settings: settings::Settings) -> App {
         vr_cursor_physical: None,
         vr_cursor_warp_pending: None,
         window_focused: false,
+        input_away: false,
+        window_hidden: false,
         keys: Default::default(),
         door_key_triggers: Default::default(),
         last: Instant::now(),
@@ -529,6 +538,8 @@ fn new_app(args: Args, settings: settings::Settings) -> App {
         game_menu: None,
         menu_top: None,
         menu_scroll_drag: false,
+        dd_scroll_drag: None,
+        pane_scroll_drag: None,
         pane_scroll: None,
         plugin_keys: Vec::new(),
         clock_hold: 0.0,
@@ -537,6 +548,9 @@ fn new_app(args: Args, settings: settings::Settings) -> App {
         teleport_pick: false,
         discord: None,
         discord_t: 0.0,
+        #[cfg(steam)]
+        steam: None,
+        voice: None,
         headtrack: None,
         headtrack_failed: None,
         controllers: None,
@@ -589,6 +603,7 @@ fn new_app(args: Args, settings: settings::Settings) -> App {
         frames: 0,
         fps_t: Instant::now(),
         service_msg: clock_note.map(|m| (m, 10.0)),
+        notices: Vec::new(),
         log_state: Default::default(),
         plugins: None,
         career: Default::default(),

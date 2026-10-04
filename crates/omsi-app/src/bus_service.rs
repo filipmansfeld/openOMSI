@@ -101,12 +101,26 @@ fn boarding_time(id: u64) -> f32 {
     7.0 + (id % 5) as f32
 }
 
-/// An early bus waits for its departure, but not for more than this (the stop times of
-/// most trips are the running time shared out by distance: a bus that sat out minutes of
-/// "lead" at every stop held up every bus behind it).
-const EARLY_WAIT: f64 = 40.0;
+/// An early bus waits at its stop until this long before its departure, a train at its
+/// station until `EARLY_LEAVE_RAIL` before (Omsi.exe 0x7d9bdc: it stands while it is more
+/// than 20 s, a train 120 s, early). Capped at 40 s, the buses no longer waited for their
+/// times at the stops where a timetable holds them all for a connection (#1012).
+const EARLY_LEAVE: f64 = 20.0;
+const EARLY_LEAVE_RAIL: f64 = 120.0;
 /// A layover waits for the departure however long (a tour's bus in on its previous trip).
 const LAYOVER_WAIT: f64 = 1800.0;
+
+/// How long a bus arriving at `now` stands at a stop it is to leave at `depart`.
+fn early_wait(depart: f64, now: f64, layover: bool, rail: bool) -> f64 {
+    let lead = if layover {
+        0.0
+    } else if rail {
+        EARLY_LEAVE_RAIL
+    } else {
+        EARLY_LEAVE
+    };
+    (depart - lead - now).clamp(0.0, LAYOVER_WAIT)
+}
 /// On a layover, the doors open this long before the departure.
 const LAYOVER_BOARDING: f64 = 45.0;
 /// Pull into the bay over this distance before the stop: the stop's docking distance,
@@ -204,9 +218,12 @@ impl BusService {
         }
     }
 
-    /// Somebody is still at the doors: keep them open for `secs` more.
-    pub fn hold(&mut self, secs: f32) {
-        if self.phase == Phase::Boarding {
+    /// Somebody is still at the doors: keep them open for `secs` more - for somebody
+    /// coming from stop `stop` only while the bus serves that stop (Omsi.exe 0x7d9f1d: the
+    /// person's stop is the bus's), not a stop it stands next to.
+    pub fn hold(&mut self, stop: Option<i64>, secs: f32) {
+        let here = stop.is_none_or(|s| self.stops.front().is_some_and(|f| f.id == s));
+        if self.phase == Phase::Boarding && here {
             self.boarding = self.boarding.max(secs);
         }
     }
@@ -246,8 +263,8 @@ impl BusService {
             log::info!("t={:.1}: timetable bus {} serves its stop {:?}", ctx.day_time, ctx.id, self.stops.front().map(|s| s.id));
         }
         let layover = std::mem::take(&mut self.layover);
-        let limit = if layover { LAYOVER_WAIT } else { EARLY_WAIT };
-        let wait = (depart - ctx.day_time).clamp(0.0, limit);
+        let rail = ctx.net.lanes.get(at.0).is_some_and(|l| l.kind == LaneKind::Rail);
+        let wait = early_wait(depart, ctx.day_time, layover, rail);
         self.leave_at = ctx.day_time + wait;
         self.boarding = boarding_time(ctx.id);
         self.boarded = false;
@@ -473,6 +490,35 @@ pub fn stop_shift(ty: &omsi_sim::VehicleType, rail: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Somebody coming from another stop than the one the bus serves does not keep it there
+    /// (#767); somebody on the way out does, wherever.
+    #[test]
+    fn a_hold_counts_at_the_stop_served() {
+        let stop = Stop { ri: 0, s: 0.0, bay: 0.0, depart: 0.0, id: 42, side: 0.0 };
+        let mut s = BusService::new(vec![stop]);
+        s.phase = Phase::Boarding;
+        s.boarding = 0.0;
+        s.hold(Some(41), 2.5);
+        assert_eq!(s.boarding, 0.0);
+        s.hold(Some(42), 2.5);
+        assert_eq!(s.boarding, 2.5);
+        s.boarding = 0.0;
+        s.hold(None, 2.5);
+        assert_eq!(s.boarding, 2.5);
+    }
+
+    #[test]
+    fn an_early_bus_waits_for_its_time() {
+        // five minutes early: until 20 s before its departure (a train: 2 min)
+        assert_eq!(early_wait(400.0, 100.0, false, false), 280.0);
+        assert_eq!(early_wait(400.0, 100.0, false, true), 180.0);
+        // late, or nearly on time: off at once
+        assert_eq!(early_wait(400.0, 390.0, false, false), 0.0);
+        assert_eq!(early_wait(400.0, 500.0, false, false), 0.0);
+        // a layover: to the departure itself
+        assert_eq!(early_wait(400.0, 100.0, true, false), 300.0);
+    }
 
     #[test]
     fn standing_time() {

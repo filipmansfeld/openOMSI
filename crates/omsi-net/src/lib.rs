@@ -1345,6 +1345,9 @@ pub struct LanSession {
     /// `JOIN_TIMEOUT`, `RECONNECT_TIMEOUT`).
     trying: f32,
     lost_at: Option<Instant>,
+    /// The client gave up (no answer / host lost) but keeps saying hello now and then: a
+    /// welcome brings it back without restarting the game (see `reconnect`).
+    timed_out: bool,
     join_timeout: Duration,
     /// "Port unreachable" answers to our hellos (a computer that is there, without a session
     /// on that port; Windows and Linux report them).
@@ -1482,6 +1485,7 @@ impl LanSession {
             candidates: Vec::new(),
             trying: 0.0,
             lost_at: None,
+            timed_out: false,
             join_timeout: std::env::var("OMSI_LAN_JOIN_TIMEOUT")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
@@ -2393,8 +2397,8 @@ impl LanSession {
         }
         if self.role == Role::Client
             && !self.connected
-            && self.rejected.is_none()
-            && self.hello_acc >= 1.0
+            && (self.rejected.is_none() && self.hello_acc >= 1.0
+                || self.timed_out && self.hello_acc >= 5.0)
         {
             self.hello_acc = 0.0;
             self.send_hello(mine);
@@ -2464,7 +2468,7 @@ impl LanSession {
                 self.no_answer(self.join_timeout)
             }
             (true, Some(at)) if at.elapsed() >= RECONNECT_TIMEOUT => format!(
-                "the host has not answered for {:.0} s - the session is over (playing on alone)",
+                "the host has not answered for {:.0} s - the session is over (playing on alone; still trying, or type /reconnect)",
                 RECONNECT_TIMEOUT.as_secs_f32()
             ),
             _ => return,
@@ -2472,6 +2476,50 @@ impl LanSession {
         log::warn!("LAN: {why}");
         self.events.push(LanEvent::Notice(why.clone()));
         self.rejected = Some(why);
+        self.timed_out = true;
+    }
+
+    /// Say hello once more at once (the way to the host was made again: a new connection
+    /// is a new address to it, which it only learns from a hello). Clients only.
+    pub fn rehello(&mut self) {
+        if self.role == Role::Client && (self.rejected.is_none() || self.timed_out) {
+            if self.connected { self.confirm = true; } else { self.hello_acc = 5.0; }
+        }
+    }
+
+    /// A transport admission refusal must not be treated like a temporary outage.
+    /// The local game continues, but only an explicit reconnect can clear this state.
+    pub fn stop_automatic_reconnect(&mut self, reason: &str) {
+        if self.role != Role::Client { return; }
+        if self.rejected.is_none() || self.timed_out {
+            self.events.push(LanEvent::Notice(reason.to_owned()));
+            self.rejected = Some(reason.to_owned());
+        }
+        self.connected = false;
+        self.timed_out = false;
+        self.confirm = false;
+    }
+
+    /// Try the host again at once (a client that was turned away, timed out or sent away):
+    /// the game takes the host's world again when the welcome comes. False for a host.
+    pub fn reconnect(&mut self) -> bool {
+        if self.role != Role::Client {
+            return false;
+        }
+        self.rejected = None;
+        self.timed_out = false;
+        self.connected = false;
+        self.other_reject = None;
+        self.refused = 0;
+        self.trying = 0.0;
+        self.lost_at = Some(Instant::now());
+        self.hello_acc = 1.0;
+        if self.candidates.len() > 1 {
+            self.host = None;
+        }
+        log::info!("LAN: reconnecting");
+        self.events.push(LanEvent::Notice("reconnecting ...".into()));
+        true
     }
 
     /// Why nobody may have answered, for the player.
@@ -2705,6 +2753,7 @@ impl LanSession {
                     }
                     self.rejected = Some(reason);
                     self.connected = false;
+                    self.timed_out = false;
                 }
                 ("INFO", _) => self.on_info(&parts, from),
                 ("TOURS", Role::Client) => self.on_tours(&parts, from),
@@ -2744,6 +2793,7 @@ impl LanSession {
                     self.events.push(LanEvent::Notice(format!("the host sent you away: {reason}")));
                     self.rejected = Some(format!("the host sent you away: {reason}"));
                     self.connected = false;
+                    self.timed_out = false;
                 }
                 ("WANT", Role::Host) | ("CLAIM", Role::Host) => {
                     let Some(id) = field(&parts, 1).parse::<u32>().ok() else {
@@ -3258,11 +3308,16 @@ impl LanSession {
     }
 
     fn on_welcome(&mut self, parts: &[&str], from: SocketAddr) {
+        if self.rejected.is_some() && !self.timed_out {
+            return;
+        }
+        let was_timed_out = self.timed_out;
         let proto = field(parts, 1).parse::<u32>().unwrap_or(1);
         if proto != PROTOCOL {
             self.rejected = Some(format!(
                 "the host runs LAN protocol {proto}, this game protocol {PROTOCOL}"
             ));
+            self.timed_out = false;
             return;
         }
         let Some(id) = field(parts, 2)
@@ -3279,6 +3334,7 @@ impl LanSession {
                 session_hex(session),
                 session_hex(self.session)
             ));
+            self.timed_out = false;
             return;
         }
         let host_name = clean_text(field(parts, 4), MAX_NAME);
@@ -3309,6 +3365,11 @@ impl LanSession {
         self.session = session;
         self.connected = true;
         self.lost_at = None;
+        if was_timed_out {
+            // the host is back after we had given up
+            self.timed_out = false;
+            self.rejected = None;
+        }
         self.host_seen = Instant::now();
         if first {
             log::info!("LAN: connected to '{host_name}' (session {}), we are player {id}; the host's world: {} {} {:02}:{:02} weather '{}' season '{}'", session_hex(session), world.map, world.date, (world.time / 3600.0) as i32, ((world.time % 3600.0) / 60.0) as i32, world.weather, world.season);

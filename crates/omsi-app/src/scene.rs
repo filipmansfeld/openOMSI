@@ -110,6 +110,54 @@ impl World {
         g.get(&index).cloned().unwrap_or_default()
     }
 
+    /// The shape of the glass that shows mirror `i`'s picture: material `slot` of `data`. How far
+    /// the position moves for a step of the texture coordinates across and down, over a
+    /// triangle at a time (area weighted), times the part of the picture the mesh uses.
+    pub fn note_mirror_aspect(&self, i: usize, data: &MeshData, slot: usize) {
+        let (mut tu, mut tv, mut area) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut umin, mut umax, mut vmin, mut vmax) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for &(first, count, mat) in &data.ranges {
+            if mat as usize != slot {
+                continue;
+            }
+            let end = ((first + count) as usize).min(data.indices.len());
+            for tri in data.indices[(first as usize).min(end)..end].chunks_exact(3) {
+                let (Some(&a), Some(&b), Some(&c)) = (data.positions.get(tri[0] as usize), data.positions.get(tri[1] as usize), data.positions.get(tri[2] as usize)) else { continue };
+                let (Some(&ua), Some(&ub), Some(&uc)) = (data.uvs.get(tri[0] as usize), data.uvs.get(tri[1] as usize), data.uvs.get(tri[2] as usize)) else { continue };
+                for uv in [ua, ub, uc] {
+                    umin = umin.min(uv.x);
+                    umax = umax.max(uv.x);
+                    vmin = vmin.min(uv.y);
+                    vmax = vmax.max(uv.y);
+                }
+                let (e1, e2) = (b - a, c - a);
+                let (d1, d2) = (ub - ua, uc - ua);
+                let det = d1.x * d2.y - d1.y * d2.x;
+                if det.abs() < 1e-9 {
+                    continue;
+                }
+                let t = (e1 * d2.y - e2 * d1.y) / det;
+                let v = (e2 * d1.x - e1 * d2.x) / det;
+                let w = e1.cross(e2).length() as f64;
+                tu += t.length() as f64 * w;
+                tv += v.length() as f64 * w;
+                area += w;
+            }
+        }
+        if area <= 0.0 || umax <= umin || vmax <= vmin || tv <= 0.0 {
+            return;
+        }
+        let aspect = ((tu / area) * (umax - umin) as f64) / ((tv / area) * (vmax - vmin) as f64);
+        if !aspect.is_finite() || !(0.15..=6.0).contains(&aspect) {
+            return;
+        }
+        let mut g = self.mirror_aspect.lock();
+        if g.len() <= i {
+            g.resize(i + 1, 0.0);
+        }
+        g[i] = aspect as f32;
+    }
+
     /// Render texture of mirror `i` (created on first use, as large as the `mirror_size`
     /// setting says).
     pub fn mirror_texture(&self, renderer: &Renderer, scene: &mut Scene, i: usize) -> TextureId {
@@ -222,8 +270,12 @@ pub struct ScriptedObject {
     /// Traffic light program of this object (crossings) or of its parent (lamps).
     pub controller: Option<usize>,
     pub light_index: usize,
-    /// The crossing and light named by an ordinary scripted child's `[varparent]`.
-    /// Resolve its controller when read, including a parent tile loaded later.
+    /// A child of a crossing that names one of its lights without being one of our lamps
+    /// (its own textures to choose, see `child_lamp`): (the crossing, the light). Its
+    /// script reads that light's `TrafficLightPhase` and `TrafficLightApproach`, as
+    /// Omsi.exe's RefreshAmpelParenting (0x77d460) hands them to any such child. The
+    /// crossing's program is looked up when the script runs: it may stand on a tile
+    /// loaded later.
     pub light_parent: Option<(i64, usize)>,
     pub map_id: i64,
     /// `[matl_change]` variants: (instance, slot, base, item, variable).
@@ -330,6 +382,9 @@ impl LampSlots {
     }
 }
 
+/// `LightObject::parent` of a signal that names no crossing: no crossing has this id.
+pub const NO_CROSSING: i64 = i64::MIN;
+
 /// A placed `[trafficlight]` object: its render instances follow the light state of
 /// light `index` of the crossing `parent`.
 #[derive(Clone)]
@@ -381,6 +436,8 @@ pub struct LightObject {
 pub struct SplineType {
     pub def: Spline,
     pub dir: PathBuf,
+    /// The `.surf` map of each of `def.textures` (see [`surf_map`]).
+    pub surf: Vec<Option<Arc<omsi_geometry::HeightMap>>>,
 }
 
 #[derive(Debug, Default)]
@@ -537,22 +594,6 @@ struct StagedSpline {
 /// terrain does not - a caster in one plane with what it falls on paints dark patches into
 /// it (the sun shadow's bias is 6 cm). Splines are surfaces and cast nothing otherwise.
 const SPLINE_SHADOW_CLEARANCE: f32 = 0.75;
-/// OMSI's metric separation for a spline or `[surface]` object's vertices.
-const OMSI_SURFACE_LIFT: f32 = 0.08;
-
-fn scenery_draw_position(authored: DVec3, surface: bool) -> DVec3 {
-    authored + if surface { DVec3::Z * OMSI_SURFACE_LIFT as f64 } else { DVec3::ZERO }
-}
-
-/// Whether a scenery object is drawn with the roads' `OMSI_SURFACE_LIFT`: a `[surface]`
-/// object, and whatever is drawn in the surfaces' phases on them - a `[rendertype] surface`
-/// plate and an `on_surface` marking. A road arrow or a zebra laid a few centimetres over
-/// the authored road went under the road drawn 8 cm higher (every turn arrow of Spandau's
-/// Falkenseer Chaussee, the zebra crossings of many maps, #871).
-fn drawn_on_surfaces(sco: &SceneryObject) -> bool {
-    use omsi_scenery::sco::RenderType;
-    sco.surface || matches!(sco.render_type, RenderType::Surface | RenderType::OnSurface)
-}
 /// A spline whose profiles all hang this far (m) over its line - wires, catenaries, a
 /// canopy - is no ground surface: it neither cuts the terrain nor carries anything.
 const SPLINE_OVERHEAD: f32 = 2.0;
@@ -601,8 +642,8 @@ pub struct StagedTile {
     /// The whole spline meshes, in the order of `splines`, until the tile is placed.
     meshes: Mutex<Option<Vec<Arc<MeshData>>>>,
     /// The `[heightprofile]` surfaces of the tile's splines (local to `origin`) with their
-    /// world bounds: what the wheels roll on.
-    drive: Vec<(MeshData, [f64; 4])>,
+    /// world bounds and `.surf` maps: what the wheels roll on.
+    drive: Vec<(MeshData, [f64; 4], Option<omsi_geometry::SurfFaces>)>,
     /// Lanes, taken when the tile is loaded for the first time.
     lanes: Mutex<Vec<Lane>>,
     /// The street lanes' points of the tile's splines, kept for good (what an object's box
@@ -1784,6 +1825,75 @@ pub fn texture_dirs(root: &Path, content_dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// The `.surf` map of a texture: a picture named after the texture as the content asks for
+/// it, plus `.surf` (`str_kopfgr01.bmp.surf`, also beside a `.dds`), in the texture's folder.
+/// Its red channel is the bumpiness of a road drawn with the texture ([`HeightMap`]), which
+/// OMSI 2 lays under the wheels (#886). Loaded once per file.
+///
+/// [`HeightMap`]: omsi_geometry::HeightMap
+pub fn surf_map(texture: &str, dirs: &[&Path]) -> Option<Arc<omsi_geometry::HeightMap>> {
+    static MEMO: std::sync::OnceLock<Mutex<HashMap<PathBuf, Option<Arc<omsi_geometry::HeightMap>>>>> = std::sync::OnceLock::new();
+    // OMSI_NO_SURF: every road as smooth as before (A/B)
+    if omsi_cfg::env::var_os("OMSI_NO_SURF").is_some() {
+        return None;
+    }
+    let found = omsi_texture::find_texture(texture, dirs)?;
+    let dir = found.parent()?;
+    let req = texture.trim().replace('\\', "/");
+    let base = req.rsplit('/').next().unwrap_or(&req).to_string();
+    let found_name = found.file_name()?.to_string_lossy().into_owned();
+    let path = [base, found_name]
+        .iter()
+        .map(|n| omsi_cfg::resolve_path(dir, &format!("{n}.surf")))
+        // through the VFS: a texture found in a mounted archive has its map in there too
+        .find(|p| omsi_cfg::vfs::is_file(p))?;
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(m) = memo.lock().get(&path) {
+        return m.clone();
+    }
+    let map = match omsi_texture::decode_file(&path) {
+        Ok(img) => omsi_geometry::HeightMap::from_rgba(img.width as usize, img.height as usize, &img.rgba).map(Arc::new),
+        Err(e) => {
+            log::warn!("{e}");
+            None
+        }
+    };
+    memo.lock().insert(path, map.clone());
+    map
+}
+
+#[cfg(test)]
+mod surf_map_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn bmp(red: u8) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(2, 2, image::Rgb([red, 0, 0])).write_to(&mut out, image::ImageFormat::Bmp).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn surf_map_beside_a_texture_in_a_mounted_archive() {
+        let dir = std::env::temp_dir().join(format!("openomsi-surf-zip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("roads.zip");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        for (name, data) in [("Splines/Roads/texture/cobbles.bmp", bmp(128)), ("Splines/Roads/texture/cobbles.bmp.surf", bmp(255))] {
+            z.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            z.write_all(&data).unwrap();
+        }
+        z.finish().unwrap();
+        let mount = omsi_cfg::vfs::mount_zip(&zip_path).unwrap();
+        let tex = mount.join("Splines").join("Roads").join("texture");
+        // only the archive holds it: nothing on the disk beside the zip
+        assert!(!tex.join("cobbles.bmp.surf").is_file());
+        let map = surf_map("cobbles.bmp", &[&tex]).expect("the .surf in the archive");
+        assert!((map.lift(glam::Vec2::new(0.5, 0.5)) - 0.02).abs() < 1e-3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 pub struct World {
     pub root: PathBuf,
     pub global: GlobalCfg,
@@ -1792,6 +1902,9 @@ pub struct World {
     parklist: Mutex<HashMap<usize, Vec<String>>>,
     /// Render textures of the player's mirrors (`reflexionN.bmp`), by camera index.
     pub mirror_textures: Mutex<Vec<Option<TextureId>>>,
+    /// Width / height of the glass of the player bus mirror N (from the mesh that shows its
+    /// picture), 0 when not known: the shape of the panels that copy the mirrors to the screen.
+    pub mirror_aspect: Mutex<Vec<f32>>,
     object_types: Mutex<HashMap<String, Option<Arc<ObjectType>>>>,
     spline_types: Mutex<HashMap<String, Option<Arc<SplineType>>>>,
     pub textures: Arc<TextureCache>,
@@ -2310,6 +2423,38 @@ fn probe_tile(
     }
 }
 
+/// What is drawn at world (x, y) under `top`: the highest face of the splines and surface
+/// objects (as lifted for drawing) and the terrain where it is not cut away - the picture's
+/// ground, without any of the wheel rules of [`drive_probe`] (`OMSI_GROUND_GAP` measures the
+/// tyres against it).
+pub fn drawn_ground(
+    terrains: &RwLock<HashMap<(i32, i32), Arc<Terrain>>>,
+    surfaces: &RwLock<HashMap<(i32, i32), Arc<TileSurface>>>,
+    x: f64,
+    y: f64,
+    top: f64,
+) -> Option<f64> {
+    let key = tile_key(x, y);
+    let lx = (x - key.0 as f64 * tile_size()) as f32;
+    let ly = (y - key.1 as f64 * tile_size()) as f32;
+    let surface = surfaces.read().get(&key).cloned();
+    let terrain = terrains.read().get(&key).cloned();
+    let mut best: Option<f32> = None;
+    if let Some(s) = surface.as_deref() {
+        let a = s.drive.probe(lx, ly, top as f32).below;
+        let b = s.drive.probe_walls(lx, ly, top as f32).below;
+        best = a.into_iter().chain(b).reduce(f32::max);
+    }
+    if let Some(t) = terrain.as_deref() {
+        let h = omsi_geometry::terrain_height(t, lx, ly);
+        let cut = surface.as_deref().is_some_and(|s| s.cut_at(lx, ly, h, surface_flush()));
+        if !cut && h <= top as f32 {
+            best = Some(best.map_or(h, |b| b.max(h)));
+        }
+    }
+    best.map(|z| z as f64)
+}
+
 /// How far a road face may lie under drawn ground before it counts as buried (m): far more
 /// than the ground poking through the asphalt that the road is there to keep out.
 const BURIED_FACE: f32 = 1.0;
@@ -2457,8 +2602,8 @@ impl World {
         drive_probe(&self.terrains, &self.surfaces, x, y, top).below
     }
 
-    /// Local visible road plane under a vehicle. Exact faces include the same draw lift
-    /// as the road; raster heights do not. Choose the nearby deck, never a roof above it.
+    /// Local visible road plane under a vehicle: the exact faces where there are any (raster
+    /// heights are coarser). Choose the nearby deck, never a roof above it.
     pub fn puddle_surface(&self, position: DVec3) -> Option<(f64, glam::Vec3)> {
         let height = self.camera_ground(position.x, position.y, position.z + 0.35)?;
         let key = tile_key(position.x, position.y);
@@ -2652,6 +2797,7 @@ impl World {
             map_dir,
             parklist: Mutex::new(HashMap::new()),
             mirror_textures: Mutex::new(Vec::new()),
+            mirror_aspect: Mutex::new(Vec::new()),
             chrono_dirs: parking_lot::RwLock::new(chrono_dirs),
             ailists: RwLock::new(Arc::new(ailists)),
             preparation: RwLock::new(0),
@@ -3032,10 +3178,11 @@ impl World {
             .ok()
             .map(|def| {
                 omsi_geometry::register_half_cant_width(rel, &def);
-                Arc::new(SplineType {
-                    dir: path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
-                    def,
-                })
+                let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                let dirs = texture_dirs(&self.root, &dir);
+                let dirs: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
+                let surf = def.textures.iter().map(|t| surf_map(&t.file, &dirs)).collect();
+                Arc::new(SplineType { dir, def, surf })
             });
         self.spline_types
             .lock()
@@ -3050,103 +3197,138 @@ impl World {
     /// take the tile's terrain height; editor-only splines and objects count (some maps put
     /// all their traffic paths on invisible splines).
     pub fn navigation_map(&self) -> NavigationMap {
-        use rayon::prelude::*;
-        let t0 = std::time::Instant::now();
-        let scos: Mutex<HashMap<String, Option<Arc<SceneryObject>>>> = Mutex::new(HashMap::new());
-        let sco_of = |file: &str| -> Option<Arc<SceneryObject>> {
-            let key = file.trim().to_ascii_lowercase().replace('\\', "/");
-            if let Some(v) = scos.lock().get(&key) {
-                return v.clone();
-            }
-            let v = SceneryObject::load(&omsi_cfg::resolve_path(&self.root, file)).ok().map(Arc::new);
-            scos.lock().insert(key, v.clone());
-            v
-        };
-        let tiles = self.map_tiles();
-        #[allow(clippy::type_complexity)]
-        let parts: Vec<(Vec<Lane>, Vec<(i64, DVec3)>, Vec<(DVec3, f64, String)>, Vec<(Vec<DVec3>, f32)>)> = tiles
-            .par_iter()
-            .map(|(_, tx, ty, path)| {
-                let (tx, ty) = (*tx, *ty);
-                let mut lanes = Vec::new();
-                let mut positions = Vec::new();
-                let mut signs = Vec::new();
-                let mut roads = Vec::new();
-                let Some(tile) = crate::tiles::read_tile(path, &self.chrono_dirs.read()) else {
-                    return (lanes, positions, signs, roads);
-                };
-                let origin2 = DVec2::new(tx as f64 * tile_size(), ty as f64 * tile_size());
-                let terrain = Terrain::load(&tile_companion(&path, ".terrain")).unwrap_or_else(|_| Terrain::flat());
-                for sp in tile.splines.iter().filter(|s| !s.deleted && !s.file.trim().is_empty()) {
-                    let Some(st) = self.spline_type(&sp.file) else { continue };
-                    if !st.def.paths.iter().any(|p| p.kind == 0) {
-                        // Short surfaces also corroborate editor-only traffic paths at
-                        // junctions; the navigator filters decorative patches for display.
-                        if sp.length >= 2.0 {
-                            let curve = SplineCurve::from_map(sp, origin2).with_sli(&st.def);
-                            let n = ((curve.length / 4.0).ceil() as usize).clamp(1, 400);
-                            let side = if sp.mirror { -1.0 } else { 1.0 };
-                            for (lo, hi, z) in road_sections(&sp.file, &st.def) {
-                                let offset = side * ((lo + hi) * 0.5) as f64;
-                                let pts: Vec<DVec3> = (0..=n).map(|k| curve.offset_point(curve.length * k as f64 / n as f64, offset, z as f64)).collect();
-                                roads.push((pts, hi - lo));
-                            }
-                        }
-                    }
-                    if st.def.paths.is_empty() {
-                        continue;
-                    }
-                    let curve = SplineCurve::from_map(sp, origin2);
-                    let mut new_lanes = spline_lanes(&st.def, sp, &curve, (tx, ty));
-                    for l in new_lanes.iter_mut() {
-                        l.invisible = st.def.only_editor;
-                    }
-                    lanes.extend(new_lanes);
-                }
-                for o in &tile.objects {
-                    if o.file.trim().is_empty() {
-                        continue;
-                    }
-                    let (x, y) = (origin2.x + o.pos[0], origin2.y + o.pos[1]);
-                    let ground = || {
-                        let (lx, ly) = ((x - origin2.x).clamp(0.0, tile_size()) as f32, (y - origin2.y).clamp(0.0, tile_size()) as f32);
-                        terrain.sample(lx, ly) as f64
-                    };
-                    // street name signs carry the street's name as their text
-                    if is_street_sign(&o.file) {
-                        if let Some(name) = o.extra.first().map(|t| t.trim()).filter(|t| t.chars().filter(|c| c.is_alphabetic()).count() >= 3) {
-                            signs.push((DVec3::new(x, y, o.pos[2] + ground()), o.rot[0], name.to_string()));
-                        }
-                    }
-                    let Some(sco) = sco_of(&o.file) else {
-                        positions.push((o.id, DVec3::new(x, y, o.pos[2] + ground())));
-                        continue;
-                    };
-                    let absolute = sco.absolute_height();
-                    let pos = DVec3::new(x, y, if absolute { o.pos[2] } else { o.pos[2] + ground() });
-                    positions.push((o.id, pos));
-                    if !sco.paths.is_empty() {
-                        lanes.extend(object_lanes(&sco, pos, [o.rot[0], 0.0, 0.0], None, (tx, ty), o.id, &o.rules));
-                    }
-                }
-                (lanes, positions, signs, roads)
-            })
-            .collect();
-        let mut lanes = Vec::new();
-        let mut positions = HashMap::new();
-        let mut signs = Vec::new();
-        let mut roads = Vec::new();
-        for (l, p, s, r) in parts {
-            lanes.extend(l);
-            positions.extend(p);
-            signs.extend(s);
-            roads.extend(r);
-        }
-        log::info!("navigation map: {} roads without a path for cars", roads.len());
-        log::info!("navigation map: {} tiles, {} lanes, {} objects placed, {} street name signs, {} object types, {:.1} s", tiles.len(), lanes.len(), positions.len(), signs.len(), scos.lock().len(), t0.elapsed().as_secs_f64());
-        NavigationMap { lanes, road_surfaces: roads, places: positions, signs }
+        let tiles: Vec<(i32, i32, PathBuf)> = self.map_tiles().into_iter().map(|(_, x, y, p)| (x, y, p)).collect();
+        navigation_map_of(&self.root, &tiles, &self.chrono_dirs.read())
     }
+}
 
+/// The same read with no `World` holding the caches, so that anything else that wants to
+/// know what a map has (the launcher's map picture) reads it the way the navigator does.
+/// `root` is the installation the map belongs to: what its tiles name - a `.sli`, a `.sco`
+/// and the model beside it - is resolved against it, so a mod's own copy wins over the
+/// original's and a map that lacks one borrows the other installation's (`omsi_cfg::
+/// resolve_path`).
+pub fn navigation_map_of(root: &Path, tiles: &[(i32, i32, PathBuf)], chrono_dirs: &[PathBuf]) -> NavigationMap {
+    use rayon::prelude::*;
+    let t0 = std::time::Instant::now();
+    let scos: Mutex<HashMap<String, Option<Arc<SceneryObject>>>> = Mutex::new(HashMap::new());
+    let sco_of = |file: &str| -> Option<Arc<SceneryObject>> {
+        let key = file.trim().to_ascii_lowercase().replace('\\', "/");
+        if let Some(v) = scos.lock().get(&key) {
+            return v.clone();
+        }
+        let v = SceneryObject::load(&omsi_cfg::resolve_path(root, file)).ok().map(Arc::new);
+        scos.lock().insert(key, v.clone());
+        v
+    };
+    let slis: Mutex<HashMap<String, Option<Arc<Spline>>>> = Mutex::new(HashMap::new());
+    let sli_of = |file: &str| -> Option<Arc<Spline>> {
+        // (the navigator loads `.sli` through `World::spline_type` with the same two calls)
+        let key = file.trim().to_ascii_lowercase().replace('\\', "/");
+        if let Some(v) = slis.lock().get(&key) {
+            return v.clone();
+        }
+        let v = Spline::load(&omsi_cfg::resolve_path(root, file)).ok().map(|def| {
+            omsi_geometry::register_half_cant_width(file, &def);
+            Arc::new(def)
+        });
+        slis.lock().insert(key, v.clone());
+        v
+    };
+    #[allow(clippy::type_complexity)]
+    let parts: Vec<(Vec<Lane>, Vec<(i64, DVec3)>, Vec<(DVec3, f64, String)>, Vec<(Vec<DVec3>, f32)>)> = tiles
+        .par_iter()
+        .map(|(tx, ty, path)| {
+            let (tx, ty) = (*tx, *ty);
+            let mut lanes = Vec::new();
+            let mut positions = Vec::new();
+            let mut signs = Vec::new();
+            let mut roads = Vec::new();
+            let Some(tile) = crate::tiles::read_tile(path, chrono_dirs) else {
+                return (lanes, positions, signs, roads);
+            };
+            let origin2 = DVec2::new(tx as f64 * tile_size(), ty as f64 * tile_size());
+            let terrain = Terrain::load(&tile_companion(&path, ".terrain")).unwrap_or_else(|_| Terrain::flat());
+            for sp in tile.splines.iter().filter(|s| !s.deleted && !s.file.trim().is_empty()) {
+                let Some(def) = sli_of(&sp.file) else { continue };
+                if !def.paths.iter().any(|p| p.kind == 0) {
+                    // Short surfaces also corroborate editor-only traffic paths at
+                    // junctions; the navigator filters decorative patches for display.
+                    if sp.length >= 2.0 {
+                        let curve = SplineCurve::from_map(sp, origin2).with_sli(&def);
+                        let n = ((curve.length / 4.0).ceil() as usize).clamp(1, 400);
+                        let side = if sp.mirror { -1.0 } else { 1.0 };
+                        for (lo, hi, z) in road_sections(&sp.file, &def) {
+                            let offset = side * ((lo + hi) * 0.5) as f64;
+                            let pts: Vec<DVec3> = (0..=n).map(|k| curve.offset_point(curve.length * k as f64 / n as f64, offset, z as f64)).collect();
+                            roads.push((pts, hi - lo));
+                        }
+                    }
+                }
+                if def.paths.is_empty() {
+                    continue;
+                }
+                let curve = SplineCurve::from_map(sp, origin2);
+                let mut new_lanes = spline_lanes(&def, sp, &curve, (tx, ty));
+                for l in new_lanes.iter_mut() {
+                    l.invisible = def.only_editor;
+                }
+                lanes.extend(new_lanes);
+            }
+            for o in &tile.objects {
+                if o.file.trim().is_empty() {
+                    continue;
+                }
+                let (x, y) = (origin2.x + o.pos[0], origin2.y + o.pos[1]);
+                let ground = || {
+                    let (lx, ly) = ((x - origin2.x).clamp(0.0, tile_size()) as f32, (y - origin2.y).clamp(0.0, tile_size()) as f32);
+                    terrain.sample(lx, ly) as f64
+                };
+                // street name signs carry the street's name as their text
+                if is_street_sign(&o.file) {
+                    if let Some(name) = o.extra.first().map(|t| t.trim()).filter(|t| t.chars().filter(|c| c.is_alphabetic()).count() >= 3) {
+                        signs.push((DVec3::new(x, y, o.pos[2] + ground()), o.rot[0], name.to_string()));
+                    }
+                }
+                let Some(sco) = sco_of(&o.file) else {
+                    positions.push((o.id, DVec3::new(x, y, o.pos[2] + ground())));
+                    continue;
+                };
+                let absolute = sco.absolute_height();
+                let pos = DVec3::new(x, y, if absolute { o.pos[2] } else { o.pos[2] + ground() });
+                positions.push((o.id, pos));
+                if !sco.paths.is_empty() {
+                    lanes.extend(object_lanes(&sco, pos, [o.rot[0], 0.0, 0.0], None, (tx, ty), o.id, &o.rules));
+                }
+            }
+            (lanes, positions, signs, roads)
+        })
+        .collect();
+    let mut lanes = Vec::new();
+    let mut positions = HashMap::new();
+    let mut signs = Vec::new();
+    let mut roads = Vec::new();
+    for (l, p, s, r) in parts {
+        lanes.extend(l);
+        positions.extend(p);
+        signs.extend(s);
+        roads.extend(r);
+    }
+    log::info!("navigation map: {} roads without a path for cars", roads.len());
+    log::info!(
+        "navigation map: {} tiles, {} lanes, {} objects placed, {} street name signs, {} object types, {} spline types, {:.1} s",
+        tiles.len(),
+        lanes.len(),
+        positions.len(),
+        signs.len(),
+        scos.lock().len(),
+        slis.lock().len(),
+        t0.elapsed().as_secs_f64()
+    );
+    NavigationMap { lanes, road_surfaces: roads, places: positions, signs }
+}
+
+impl World {
     /// Every tile of global.cfg's `[map]` list whose file exists, with its index in that list
     /// (repeaters and timetable tracks name a tile by that index).
     pub fn map_tiles(&self) -> Vec<(usize, i32, i32, PathBuf)> {
@@ -3501,30 +3683,50 @@ impl World {
     /// streamed in gets exactly the ground and the cut a whole-map load gives it.
     pub fn prepare_tiles(&self, tiles: &[(i32, i32, PathBuf)]) -> (Vec<Prepared>, LoadStats) {
         let _preparation = self.preparation.read();
-        self.prepare_tiles_inner(tiles)
+        self.prepare_tiles_impl(tiles, false)
     }
 
-    /// A queued worker may start after a date/season reset. Check its source
-    /// generation under the preparation gate before it can repopulate caches.
+    /// Prepare the initial area with bounded diagnostics under the same cache gate.
+    pub fn prepare_tiles_initial(&self, tiles: &[(i32, i32, PathBuf)]) -> (Vec<Prepared>, LoadStats) {
+        let _preparation = self.preparation.read();
+        self.prepare_tiles_impl(tiles, true)
+    }
+
+    /// Reject queued work from before a date/season reset before it repopulates caches.
     pub(crate) fn prepare_tiles_for_generation(
         &self,
         tiles: &[(i32, i32, PathBuf)],
         generation: u64,
     ) -> (Vec<Prepared>, LoadStats) {
-        let preparation = self.preparation.read();
-        if *preparation != generation {
-            return Default::default();
-        }
-        self.prepare_tiles_inner(tiles)
+        self.prepare_tiles_for_generation_diagnostic(tiles, generation, false)
     }
 
-    fn prepare_tiles_inner(&self, tiles: &[(i32, i32, PathBuf)]) -> (Vec<Prepared>, LoadStats) {
+    pub(crate) fn prepare_tiles_for_generation_diagnostic(
+        &self,
+        tiles: &[(i32, i32, PathBuf)],
+        generation: u64,
+        initial_diag: bool,
+    ) -> (Vec<Prepared>, LoadStats) {
+        let preparation = self.preparation.read();
+        if *preparation != generation { return Default::default(); }
+        self.prepare_tiles_impl(tiles, initial_diag)
+    }
+
+    fn prepare_tiles_impl(&self, tiles: &[(i32, i32, PathBuf)], initial_diag: bool) -> (Vec<Prepared>, LoadStats) {
         let profile = omsi_cfg::env::var_os("OMSI_PROFILE").is_some();
         let t0 = std::time::Instant::now();
         let index = self.index();
         let layout = self.layout();
         let t1 = std::time::Instant::now();
         let keys: Vec<(i32, i32)> = tiles.iter().map(|t| (t.0, t.1)).collect();
+        if initial_diag {
+            log::info!(
+                "tile loading: first-area batch {} tile(s) {:?}: index/layout {:.2} s",
+                keys.len(),
+                keys,
+                (t1 - t0).as_secs_f64()
+            );
+        }
         // the batch needs the sources of every tile next to it (their placed surfaces go
         // into its cut)
         let mut wanted: Vec<(i32, i32)> = Vec::new();
@@ -3549,13 +3751,56 @@ impl World {
                 })
                 .collect()
         };
+        if initial_diag && !missing.is_empty() {
+            log::info!(
+                "tile loading: first-area batch needs {} staged dependency tile(s): {:?}",
+                missing.len(),
+                missing
+            );
+        }
         let fresh: Vec<((i32, i32), Arc<StagedTile>)> = missing
             .par_iter()
             .filter_map(|k| {
-                Some((
-                    *k,
-                    Arc::new(self.stage_tile(k.0, k.1, layout.paths.get(k)?, &index)),
-                ))
+                let path = layout.paths.get(k)?;
+                let started = std::time::Instant::now();
+                if initial_diag {
+                    log::info!(
+                        "tile loading: staging tile {},{} ({})",
+                        k.0,
+                        k.1,
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                }
+                let staged = Arc::new(self.stage_tile(k.0, k.1, path, &index));
+                let secs = started.elapsed().as_secs_f64();
+                if initial_diag {
+                    if secs >= 2.0 {
+                        log::warn!(
+                            "tile loading: slow stage tile {},{} ({}) took {:.2} s",
+                            k.0,
+                            k.1,
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            secs
+                        );
+                    } else {
+                        log::info!(
+                            "tile loading: staged tile {},{} ({}) in {:.2} s",
+                            k.0,
+                            k.1,
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            secs
+                        );
+                    }
+                } else if secs >= 5.0 {
+                    log::warn!(
+                        "tile streaming: staging tile {},{} ({}) took {:.2} s",
+                        k.0,
+                        k.1,
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        secs
+                    );
+                }
+                Some((*k, staged))
             })
             .collect();
         // what this batch works with, held here: the cache may drop entries meanwhile
@@ -3570,18 +3815,70 @@ impl World {
                 .collect()
         };
         let t2 = std::time::Instant::now();
+        if initial_diag {
+            log::info!(
+                "tile loading: first-area staging finished in {:.2} s ({} dependency tile(s) read now)",
+                (t2 - t1).as_secs_f64(),
+                missing.len()
+            );
+        }
         let stats = Mutex::new(LoadStats {
             tiles: tiles.len(),
             ..Default::default()
         });
         let mut prepared: Vec<Prepared> = keys
             .par_iter()
-            .filter_map(|k| self.place_tile(*k, &staged, &layout, &stats))
+            .filter_map(|k| {
+                let started = std::time::Instant::now();
+                if initial_diag {
+                    log::info!("tile loading: placing tile {},{}", k.0, k.1);
+                }
+                let out = self.place_tile(*k, &staged, &layout, &stats);
+                let secs = started.elapsed().as_secs_f64();
+                if initial_diag {
+                    if secs >= 2.0 {
+                        log::warn!("tile loading: slow place tile {},{} took {:.2} s", k.0, k.1, secs);
+                    } else {
+                        log::info!("tile loading: placed tile {},{} in {:.2} s", k.0, k.1, secs);
+                    }
+                } else if secs >= 5.0 {
+                    log::warn!("tile streaming: placing tile {},{} took {:.2} s", k.0, k.1, secs);
+                }
+                out
+            })
             .collect();
         let t3 = std::time::Instant::now();
+        if initial_diag {
+            log::info!(
+                "tile loading: first-area placement finished in {:.2} s; cutting terrain/textures",
+                (t3 - t2).as_secs_f64()
+            );
+        }
         self.cut_terrain(&mut prepared, &staged, &layout);
-        if profile {
-            log::info!("prepare {} tiles ({} staged, {} read now): index {:.2} s, read {:.2} s, place {:.2} s, cut + textures {:.2} s", tiles.len(), staged.len(), missing.len(), (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), (t3 - t2).as_secs_f64(), t3.elapsed().as_secs_f64());
+        let cut_secs = t3.elapsed().as_secs_f64();
+        if initial_diag {
+            let total = t0.elapsed().as_secs_f64();
+            if total >= 2.0 {
+                log::warn!(
+                    "tile loading: first-area batch prepared in {:.2} s: index/layout {:.2}, stage {:.2}, place {:.2}, cut/textures {:.2}",
+                    total,
+                    (t1 - t0).as_secs_f64(),
+                    (t2 - t1).as_secs_f64(),
+                    (t3 - t2).as_secs_f64(),
+                    cut_secs
+                );
+            } else {
+                log::info!(
+                    "tile loading: first-area batch prepared in {:.2} s: index/layout {:.2}, stage {:.2}, place {:.2}, cut/textures {:.2}",
+                    total,
+                    (t1 - t0).as_secs_f64(),
+                    (t2 - t1).as_secs_f64(),
+                    (t3 - t2).as_secs_f64(),
+                    cut_secs
+                );
+            }
+        } else if profile {
+            log::info!("prepare {} tiles ({} staged, {} read now): index {:.2} s, read {:.2} s, place {:.2} s, cut + textures {:.2} s", tiles.len(), staged.len(), missing.len(), (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), (t3 - t2).as_secs_f64(), cut_secs);
         }
         let stats = stats.into_inner();
         (prepared, stats)
@@ -3695,7 +3992,12 @@ impl World {
     fn stage_tile(&self, tx: i32, ty: i32, path: &Path, index: &MapIndex) -> StagedTile {
         let origin2 = DVec2::new(tx as f64 * tile_size(), ty as f64 * tile_size());
         let origin = DVec3::new(origin2.x, origin2.y, 0.0);
-        let terrain_path = tile_companion(path, ".terrain");
+        let tile = crate::tiles::read_tile(path, &self.chrono_dirs.read());
+        // (an active chrono patch may bring the tile's terrain: see `Tile::terrain_from`)
+        let terrain_path = match &tile {
+            Some(t) => crate::tiles::terrain_file(t, path),
+            None => tile_companion(path, ".terrain"),
+        };
         let edited = self.terrain_edits.lock().get(&(tx, ty)).cloned();
         let base_terrain = edited.unwrap_or_else(|| Terrain::load(&terrain_path).unwrap_or_else(|_| Terrain::flat()));
         let counts = Mutex::new(LoadStats::default());
@@ -3718,7 +4020,7 @@ impl World {
             counts: LoadStats::default(),
             resolved: std::sync::OnceLock::new(),
         };
-        let Some(tile) = crate::tiles::read_tile(path, &self.chrono_dirs.read()) else {
+        let Some(tile) = tile else {
             return out;
         };
         // a tile with water carries one surface with a height at each corner. As in Omsi.exe
@@ -3727,7 +4029,7 @@ impl World {
         // -5 m (TFileWater 0x7ab6f0) and take the file's heights only when its count is 1
         // (0x7ab760).
         out.water = tile.has_water.then(|| {
-            match omsi_cfg::vfs::read(&PathBuf::from(format!("{}.water", path.display())))
+            match omsi_cfg::vfs::read(&crate::tiles::water_file(&tile, path))
                 .ok()
                 .map(|b| omsi_map::terrain::Water::parse(&b))
             {
@@ -3777,7 +4079,7 @@ impl World {
                 let hp = omsi_geometry::build_height_profile_mesh(&st.def, &curve, s.mirror, origin);
                 if !hp.is_empty() {
                     let b = mesh_bounds(&hp, &Mat4::IDENTITY, origin);
-                    out.drive.push((hp, b));
+                    out.drive.push((hp, b, None));
                 }
             }
             let mesh = build_spline_mesh(&st.def, &curve, s.mirror, origin);
@@ -3855,7 +4157,7 @@ impl World {
                 };
                 // (every spline the game draws: Omsi.exe asks them all, roads or not)
                 if !heightprofile_ground() {
-                    out.drive.push((shape.clone(), bounds));
+                    out.drive.push((shape.clone(), bounds, omsi_geometry::SurfFaces::of(&mesh, &st.surf)));
                 }
                 let drivable = st.def.paths.iter().any(|pd| pd.kind == 0 || pd.kind == 1);
                 let overlay = !st.def.profiles.is_empty()
@@ -3909,6 +4211,8 @@ impl World {
                     .unwrap_or(false)
         };
         // [object]
+        let debug_outside = omsi_cfg::env::var_os("OMSI_DEBUG_OBJECTS").is_some();
+        let mut outside = 0usize;
         for o in &tile.objects {
             if !wanted(&o.file) {
                 continue;
@@ -3919,6 +4223,21 @@ impl World {
             // Objects with traffic paths (crossings, switches, road pieces) are stored with
             // absolute heights like the splines themselves; so are [absheight] ones.
             let absolute = ot.sco.absolute_height();
+            // An object that stands on the terrain but lies outside its own tile is never
+            // seen in OMSI: Omsi.exe finds its height with a ray from 1000 m down onto that
+            // tile's terrain mesh only (0x79e43d -> 0x7ab594), and where the ray misses the
+            // mesh it answers 10000 m more, which puts the object 11 km under the ground.
+            // Maps copied from a `[worldcoordinates]` map keep such leftovers (Ahlheim's
+            // Bostoner Weg: 588 objects past the edge, redrawn by the author where they
+            // belong), and drawn they stood as houses and bushes in the road (#787).
+            let edge = tile_size() + 1e-3;
+            if !absolute && !((-1e-3..=edge).contains(&o.pos[0]) && (-1e-3..=edge).contains(&o.pos[1])) {
+                if outside == 0 || debug_outside {
+                    log::info!("object {} id {} at ({:.1}, {:.1}) lies outside tile ({tx}, {ty}): not shown, as in OMSI", o.file, o.id, o.pos[0], o.pos[1]);
+                }
+                outside += 1;
+                continue;
+            }
             let (x, y) = (origin2.x + o.pos[0], origin2.y + o.pos[1]);
             let place = if absolute {
                 // On a `[worldcoordinates]` map the tile's splines are stretched onto the
@@ -3952,6 +4271,9 @@ impl World {
                 instance: 0,
                 key: o.id,
             });
+        }
+        if outside > 1 {
+            log::info!("tile ({tx}, {ty}): {outside} objects lie outside the tile and are not shown, as in OMSI");
         }
         // [attachObj]
         for o in &tile.attach_objects {
@@ -5009,7 +5331,12 @@ impl World {
                         Some(p) => log::info!("traffic light {} (id {}) at ({:.0}, {:.0}): crossing {p}, light {:?}", ot.sco.path.display(), o.id, pos.x, pos.y, o.extra),
                     }
                 }
-                o.lamp_parent.map(|p| (p, index, named.is_none()))
+                // (a signal that names no crossing - Korean maps fix pedestrian heads to a
+                // road spline without a [varparent] - is a lamp all the same: its lenses
+                // follow [visible]/[alphascale] on the dummy phase every unlinked object
+                // reads, see `UNLINKED_PHASE`; drawn as plain scenery, the red and the green
+                // man were both lit all the time, #988)
+                Some((o.lamp_parent.unwrap_or(NO_CROSSING), index, named.is_none()))
             } else {
                 None
             };
@@ -5290,11 +5617,12 @@ impl World {
                         );
                     }
                     // what the wheels roll on: the splines' height profiles
-                    for (hp, b) in &q.drive {
+                    for (hp, b, surf) in &q.drive {
                         if !outside(b) {
-                            ts.add_height_profiles(
+                            ts.add_spline_drive(
                                 hp,
-                                scenery_draw_position(q.origin, true),
+                                surf.as_ref(),
+                                q.origin,
                                 tx,
                                 ty,
                             );
@@ -5387,12 +5715,17 @@ impl World {
                             });
                             ts.rasterize_kind(mesh, &pose.rot, pose.pos, tx, ty, true);
                             if Some(k) == ground_mesh {
-                                ts.add_drive_mesh(
+                                // (its textures' `.surf` maps: cobbled junctions shake the bus too)
+                                let dirs = texture_dirs(&self.root, &ot.model_dir);
+                                let dirs: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
+                                let maps: Vec<_> = ot.meshes.get(k).map(|m| m.1.iter().map(|m| surf_map(&m.texture, &dirs)).collect()).unwrap_or_default();
+                                ts.add_drive_mesh_surf(
                                     mesh,
                                     &pose.rot,
-                                    scenery_draw_position(pose.pos, true),
+                                    pose.pos,
                                     tx,
                                     ty,
+                                    omsi_geometry::SurfFaces::of(mesh, &maps).as_ref(),
                                 );
                                 wheel_meshes += 1;
                             }
@@ -5975,7 +6308,26 @@ impl World {
                 // A separate transmap is a mask, not an automatic instruction to make the
                 // whole material transparent. Opaque body panels must stay opaque unless the
                 // model's `[matl_alpha]` or a material override explicitly says otherwise.
-                let alpha = alpha;
+                // A declared blend on a texture without alpha is opaque, as the splines take
+                // it, for a ground-layer object (`[rendertype] surface` / `on_surface`): the
+                // surface phases draw a blend without writing depth, so every spline after
+                // it showed through - the far roads and a bridge over NCCR's apartment
+                // blocks (`[matl_alpha] 2` on a 24-bit BMP), Westcountry's road signs. In
+                // Omsi.exe such a blend writes depth and its alpha is 1 throughout, the same
+                // picture. (Not with a transmap, an `[alphascale]` or a texture with alpha.)
+                let surface_phase = matches!(
+                    ot.sco.render_type,
+                    omsi_scenery::sco::RenderType::Surface | omsi_scenery::sco::RenderType::OnSurface
+                );
+                let faded = slot_ov.iter().any(|o| o.alphascale.as_ref().is_some_and(|v| !v.trim().is_empty()));
+                let alpha = if alpha == AlphaMode::Blend && surface_phase && tex.is_some() && transmap.is_none() && !faded && {
+                    let dirs_ref: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
+                    omsi_texture::find_texture(&m.texture, &dirs_ref).is_some_and(|p| gpu.textures.get(&p).is_some_and(|e| !e.alpha))
+                } {
+                    AlphaMode::Opaque
+                } else {
+                    alpha
+                };
                 // [matl_envmap]: the same reflection rule as on vehicles (factor x mask; a
                 // texture without an alpha channel reads as a full mask)
                 let envmap = match slot_ov.iter().find_map(|o| o.envmap.clone()) {
@@ -6586,10 +6938,9 @@ impl World {
                         scene.meshes[id].source = Some("terrain-mapped spline cells".to_string());
                         tg.meshes.push(id);
                         if let Some(mat) = pl.terrain_mapping_mat {
-                            let si = instance!(renderer.add_surface_instance(scene, id, p.origin, Mat4::from_translation(glam::Vec3::Z * OMSI_SURFACE_LIFT), vec![mat]));
+                            let si = instance!(renderer.add_surface_instance(scene, id, p.origin, Mat4::IDENTITY, vec![mat]));
                             if let Some(inst) = scene.instances.get_mut(si) {
                                 inst.render_phase = RenderPhase::Spline;
-                                inst.surface_bias = false;
                             }
                         }
                         done_some = true;
@@ -6698,12 +7049,11 @@ impl World {
                                 scene,
                                 gid,
                                 p.origin,
-                                Mat4::from_translation(glam::Vec3::Z * OMSI_SURFACE_LIFT),
+                                Mat4::IDENTITY,
                                 vec![mat],
                             ));
                             if let Some(inst) = scene.instances.get_mut(terrain_instance) {
                                 inst.render_phase = RenderPhase::Spline;
-                                inst.surface_bias = false;
                                 inst.blend_sort_origin = Some(*sort_origin);
                             }
                         }
@@ -6711,16 +7061,20 @@ impl World {
                     };
                     tg.meshes.push(id);
                     scene.meshes[id].source = Some(st.def.path.display().to_string());
+                    // Drawn where the map puts it and drawn over the ground by the surfaces'
+                    // depth bias, as a road wins over flush ground in Omsi.exe. Lifted 8 cm
+                    // instead, it stood over the ground the editor had aligned to it (the
+                    // footways of Spandau's Hansastr. lie at the ground's height), and under
+                    // every kerb and footway edge one saw into the hole cut beneath it (#823).
                     let si = instance!(renderer.add_surface_instance(
                         scene,
                         id,
                         p.origin,
-                        Mat4::from_translation(glam::Vec3::Z * OMSI_SURFACE_LIFT),
+                        Mat4::IDENTITY,
                         mats
                     ));
                     if let Some(inst) = scene.instances.get_mut(si) {
                         inst.render_phase = RenderPhase::Spline;
-                        inst.surface_bias = false;
                         inst.blend_sort_origin = Some(*sort_origin);
                     }
                     // a bridge deck or an elevated railway casts a sun shadow (see
@@ -6822,7 +7176,6 @@ impl World {
                         !matches!(ot.sco.render_type, omsi_scenery::sco::RenderType::Normal)
                             || ot.sco.surface;
                     let render_phase = scenery_render_phase(ot.sco.render_type);
-                    let draw_pos = scenery_draw_position(pos, drawn_on_surfaces(&ot.sco));
                     let has_lower = !type_lods.is_empty();
                     let mut lamp_instances = Vec::new();
                     let mut lamp_slots = Vec::new();
@@ -6955,23 +7308,22 @@ impl World {
                             let i = instance!(renderer.add_surface_instance(
                                 scene,
                                 *mesh_id,
-                                draw_pos,
+                                pos,
                                 xf,
                                 mats.clone()
                             ));
                             i
                         } else {
-                            let i = instance!(renderer.add_instance(scene, *mesh_id, draw_pos, xf, mats.clone()));
+                            let i = instance!(renderer.add_instance(scene, *mesh_id, pos, xf, mats.clone()));
                             renderer.set_omsi_caster(scene, i, ot.mesh_casts.get(mi).copied().unwrap_or(false));
                             i
                         };
                         if let Some(inst) = scene.instances.get_mut(inst) {
                             inst.render_phase = render_phase;
                             if surface {
-                                // The authored OMSI phase and fixed `[surface]` lift replace
-                                // camera-angle-sensitive bias for these road-layer meshes.
+                                // an object lying on the road (a crossing, markings, a zebra)
+                                // goes over the splines it overlaps
                                 inst.decal = true;
-                                inst.surface_bias = false;
                             }
                         }
                         // Scenery signs use [matl_freetex] with a string from the map
@@ -7188,16 +7540,13 @@ impl World {
                         // author painted asphalt or another layer on the terrain below it.
                         if let Some(mat) = pl.terrain_mapping_mat {
                             let inst = if surface {
-                                instance!(renderer.add_surface_instance(scene, ground_id, draw_pos, xf, vec![mat]))
+                                instance!(renderer.add_surface_instance(scene, ground_id, pos, xf, vec![mat]))
                             } else {
-                                instance!(renderer.add_instance(scene, ground_id, draw_pos, xf, vec![mat]))
+                                instance!(renderer.add_instance(scene, ground_id, pos, xf, vec![mat]))
                             };
                             if let Some(x) = scene.instances.get_mut(inst) {
                                 x.decal = surface;
                                 x.render_phase = render_phase;
-                                if surface {
-                                    x.surface_bias = false;
-                                }
                             }
                             if let Some((lo, hi)) = range {
                                 renderer.set_lod_range(scene, inst, lo, hi);
@@ -7784,7 +8133,7 @@ impl World {
                     continue;
                 }
                 let atlas = self.fonts.lock().get(&tt.font, &|p| omsi_texture::decode_file(p).ok().map(|i| (i.width, i.height, i.rgba)));
-                let image = scenery_text_image(tt, atlas, &text);
+                let image = helper_text_image(tt, atlas.as_deref(), &text).unwrap_or_else(|| scenery_text_image(tt, atlas, &text));
                 let tex = gpu.add_image(renderer, scene, &image, true);
                 let mat = renderer.add_material(scene, Some(tex), alpha, [1.0; 4], false);
                 let mat = gpu.material(renderer, scene, mat);
@@ -8107,7 +8456,7 @@ impl World {
                 .iter()
                 .map(|s| s.shape.heap_bytes())
                 .sum::<usize>()
-                + st.drive.iter().map(|d| d.0.heap_bytes()).sum::<usize>()
+                + st.drive.iter().map(|d| d.0.heap_bytes() + d.2.as_ref().map_or(0, |s| s.heap_bytes())).sum::<usize>()
                 + st.base_terrain.heights.capacity() * 4;
             staged_bytes += st
                 .meshes
@@ -9077,6 +9426,7 @@ impl World {
         // threads (a city's hundreds of scripted objects took a core's worth of a frame),
         // then what they did, in order again.
         let mut inputs: Vec<Option<omsi_sim::scenery::SceneryVars>> = Vec::with_capacity(scripted.len());
+        let controllers = self.controller_of_object.lock();
         for o in scripted.iter_mut() {
             let dist = (o.pos - center).length();
             if dist > 800.0 {
@@ -9094,7 +9444,7 @@ impl World {
             let vars = omsi_sim::scenery::SceneryVars {
                 nightlight: use_.lit(now.time, day, brightness) as i32 as f32,
                 in_use: in_use as i32 as f32,
-                traffic_light_phase: controller.map(|c| phase_of(c, light_index).0).unwrap_or(-1.0),
+                traffic_light_phase: controller.map(|c| phase_of(c, light_index).0).unwrap_or(omsi_sim::traffic::UNLINKED_PHASE as f32),
                 traffic_light_approach: controller.map(|c| phase_of(c, light_index).1).unwrap_or(0.0),
                 switch: None,
             };
@@ -9146,6 +9496,7 @@ impl World {
             }
             inputs.push(Some(vars));
         }
+        drop(controllers);
         {
             use rayon::prelude::*;
             scripted.par_iter_mut().zip(inputs.par_iter()).for_each(|(o, vars)| {
@@ -9254,9 +9605,7 @@ impl World {
                 texture_updates.push((o.ty.clone(), selection, o.instances.clone(), switches));
             }
             for ((inst, xf), &visible) in o.instances.iter().zip(&o.inst.mesh_transforms).zip(&o.inst.mesh_visible) {
-                // Scripted tram switches keep the same world-space lift as on upload.
-                // `o.pos` is the authored pose used by scripts/physics, not the draw pose.
-                renderer.set_transform(scene, *inst, scenery_draw_position(o.pos, drawn_on_surfaces(&o.ty.sco)), o.xf * *xf);
+                renderer.set_transform(scene, *inst, o.pos, o.xf * *xf);
                 let p = &mut scene.instances[*inst];
                 if p.visible != visible {
                     renderer.set_params(scene, *inst, &[], visible, &[]);
@@ -9957,6 +10306,7 @@ fn material_extra(
     MaterialExtra {
         env_mask,
         no_z_write: ov.iter().any(|o| o.no_z_write),
+        writes_depth: false,
         // `[matl_noZcheck]` leaves Omsi.exe's depth test on: its draw of the slot (0x7fd6c4)
         // never reads the flag, which only adds a colourless stencil pass marking the panes
         // for the raindrops (0x7c32c4 -> 0x7fc58c, ZENABLE 1, blend ZERO/ONE). Taken as "no
@@ -10140,6 +10490,54 @@ fn scenery_text_image(
     }
 }
 
+/// The text of one of the game's own helper objects (the route arrows' street and stop
+/// names) that its `.oft` font cannot draw: the stock arrows ask for the font "test"
+/// (`Fonts/test1.oft`), which has the Latin letters and German umlauts only, so a street
+/// or a stop named in Cyrillic (or Greek, Chinese ...) came out as an empty arrow - at
+/// most a stray `Ä` where a code page variant of `Д` happened to be in the font. Such a
+/// text is drawn with the interface font (Roboto, then the system's fonts for the
+/// scripts it lacks) in the texture's colour, the height of the `.oft` font's letters,
+/// centred, and narrowed to the texture's width. None when the font draws every letter:
+/// that text keeps OMSI's own look.
+fn helper_text_image(tt: &omsi_model::TextTexture, atlas: Option<&omsi_content::font::FontAtlas>, text: &str) -> Option<Image> {
+    let drawable = |c: char| c.is_whitespace() || atlas.is_some_and(|a| a.font.glyph(c).is_some());
+    if text.trim().is_empty() || text.chars().all(drawable) {
+        return None;
+    }
+    static FONTS: std::sync::OnceLock<omsi_ui::Fonts> = std::sync::OnceLock::new();
+    let fonts = FONTS.get_or_init(omsi_ui::Fonts::new);
+    let (w, h) = (tt.width.max(1) as u32, tt.height.max(1) as u32);
+    // (the .oft's line height holds its capitals and the gap below them; Roboto's capitals
+    // are 0.7 of its size, so nearly the line height gives letters of the same height)
+    let line = atlas.map(|a| a.font.height.max(8) as f32).unwrap_or(h as f32 * 0.2);
+    let px = (line * 0.95).min(h as f32);
+    let bmp = fonts.render(text.trim(), px, omsi_ui::Weight::Medium);
+    // too long for the texture: narrowed to fit (columns sampled), the height kept
+    let scale = (w as f32 / bmp.w as f32).min(1.0);
+    let out_w = ((bmp.w as f32 * scale).floor() as u32).max(1);
+    let x0 = (w - out_w.min(w)) / 2;
+    let y0 = (h as i32 - bmp.h as i32) / 2;
+    let rgb = if tt.full_color { [255u8; 3] } else { [tt.color[0] as u8, tt.color[1] as u8, tt.color[2] as u8] };
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for y in 0..bmp.h as i32 {
+        let dy = y0 + y;
+        if dy < 0 || dy >= h as i32 {
+            continue;
+        }
+        for x in 0..out_w.min(w) {
+            let sx = ((x as f32 + 0.5) / scale) as u32;
+            let a = bmp.alpha[(y as u32 * bmp.w + sx.min(bmp.w - 1)) as usize];
+            if a == 0 {
+                continue;
+            }
+            let i = ((dy as u32 * w + x0 + x) * 4) as usize;
+            rgba[i..i + 3].copy_from_slice(&rgb);
+            rgba[i + 3] = a;
+        }
+    }
+    Some(Image { width: w, height: h, rgba, has_alpha: true })
+}
+
 /// Identify a solid vehicle body material that should participate in the depth buffer.
 /// Some bus packs put either `[matl_alpha] 2` or `[matl_noZcheck]` on a complete body mesh.
 /// The decision must not depend on one creator's language or on a particular bus name:
@@ -10178,6 +10576,16 @@ fn is_vehicle_body_material(
         return false;
     }
     true
+}
+
+/// The texture whose alpha is a blended slot's coverage: its `[matl_transmap]` file where
+/// it has one (the diffuse alpha is then the reflection mask), else the diffuse texture. A
+/// script texture as the map (`\S:n`) is not known at load time: the diffuse texture then.
+fn coverage_texture<'a>(transmap: Option<&'a str>, diffuse: &'a str) -> &'a str {
+    match transmap.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) if !t.starts_with("\\S:") => t,
+        _ => diffuse,
+    }
 }
 
 /// Side of the square a texture's alpha is kept at for [`slot_is_see_through`].
@@ -10893,9 +11301,9 @@ fn vehicle_texture_names(
         }
         for o in &vm.overrides {
             for name in [
-                o.nightmap.clone(),
+                o.nightmap.clone().map(|t| subst(&t)),
                 o.transmap.clone().map(|t| subst(&t)),
-                o.lightmap.clone().map(|l| l.0),
+                o.lightmap.clone().map(|l| subst(&l.0)),
                 o.envmap.clone().map(|e| e.0),
                 o.envmap_mask
                     .clone()
@@ -11333,6 +11741,15 @@ impl World {
         } else {
             (self.textures.get_gpu_path(&path)?, false)
         };
+        // (one to be swapped for its compressed whole goes up at half its size meanwhile, as
+        // the scenery's do: an articulated bus of big PNG and TGA textures put up whole as
+        // RGBA took gigabytes for a moment, and a card with 3 GB lost its device while the
+        // bus was loading, every start again, #921)
+        let img = if worth {
+            Arc::new(omsi_texture::gpu::halved_for_now(Arc::try_unwrap(img).unwrap_or_else(|a| (*a).clone())))
+        } else {
+            img
+        };
         let id = {
             let mut gpu = self.gpu.lock();
             let id = gpu.add_data(renderer, scene, &img);
@@ -11688,7 +12105,7 @@ impl World {
                 .iter()
                 .filter_map(|(_, _, slot)| inst.materials.get(*slot as usize))
                 .filter_map(|&m| scene.materials.get(m))
-                .map(|m| (m.alpha, !m.no_z_write && !m.no_z_check))
+                .map(|m| (m.alpha, (!m.no_z_write || m.writes_depth) && !m.no_z_check))
                 .collect()
         };
         let mut blended_first = false;
@@ -11857,6 +12274,7 @@ impl World {
                         // looking for it on disk only produced a false "texture not found"
                         None
                     } else if let Some(mi) = mirror_index(&tex_name) {
+                        self.note_mirror_aspect(mi, &vm.data, slot);
                         Some(self.mirror_texture(renderer, scene, mi))
                     } else if rain_layer && snowing() && !seasonal_texture(&tex_name, &dirs_ref) {
                         tex!("", &dirs_ref, snow_glass_texture)
@@ -11925,9 +12343,16 @@ impl World {
                     // (a tilting window): taken for bodywork they wrote their depth, and the
                     // glow of every lamp and the lit lenses of the traffic lights behind them
                     // were gone - seen only through an opened window.
+                    // The alpha that says so is the [matl_transmap]'s where the slot has one:
+                    // the diffuse alpha is then only the reflection mask (the stock Golf 2's
+                    // body texture is 0 almost everywhere, its transmap opaque). Read from
+                    // the diffuse texture, every transmapped car body wrote no depth, and its
+                    // wheel arches, far wheels and interior drawn after it showed through the
+                    // paint (#928, #932).
+                    let coverage_tex = subst(coverage_texture(ov.iter().find_map(|o| o.transmap.as_deref()), &m.texture));
                     let see_through = !named_pane
                         && declared_alpha == AlphaMode::Blend
-                        && omsi_texture::find_texture(&subst(&m.texture), &dirs_ref).and_then(|p| alpha_mask(&p)).is_some_and(|mask| slot_is_see_through(&vm.data, slot, &mask));
+                        && omsi_texture::find_texture(&coverage_tex, &dirs_ref).and_then(|p| alpha_mask(&p)).is_some_and(|mask| slot_is_see_through(&vm.data, slot, &mask));
                     if see_through {
                         log::debug!("  {} slot {slot} '{}': see-through by its texture's alpha, writes no depth", def.file, m.texture);
                     }
@@ -11975,16 +12400,20 @@ impl World {
                     if omsi_cfg::env::var_os("OMSI_FORCE_OPAQUE").is_some() && !dirt_overlay {
                         alpha = AlphaMode::Opaque;
                     }
+                    // (a night or light map named as a [CTCTexture] is the paint scheme's
+                    // picture as well, like the diffuse texture and the transparency map:
+                    // looked up by the model's own name, a destination display lit by its own
+                    // texture glowed with the model's default text over the repaint's, #895)
                     let night = ov.iter().find_map(|o| o.nightmap.clone()).and_then(|t| {
-                        tex!(&t, &dirs_ref)
+                        tex!(&subst(&t), &dirs_ref)
                     });
                     let lightmap = ov.iter().find_map(|o| o.lightmap.clone()).and_then(|(t, _)| {
-                        tex!(&t, &dirs_ref)
+                        tex!(&subst(&t), &dirs_ref)
                     });
                     // (a `\S:n` panel lit all over by its light map is an LED panel; one
                     // whose light map is a picture is a flipdot: see `is_white_lightmap`)
                     let lm_white = |ov: &[&MaterialDef]| -> bool {
-                        ov.iter().find_map(|o| o.lightmap.as_ref()).and_then(|(t, _)| lightmap_is_white(t, &dirs_ref)).unwrap_or(true)
+                        ov.iter().find_map(|o| o.lightmap.as_ref()).and_then(|(t, _)| lightmap_is_white(&subst(t), &dirs_ref)).unwrap_or(true)
                     };
                     // [matl_envmap] tex factor: reflectivity = factor (saturating at 1) x the
                     // reflection mask, which is the [matl_envmap_mask]'s alpha or else the
@@ -12039,7 +12468,13 @@ impl World {
                     // though their alpha mode is Blend. They are transparent colour layers,
                     // not solid shadow casters; letting them into the shadow map paints the
                     // bus shadow with the pane/film texture (the striped triangular artifact).
+                    // (Its depth is still written as Omsi.exe writes it, whenever the model
+                    // blends the slot by [matl_alpha] 2 without [matl_noZwrite] - a dirt
+                    // film's as well: see `MaterialExtra::writes_depth`. Left out of the
+                    // depth buffer, the stacked panes of a door blended over each other
+                    // whichever lay in front, #211.)
                     if (transparent_layer_hint || see_through) && alpha == AlphaMode::Blend {
+                        extra.writes_depth = declared_alpha == AlphaMode::Blend && !ov.iter().any(|o| o.no_z_write) && !def.is_shadow;
                         extra.no_z_write = true;
                     }
                     // Name the pane explicitly for the shader. A plain blended window has
@@ -12092,8 +12527,8 @@ impl World {
                     };
                     let mut item_look = |ov_item: &Vec<&MaterialDef>| -> Look {
                         let mut find_tex = |t: &str| -> Option<TextureId> { tex!(t, &dirs_ref) };
-                        let it_night = ov_item.iter().find_map(|o| o.nightmap.clone()).and_then(|t| find_tex(&t)).or(night);
-                        let it_light = ov_item.iter().find_map(|o| o.lightmap.clone()).and_then(|(t, _)| find_tex(&t)).or(lightmap);
+                        let it_night = ov_item.iter().find_map(|o| o.nightmap.clone()).and_then(|t| find_tex(&subst(&t))).or(night);
+                        let it_light = ov_item.iter().find_map(|o| o.lightmap.clone()).and_then(|(t, _)| find_tex(&subst(&t))).or(lightmap);
                         // the item's own transparency map, else the plain material's
                         let it_script_trans = match ov_item.iter().find_map(|o| o.transmap.clone()) {
                             Some(t) => t.trim().strip_prefix("\\S:").and_then(|n| n.trim().parse::<usize>().ok()),
@@ -12192,7 +12627,7 @@ impl World {
                         let list = ov.iter().map(|o| &o.lightmaps).find(|l| !l.is_empty())?;
                         let maps: Vec<(PathBuf, String)> = list
                             .iter()
-                            .filter_map(|(t, v)| omsi_texture::find_texture(t, &dirs_ref).map(|p| (p, v.clone())))
+                            .filter_map(|(t, v)| omsi_texture::find_texture(&subst(t), &dirs_ref).map(|p| (p, v.clone())))
                             .collect();
                         (maps.len() >= 2 && maps.len() <= 8).then(|| MultiLight {
                             maps,
@@ -12384,6 +12819,8 @@ fn spline_lanes(
     out
 }
 
+/// The crossing light a placed child names (see `ScriptedObject::light_parent`): its
+/// `[varparent]` is a crossing whose program runs and its first string a light index.
 fn light_child_of(crossings: &hashbrown::HashSet<i64>, var_parent: Option<i64>, strings: &[String]) -> Option<(i64, usize)> {
     let parent = var_parent.filter(|p| crossings.contains(p))?;
     if !crate::tiles::names_traffic_light(strings) {
@@ -12555,6 +12992,39 @@ pub(crate) fn resolve_scenery_freetex_name<'a>(
 mod tests {
     use super::*;
 
+    /// A route arrow's Cyrillic street name with the stock Latin-only "test" font: drawn
+    /// with the interface font (it was an empty texture); a Latin one keeps the .oft.
+    #[test]
+    fn a_helper_text_the_font_cannot_draw_comes_from_the_interface_font() {
+        use omsi_content::font::{Font, FontAtlas, FontChar};
+        // a Latin font with its umlauts (`Ä` is `Д` in code page 1251, so one Cyrillic
+        // letter alone is "in" the font)
+        let chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÄÖÜäöüß"
+            .chars()
+            .enumerate()
+            .map(|(k, ch)| FontChar { ch, x0: k as i32 * 4, x1: k as i32 * 4 + 3, y: 0 })
+            .collect();
+        let font = Font { path: PathBuf::new(), name: "test".into(), bitmap: String::new(), alpha: String::new(), height: 27, gap: 1, chars };
+        let (aw, ah) = (256u32, 32u32);
+        let atlas = FontAtlas::new(font, aw, ah, vec![255; (aw * ah * 4) as usize], vec![255; (aw * ah * 4) as usize]);
+        let tt = omsi_model::TextTexture { variable: "0".into(), font: "test".into(), width: 128, height: 128, full_color: false, color: [255.0, 0.0, 0.0], orientation: 0, grid: 1 };
+        assert!(helper_text_image(&tt, Some(&atlas), "Bauernhof").is_none());
+        assert!(helper_text_image(&tt, Some(&atlas), "  ").is_none());
+        for text in ["Улица Ленина", "Булевар ослобођења", "Δ"] {
+            let img = helper_text_image(&tt, Some(&atlas), text).unwrap_or_else(|| panic!("{text}: drawn with the .oft"));
+            assert_eq!((img.width, img.height), (128, 128));
+            let ink: Vec<usize> = (0..128 * 128).filter(|&p| img.rgba[p * 4 + 3] > 128).collect();
+            assert!(ink.len() > 40, "{text}: {} pixels", ink.len());
+            assert!(ink.iter().all(|&p| img.rgba[p * 4..p * 4 + 3] == [255, 0, 0]), "{text}: in the texture's colour");
+            // centred, and a long name narrowed into the texture
+            let rows: Vec<usize> = ink.iter().map(|p| p / 128).collect();
+            let (top, bottom) = (*rows.iter().min().unwrap(), *rows.iter().max().unwrap());
+            assert!(top > 40 && bottom < 88, "{text}: rows {top}..{bottom}");
+        }
+        // no font at all (missing from the installation): still readable
+        assert!(helper_text_image(&tt, None, "Bauernhof").is_some());
+    }
+
     #[test]
     fn nightlight_follows_the_objects_darkness_threshold() {
         let day = DayKind { workday: true, ..Default::default() };
@@ -12580,6 +13050,20 @@ mod tests {
         );
         assert_eq!(found.as_deref(), Some(wanted.as_path()));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_child_naming_a_crossing_light_reads_that_light() {
+        // (RefreshAmpelParenting hands any child of a running crossing whose first string
+        // is a light index that light's phase, lamp or not, #922)
+        let crossings: hashbrown::HashSet<i64> = [7].into_iter().collect();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(light_child_of(&crossings, Some(7), &s(&["2", "x"])), Some((7, 2)));
+        assert_eq!(light_child_of(&crossings, Some(7), &s(&[" 0 "])), Some((7, 0)));
+        assert_eq!(light_child_of(&crossings, Some(8), &s(&["2"])), None, "not a crossing with lights");
+        assert_eq!(light_child_of(&crossings, None, &s(&["2"])), None);
+        assert_eq!(light_child_of(&crossings, Some(7), &s(&["Hbf"])), None);
+        assert_eq!(light_child_of(&crossings, Some(7), &s(&["-1"])), None);
     }
 
     #[test]
@@ -12610,6 +13094,15 @@ mod tests {
 
     /// An LED panel's light map is one white pixel; a flipdot's is a picture with dark
     /// parts (the Krueger's `vmatrix_leer_LM.bmp`), and does not make an LED panel (#413).
+    #[test]
+    fn a_transmapped_slot_is_see_through_by_its_transmap_not_its_reflection_mask() {
+        // the stock Golf 2: diffuse alpha 0 (reflection mask), transmap opaque (#928, #932)
+        assert_eq!(coverage_texture(Some("Golf2_main1_T.tga"), "Golf2_main1.tga"), "Golf2_main1_T.tga");
+        assert_eq!(coverage_texture(None, "glass.tga"), "glass.tga");
+        assert_eq!(coverage_texture(Some("  "), "glass.tga"), "glass.tga");
+        assert_eq!(coverage_texture(Some("\\S:2"), "led.tga"), "led.tga");
+    }
+
     #[test]
     fn a_lamps_lenses_follow_its_alphascale_and_light_map_variables() {
         // three lenses on one mesh, each faded by its colour's variable and lit by its
@@ -12741,19 +13234,19 @@ mod tests {
             textures: vec![SplineTexture { file: file.into(), ..Default::default() }],
             ..Default::default()
         };
-        let ty = Arc::new(SplineType { def: def("curb.dds"), dir: PathBuf::new() });
-        let other = Arc::new(SplineType { def: def("other.dds"), dir: PathBuf::new() });
-        let other_dir = Arc::new(SplineType { def: def("curb.dds"), dir: PathBuf::from("another_pack") });
+        let ty = Arc::new(SplineType { def: def("curb.dds"), dir: PathBuf::new(), surf: Vec::new() });
+        let other = Arc::new(SplineType { def: def("other.dds"), dir: PathBuf::new(), surf: Vec::new() });
+        let other_dir = Arc::new(SplineType { def: def("curb.dds"), dir: PathBuf::from("another_pack"), surf: Vec::new() });
         let mut tested = def("curb.dds");
         tested.textures[0].alpha = 1;
-        let tested = Arc::new(SplineType { def: tested, dir: PathBuf::new() });
+        let tested = Arc::new(SplineType { def: tested, dir: PathBuf::new(), surf: Vec::new() });
         let mut blended = def("curb.dds");
         blended.textures[0].alpha = 2;
-        let blended = Arc::new(SplineType { def: blended, dir: PathBuf::new() });
+        let blended = Arc::new(SplineType { def: blended, dir: PathBuf::new(), surf: Vec::new() });
         let mut compatible = def("curb.dds");
         compatible.path = PathBuf::from("another_profile.sli");
         compatible.textures.push(SplineTexture { file: "unused-grass.dds".into(), ..Default::default() });
-        let compatible = Arc::new(SplineType { def: compatible, dir: PathBuf::new() });
+        let compatible = Arc::new(SplineType { def: compatible, dir: PathBuf::new(), surf: Vec::new() });
         let mesh = |x: f32, length: f32| Arc::new(MeshData {
             positions: vec![glam::Vec3::new(x, 0.0, 0.0), glam::Vec3::new(x + length, 0.0, 0.0), glam::Vec3::new(x, 1.0, 0.0)],
             normals: vec![glam::Vec3::Z; 3],
@@ -12845,36 +13338,6 @@ mod tests {
             assert!((at(0, x, 1) - expect(x)).abs() <= 1.0, "row {x}");
         }
         assert!((0..n * n).all(|i| own.rgba[i * 4 + 2] == 0));
-    }
-
-    #[test]
-    fn surface_contact_height_matches_the_visible_surface_lift() {
-        let authored = DVec3::new(12.0, 18.0, 3.5);
-        let contact = scenery_draw_position(authored, true);
-        assert!((contact.z - authored.z - OMSI_SURFACE_LIFT as f64).abs() < 1e-8);
-    }
-
-    #[test]
-    fn road_markings_are_lifted_with_the_road_they_lie_on() {
-        let sco = |text: &str| SceneryObject::parse(&omsi_cfg::CfgFile::from_str("x.sco", text));
-        // Spandau's VZ_surfmark_arrow_L: a terrain-relative object drawn on the surfaces
-        assert!(drawn_on_surfaces(&sco("[rendertype]\non_surface\n[mesh]\narrow.o3d\n")));
-        assert!(drawn_on_surfaces(&sco("[rendertype]\nsurface\n[mesh]\nplate.o3d\n")));
-        assert!(drawn_on_surfaces(&sco("[surface]\n[mesh]\nplate.o3d\n")));
-        assert!(!drawn_on_surfaces(&sco("[mesh]\nhouse.o3d\n")));
-        assert!(!drawn_on_surfaces(&sco("[rendertype]\npresurface\n[mesh]\nground.o3d\n")));
-    }
-
-    #[test]
-    fn scripted_surface_draw_pose_keeps_the_upload_lift() {
-        let authored = DVec3::new(-2165.1, -2368.8, -0.068);
-        let uploaded = scenery_draw_position(authored, true);
-        for _frame in 0..8 {
-            assert_eq!(scenery_draw_position(authored, true), uploaded);
-        }
-        assert_eq!(scenery_draw_position(authored, false), authored);
-        assert_eq!(uploaded.truncate(), authored.truncate());
-        assert!((uploaded.z - authored.z - 0.08).abs() < 1e-8);
     }
 
     #[test]
@@ -13161,7 +13624,7 @@ mod material_tests {
         ];
         let alpha = material_alpha(&mats, 0, &defs);
         assert_eq!(alpha, AlphaMode::Opaque);
-        assert_eq!(Renderer::clamp_slot_alpha(0.35, alpha), 1.0);
+        assert_eq!(Renderer::clamp_slot_alpha(0.35, alpha, false), 1.0);
     }
 
     #[test]
@@ -13222,6 +13685,19 @@ mod material_tests {
             true,
             true
         ));
+    }
+
+    /// The ICU400 controller's screen layer: a script texture as its transmap declares one.
+    #[test]
+    fn script_transmap_is_declared() {
+        let text = "[mesh]\nscreen.o3d\n\n[matl]\nScreen.dds\n0\n[matl_transmap]\n\\S:1\n[alphascale]\nsignController_alphaScale\n[matl_alpha]\n2\n\n[matl]\nPlain.dds\n0\n";
+        let m = omsi_model::Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", text));
+        let mats = &m.meshes[0].materials;
+        let screen = mats.iter().find(|d| d.texture == "Screen.dds").unwrap();
+        let plain = mats.iter().find(|d| d.texture == "Plain.dds").unwrap();
+        assert_eq!(screen.transmap.as_deref(), Some("\\S:1"));
+        assert!(material_extra(&[screen], None, None, [0.0; 4]).transmap_declared);
+        assert!(!material_extra(&[plain], None, None, [0.0; 4]).transmap_declared);
     }
 
     #[test]

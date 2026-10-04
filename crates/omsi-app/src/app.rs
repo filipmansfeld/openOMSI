@@ -49,6 +49,8 @@ pub(crate) struct App {
     pub(crate) navigator: Option<navigator::Navigator>,
     pub(crate) vr_nav_profiles: crate::vr_navigator::Profiles,
     pub(crate) vr_nav_edit: Option<crate::vr_navigator::Editing>,
+    /// The window spans the triple screen's three monitors: fullscreen would shrink it to one.
+    pub(crate) spanned: bool,
     /// Chat, mouse-over names and name tags (Roboto).
     pub(crate) ui: Option<ui::Ui>,
     pub(crate) fps: f32,
@@ -78,6 +80,8 @@ pub(crate) struct App {
     /// With no real-time reflections: the bus whose mirrors are frozen (see
     /// `MIRROR_FREEZE_REDRAW`).
     pub(crate) frozen_mirrors: Option<FrozenMirrors>,
+    /// The mirror panels laid over the picture (see `mirror_hud`).
+    pub(crate) mirror_hud: crate::mirror_hud::MirrorHud,
     /// Cursor and view the hover was last worked out for (see the redraw).
     pub(crate) hover_key: Option<(i32, i32, i32, i32)>,
     pub(crate) view: String,
@@ -91,6 +95,11 @@ pub(crate) struct App {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) vr_cursor_warp_pending: Option<(f32, f32)>,
     pub(crate) window_focused: bool,
+    /// The window lost the focus or was minimised or hidden: the keyboard and the mouse
+    /// work nothing until it has the focus again (`App::input_lost` / `input_back`).
+    pub(crate) input_away: bool,
+    /// The window is minimised or out of sight, as its events last said.
+    pub(crate) window_hidden: bool,
     pub(crate) keys: hashbrown::HashSet<KeyCode>,
     /// Door trigger groups currently held by the Shift+number shortcut. Keeping the
     /// release until physical key-up prevents latched button states and door chatter.
@@ -126,6 +135,11 @@ pub(crate) struct App {
     /// (in lines, fractional while dragged); `None`: the chosen line is kept in view.
     pub(crate) menu_top: Option<f32>,
     pub(crate) menu_scroll_drag: bool,
+    /// The scroll bar of an open drop-down held with the mouse: where on its thumb it was
+    /// taken (pixels from the thumb's top).
+    pub(crate) dd_scroll_drag: Option<f32>,
+    /// The same for the scroll bar of the timetable beside a line's tours.
+    pub(crate) pane_scroll_drag: Option<f32>,
     /// The timetable beside the tours scrolled with the wheel: (the tour's line in the list,
     /// the first stop shown).
     pub(crate) pane_scroll: Option<(usize, usize)>,
@@ -153,6 +167,11 @@ pub(crate) struct App {
     /// Discord's "Playing openOMSI" status, and when it was last brought up to date.
     pub(crate) discord: Option<crate::discord::Discord>,
     pub(crate) discord_t: f32,
+    // Steamworks API layer and it's last updated time
+    #[cfg(steam)]
+    pub(crate) steam: Option<crate::steam::Steam>,
+    /// Positional voice through GreenTeaSpeak in a session (`voice`).
+    pub(crate) voice: Option<crate::voice::Voice>,
     /// Head tracking (Settings → head tracking), started with the first frame that wants it.
     pub(crate) headtrack: Option<crate::headtrack::HeadTracker>,
     /// When head tracking last failed to start (tried again a few seconds later).
@@ -270,6 +289,8 @@ pub(crate) struct App {
     pub(crate) fps_t: Instant,
     /// Last workshop / fuel pump / wash message, and how long it still shows.
     pub(crate) service_msg: Option<(String, f32)>,
+    /// The server's notifications on the screen (`notify`), oldest first.
+    pub(crate) notices: Vec<crate::ui::Notice>,
     /// What the log has said (see applog.rs).
     pub(crate) log_state: crate::applog::LogState,
     /// The driver's personnel file and this session's statistics.
@@ -345,6 +366,12 @@ impl App {
     /// The game's window (or the launcher's, handed over on a phone), its surface and the
     /// renderer; then the menu or, when the session is given, the world.
     pub(crate) fn create_window(&mut self, event_loop: &ActiveEventLoop, given: Option<Arc<Window>>) {
+        // Steam's rich presence starts before the game window (see `steam.rs`)
+        #[cfg(steam)]
+        if self.steam.is_none() {
+            self.steam = crate::steam::Steam::start();
+        }
+
         // --size sets the window's size in points as well (1600x900 unless given)
         let (lw, lh) = self
             .args
@@ -365,8 +392,53 @@ impl App {
         if let Some(at) = at {
             attrs = attrs.with_position(at);
         }
-        if self.settings.fullscreen {
+        // the window size of the settings (pixels, #904) unless --size names one
+        let resolution = crate::settings::Settings::resolution().filter(|_| self.args.size == crate::cli::DEFAULT_SIZE);
+        if let Some((w, h)) = resolution {
+            attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h));
+            if let Some(m) = event_loop.primary_monitor().or_else(|| event_loop.available_monitors().next()) {
+                let (sw, sh) = (m.size().width as i32, m.size().height as i32);
+                attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(m.position().x + ((sw - w as i32) / 2).max(0), m.position().y + ((sh - h as i32) * 2 / 5).max(0)));
+            }
+        }
+        // (a Steam Deck's Gaming Mode: gamescope shows one window over the whole screen and
+        // scales whatever size it has to it - a window fitted to 90 % of the screen came out
+        // blurred and letterboxed. There the window is the screen's, unless a size is set)
+        let gamescope = resolution.is_none() && crate::startup::under_gamescope();
+        if gamescope {
+            log::info!("gamescope (Steam Deck Gaming Mode): the window fills the screen");
+        }
+        if self.settings.fullscreen || gamescope {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
+        if self.settings.triple.enabled
+            && self.settings.triple_span
+            && !self.settings.vr_requested()
+        {
+            let mut monitors: Vec<_> = event_loop.available_monitors().collect();
+            monitors.sort_by_key(|m| m.position().x);
+            let row = monitors.windows(3).find(|row| {
+                let size = row[0].size();
+                row.iter()
+                    .all(|m| m.size() == size && m.position().y == row[0].position().y)
+                    && row[1].position().x == row[0].position().x + size.width as i32
+                    && row[2].position().x == row[1].position().x + size.width as i32
+            });
+            if let Some(row) = row {
+                let size = row[0].size();
+                if self.settings.fullscreen || gamescope || resolution.is_some() || self.args.size != crate::cli::DEFAULT_SIZE {
+                    log::info!("triple screen: spanning three monitors instead of the fullscreen / window size settings");
+                }
+                self.spanned = true;
+                attrs = attrs
+                    .with_fullscreen(None)
+                    .with_decorations(false)
+                    .with_position(row[0].position())
+                    .with_inner_size(winit::dpi::PhysicalSize::new(size.width * 3, size.height));
+                log::info!("triple screen: spanning {}x{}", size.width * 3, size.height);
+            } else {
+                log::warn!("triple screen: no equal horizontal monitor row found; using configured window size (Surround/Eyefinity can expose one wide display)");
+            }
         }
         // OMSI_BACKGROUND=1: a test window that does not take the keyboard from whoever is
         // working at the screen (OMSI_INPUT drives the handlers directly, it needs no focus)
@@ -375,7 +447,16 @@ impl App {
         }
         let window = match given {
             Some(w) => w,
-            None => Arc::new(event_loop.create_window(attrs).expect("window")),
+            // (no display to open it on, a compositor that refuses it: said so, not a panic
+            // report about "window")
+            None => match event_loop.create_window(attrs) {
+                Ok(w) => Arc::new(w),
+                Err(e) => {
+                    fatal_message(&format!("The game cannot open its window: {e}"));
+                    crate::platform::exit(event_loop);
+                    return;
+                }
+            },
         };
         let mut renderer = match window_renderer(&mut self.instance, &window, self.settings.render_options()) {
             Ok(r) => r,
@@ -551,7 +632,7 @@ impl App {
                             p.load_sounds(&audio);
                             p.ibis_background = true;
                             // --autostart applies in the window too, not only offscreen
-                            if self.args.autostart {
+                            if self.args.autostart && !self.args.is_resuming() {
                                 let msg = p.start_up();
                                 self.service_msg = Some((msg, 6.0));
                             }
@@ -594,6 +675,7 @@ impl App {
                         tour: None,
                         trip: None,
                         autostart: false,
+                        situation_next_stop: None,
                         ..self.args.clone()
                     };
                     match spawn_player(&one, &w, &renderer, &mut scene) {
@@ -690,6 +772,12 @@ impl App {
                                     if let Some(k) = self.args.duty_trip {
                                         d.start_at(k, self.args.duty_first_stop);
                                     }
+                                    if self.args.is_resuming() {
+                                        d.resume(&mut p.vehicle, parse_time(&self.args.time), self.args.situation_next_stop);
+                                        // the IBIS keeps its saved trip; with --autostart
+                                        // the duty's next trips are typed into it again
+                                        p.duty_typed = self.args.autostart;
+                                    }
                                     Some(d)
                                 }
                                 Err(e) => {
@@ -704,7 +792,10 @@ impl App {
                             let duty_confirmed = self.duty.as_ref().is_some_and(|d| self.lan.as_ref()
                                 .is_none_or(|l| l.tour_claim_confirmed(&format!("{}/{}", d.line, d.tour))));
                             if !duty_confirmed { p.vehicle.host.schedule_active = 0.0; }
-                            if let (true, Some(d)) = (self.args.autostart && duty_confirmed, self.duty.as_mut()) {
+                            if let (true, Some(d)) = (
+                                self.args.autostart && duty_confirmed && !self.args.is_resuming(),
+                                self.duty.as_mut(),
+                            ) {
                                 d.update(&mut p.vehicle, parse_time(&self.args.time));
                                 let (trip, stop) = d.trip_for_ibis();
                                 p.set_duty_destination(trip, stop);

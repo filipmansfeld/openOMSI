@@ -606,13 +606,16 @@ impl State {
         };
         let theirs = info.map.trim().replace('\\', "/");
         let file = self.maps.iter().find(|m| m.file.eq_ignore_ascii_case(&theirs)).map(|m| m.file.clone());
-        if !self.maps.is_empty() && file.is_none() {
-            self.set_status(format!("The server plays {}, which is not installed here: install that map first.", info.map), true);
-            return;
+        // A map not installed here comes with the server's mods when the game joins
+        // (`lan_mods`), so this is a notice, not a refusal. The Drive page needs a map of
+        // this installation chosen, so the choice stays as it is then: `duty()` starts the
+        // game on the server's map anyway.
+        let missing_map = !self.maps.is_empty() && file.is_none();
+        if !missing_map {
+            // Changing the world also invalidates its timetable and entry point.
+            // Use the installed path's spelling for case-sensitive lookups later.
+            self.select_map(&file.unwrap_or(theirs));
         }
-        // Changing the world also invalidates its timetable and entry point. Merely
-        // assigning the map kept the previous map's lines on the locked server page.
-        self.select_map(&file.unwrap_or(theirs));
         self.choice.lan_mode = "join".into();
         // (a server added by its bare address is joined where it answered: its web gateway)
         let bare = omsi_net::ws::ws_url(address).is_none() && !omsi_net::official::is_alias(address);
@@ -621,7 +624,8 @@ impl State {
         self.join = (true, format!("the server {}", info.name));
         self.join_checked = address.to_string();
         self.touched();
-        self.set_status(format!("Joined {} - choose your bus and duty, then Start the duty", info.name), false);
+        let notice = if missing_map { format!(" The server map {} will be fetched on joining.", info.map) } else { String::new() };
+        self.set_status(format!("Joined {} - choose your bus and duty, then Start the duty{notice}", info.name), false);
     }
 
     /// Back to playing alone (the Drive page's "Leave Server").
@@ -1221,7 +1225,21 @@ impl State {
         });
         let want = on_date.or_else(|| self.map().map(|m| m.hof.clone())).unwrap_or_default();
         let Some(v) = self.bus() else { return want };
-        v.hofs.iter().find(|h| h.eq_ignore_ascii_case(&want)).cloned().or(Some(want).filter(|w| !w.is_empty())).or_else(|| v.hofs.first().cloned()).unwrap_or_default()
+        // (the bus's own depot of the same place before the map's borrowed from another
+        // bus, and one named like the map before its first, #896)
+        let names: Vec<&str> = v.hofs.iter().map(|h| h.as_str()).collect();
+        let like = |hints: &[&str]| omsi_vehicle::hof::closest_name(&names, hints).map(|i| v.hofs[i].clone());
+        let map_hints: Vec<String> = self.map().map(|m| vec![m.name.clone(), m.friendly.clone(), m.file.trim_end_matches("/global.cfg").rsplit('/').next().unwrap_or("").to_string()]).unwrap_or_default();
+        let map_hints: Vec<&str> = map_hints.iter().map(|h| h.as_str()).collect();
+        v.hofs
+            .iter()
+            .find(|h| h.eq_ignore_ascii_case(&want))
+            .cloned()
+            .or_else(|| like(&[want.as_str()]))
+            .or(Some(want.clone()).filter(|w| !w.is_empty()))
+            .or_else(|| like(&map_hints))
+            .or_else(|| v.hofs.first().cloned())
+            .unwrap_or_default()
     }
 
     pub fn select_bus(&mut self, file: &str) {
@@ -1650,17 +1668,19 @@ mod map_switch_tests {
     }
 
     #[test]
-    fn joining_an_uninstalled_map_keeps_the_current_duty_and_lines() {
+    fn joining_an_uninstalled_map_fetches_it_and_keeps_the_local_view() {
         let mut s = state_on_brno();
-        let before = serde_json::to_value(&s.choice).unwrap();
         add_server(&mut s, "maps/Missing/global.cfg");
         s.join_server(SERVER);
-        assert_eq!(serde_json::to_value(&s.choice).unwrap(), before);
+        assert_eq!(s.choice.map, BRNO);
+        assert_eq!(s.choice.line.as_deref(), Some("78 Modrice-Zidenice"));
+        assert_eq!(s.choice.tour.as_deref(), Some("Po-Ne 2"));
         assert_eq!(s.lines[0].name, "78 Modrice-Zidenice");
         assert_eq!(s.lines_for, (BRNO.into(), DATE.into()));
-        assert!(s.joined_server.is_none());
+        assert_eq!(s.active_joined_server(), Some(SERVER));
+        assert_eq!(s.duty().map, "maps/Missing/global.cfg");
         assert!(!s.loading_lines);
-        assert!(s.status.1);
+        assert!(!s.status.1);
     }
 
     #[test]

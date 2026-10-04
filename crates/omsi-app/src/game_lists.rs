@@ -134,7 +134,9 @@ fn route_numbers(app: &App) -> Vec<String> {
         for t in &hof.info_trips {
             let code = t.code.trim();
             let l = if !t.line.trim().is_empty() { t.line.trim().to_string() } else if code.len() > 2 && code.chars().all(|c| c.is_ascii_digit()) { code[..code.len() - 2].trim_start_matches('0').to_string() } else { String::new() };
-            let l = l.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+            // A route number is display text, not necessarily an alphanumeric IBIS code:
+            // Brazilian matrices use values such as "-10". Keep the HOF spelling intact.
+            let l = l.trim().to_string();
             if !l.is_empty() && !out.contains(&l) {
                 out.push(l);
             }
@@ -152,6 +154,34 @@ fn route_numbers(app: &App) -> Vec<String> {
     out
 }
 
+/// Whether a line can be represented by the numeric IBIS line/suffix variables openOMSI
+/// already knows how to encode. Everything else must stay as display text: turning "-10"
+/// or "EXP" into a number loses information.
+fn numeric_ibis_line(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+    if line.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    let mut chars = line.chars();
+    if let Some(first) = chars.next() {
+        let rest: String = chars.collect();
+        if matches!(first.to_ascii_uppercase(), 'E' | 'S' | 'A' | 'D' | 'C' | 'B' | 'U' | 'M' | 'N' | 'X')
+            && !rest.is_empty()
+            && rest.chars().all(|c| c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    let digits: String = line.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let suffix = &line[digits.len()..];
+    !digits.is_empty()
+        && suffix.chars().count() == 1
+        && matches!(suffix.chars().next().unwrap().to_ascii_uppercase(), 'E' | 'U' | 'N' | 'S' | 'M')
+}
+
 /// The route number on the bus's IBIS and display, as picked or typed in the destination
 /// list (the destination stays: the one on the display now, else the first).
 pub(crate) fn set_route_by_hand(app: &mut App, line: &str) {
@@ -160,13 +190,28 @@ pub(crate) fn set_route_by_hand(app: &mut App, line: &str) {
         return;
     }
     if let Some(p) = app.player.as_mut() {
-        let hof = p.vehicle.host.hof.clone();
-        let code = p.vehicle.var("IBIS_TerminusCode").unwrap_or(-1.0) as i32;
-        let named = |t: &&omsi_vehicle::hof::Terminus| t.strings.first().is_some_and(|s| !s.trim().is_empty());
-        let term = hof.as_ref().and_then(|h| h.termini.iter().filter(named).find(|t| t.code == code).or_else(|| h.termini.iter().find(named)));
-        let name = term.and_then(|t| t.strings.first().cloned()).unwrap_or_default();
-        crate::schedule::set_player_destination_directly(&mut p.vehicle, hof.as_deref(), line, &name, &[]);
-        log::info!("route number set by hand: {line} (IBIS_LinieKurs {:?})", p.vehicle.var("IBIS_LinieKurs"));
+        if numeric_ibis_line(line) {
+            let hof = p.vehicle.host.hof.clone();
+            let code = p.vehicle.var("IBIS_TerminusCode").unwrap_or(-1.0) as i32;
+            let named = |t: &&omsi_vehicle::hof::Terminus| t.strings.first().is_some_and(|s| !s.trim().is_empty());
+            let term = hof.as_ref().and_then(|h| h.termini.iter().filter(named).find(|t| t.code == code).or_else(|| h.termini.iter().find(named)));
+            let name = term.and_then(|t| t.strings.first().cloned()).unwrap_or_default();
+            crate::schedule::set_player_destination_directly(&mut p.vehicle, hof.as_deref(), line, &name, &[]);
+        } else {
+            // OMSI's route-number field is also used as arbitrary display text. Do not
+            // force symbols/unknown letters through IBIS_LinieKurs: that would turn "-10"
+            // into line 0 (and matrix scripts would then blank or rewrite the rear sign).
+            for name in ["SetLineTo", "Matrix_Nr", "Linie"] {
+                if let Some(i) = p.vehicle.ty.program.str_var(name) {
+                    p.vehicle.state.str_vars[i as usize] = line.to_string();
+                }
+            }
+        }
+        log::info!(
+            "route number set by hand: {line} (IBIS_LinieKurs {:?}, Matrix_Nr {:?})",
+            p.vehicle.var("IBIS_LinieKurs"),
+            p.vehicle.str_var("Matrix_Nr")
+        );
         app.service_msg = Some((format!("Route {line}"), 3.0));
     }
 }
@@ -305,7 +350,15 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
         }
         ListKind::Destinations => {
             if let Some(p) = app.player.as_ref().filter(|p| p.vehicle.host.hof.is_some()) {
-                let now = p.vehicle.var("IBIS_LinieKurs").filter(|l| *l > 0.0).map(|l| format!("{}", l as i64)).unwrap_or_else(|| "-".into());
+                let shown = p.vehicle.str_var("Matrix_Nr").trim().to_string();
+                let set = p.vehicle.str_var("SetLineTo").trim().to_string();
+                let now = if !shown.is_empty() {
+                    shown
+                } else if !set.is_empty() {
+                    set
+                } else {
+                    p.vehicle.var("IBIS_LinieKurs").filter(|l| *l > 0.0).map(|l| format!("{}", l as i64)).unwrap_or_else(|| "-".into())
+                };
                 out.push((format!("{}: {now}...", tr("Route number")), "routes".into()));
             }
             if let Some(hof) = app.player.as_ref().and_then(|p| p.vehicle.host.hof.clone()) {
@@ -810,6 +863,11 @@ fn slider_row(app: &App, id: &str, name: &str, desc: &str, fmt: &dyn Fn(f32) -> 
 fn steps_of(verb: &str) -> Option<Vec<f32>> {
     Some(match verb {
         "vr_nav_x" | "vr_nav_y" | "vr_nav_z" => (-100..=100).map(|v| v as f32 * 0.02).collect(),
+        "triple_width_mm" => (20..=200).map(|v| v as f32 * 10.0).collect(),
+        "triple_distance_mm" => (20..=300).map(|v| v as f32 * 10.0).collect(),
+        "triple_bezel_mm" => (0..=100).map(|v| v as f32).collect(),
+        "triple_left_angle_deg" | "triple_right_angle_deg" => (0..=90).map(|v| v as f32).collect(),
+        "triple_eye_height_mm" => (-100..=100).map(|v| v as f32 * 5.0).collect(),
         "vr_nav_width" => (12..=65).map(|v| v as f32 * 0.01).collect(),
         "vr_nav_yaw" | "vr_nav_roll" => (-90..=90).map(|v| v as f32 * 2.0).collect(),
         "vr_nav_tilt" => (-40..=40).map(|v| v as f32 * 2.0).collect(),
@@ -922,6 +980,22 @@ fn step_move(steps: &[f32], now: f32, mv: Move) -> f32 {
     steps.get(to).copied().unwrap_or(now)
 }
 
+/// Keep the physical triple-screen calibration separate from the single-screen FOV.
+fn set_camera_fov(settings: &mut crate::settings::Settings, value: f32) -> (&'static str, String) {
+    let value = if value < 20.0 {
+        0.0
+    } else {
+        value.round().min(120.0)
+    };
+    if settings.triple.enabled && !settings.vr_requested() {
+        settings.triple.fov_deg = value;
+        ("triple_fov_deg", value.to_string())
+    } else {
+        settings.fov = value;
+        ("fov", value.to_string())
+    }
+}
+
 /// The value of the slider setting `verb` (`arg`: the seat's axis).
 fn option_now(app: &App, verb: &str, arg: &str) -> Option<f32> {
     if let Some(field) = verb.strip_prefix("vr_nav_") {
@@ -945,7 +1019,19 @@ fn option_now(app: &App, verb: &str, arg: &str) -> Option<f32> {
         "vol_scenery" => s.vol_scenery,
         "wheel_range" => s.wheel_range,
         "wheel_lock" => s.wheel_lock,
-        "fov" => s.fov,
+        "triple_width_mm" => s.triple.width_mm,
+        "triple_distance_mm" => s.triple.distance_mm,
+        "triple_bezel_mm" => s.triple.bezel_mm,
+        "triple_left_angle_deg" => s.triple.left_angle_deg,
+        "triple_right_angle_deg" => s.triple.right_angle_deg,
+        "triple_eye_height_mm" => s.triple.eye_height_mm,
+        "fov" => {
+            if s.triple.enabled && !s.vr_requested() {
+                s.triple.fov_deg
+            } else {
+                s.fov
+            }
+        }
         "steer_look_angle" => s.steer_look_angle,
         "steer_look_response" => s.steer_look_response,
         "seat" => s.seat[arg.trim().parse::<usize>().unwrap_or(0).min(2)],
@@ -1040,10 +1126,45 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
             app.settings.wheel_lock = if v < 45.0 { 0.0 } else { v.round() };
             Some(("wheel_lock", app.settings.wheel_lock.to_string()))
         }
-        "fov" => {
-            app.settings.fov = if v < 20.0 { 0.0 } else { v.round() };
-            Some(("fov", app.settings.fov.to_string()))
+        "triple_width_mm" => {
+            app.settings.triple.width_mm = v.clamp(200.0, 2000.0);
+            Some(("triple_width_mm", app.settings.triple.width_mm.to_string()))
         }
+        "triple_distance_mm" => {
+            app.settings.triple.fov_deg = 0.0;
+            remember_setting("triple_fov_deg", "0");
+            app.settings.triple.distance_mm = v.clamp(200.0, 3000.0);
+            Some((
+                "triple_distance_mm",
+                app.settings.triple.distance_mm.to_string(),
+            ))
+        }
+        "triple_bezel_mm" => {
+            app.settings.triple.bezel_mm = v.clamp(0.0, 100.0);
+            Some(("triple_bezel_mm", app.settings.triple.bezel_mm.to_string()))
+        }
+        "triple_left_angle_deg" => {
+            app.settings.triple.left_angle_deg = v.clamp(0.0, 90.0);
+            Some((
+                "triple_left_angle_deg",
+                app.settings.triple.left_angle_deg.to_string(),
+            ))
+        }
+        "triple_right_angle_deg" => {
+            app.settings.triple.right_angle_deg = v.clamp(0.0, 90.0);
+            Some((
+                "triple_right_angle_deg",
+                app.settings.triple.right_angle_deg.to_string(),
+            ))
+        }
+        "triple_eye_height_mm" => {
+            app.settings.triple.eye_height_mm = v.clamp(-500.0, 500.0);
+            Some((
+                "triple_eye_height_mm",
+                app.settings.triple.eye_height_mm.to_string(),
+            ))
+        }
+        "fov" => Some(set_camera_fov(&mut app.settings, v)),
         "steer_look_angle" => {
             app.settings.steer_look_angle = v.round();
             Some(("steer_look_angle", app.settings.steer_look_angle.to_string()))
@@ -1151,6 +1272,9 @@ fn toggle_now(app: &App, id: &str) -> Option<bool> {
         "texture_compression" => s.texture_compression,
         "driver" => s.driver,
         "alt_view" => s.alt_view,
+        "triple_screen" => s.triple.enabled,
+        "triple_hud_center" => s.triple_hud_center,
+        "triple_span" => s.triple_span,
         "vr" => s.vr,
         "vr_desktop_mirror" => s.vr_desktop_mirror,
         "doppler" => s.doppler,
@@ -1218,16 +1342,9 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
             Some(("collision_vehicles", bit))
         }
         "mouse" => {
-            app.mouse_drive = on;
-            if !app.mouse_drive {
-                crate::player::keep_wheel(app.player.as_mut());
-            }
-            #[cfg(windows)]
-            if !app.mouse_drive {
-                app.reset_vr_pointer();
-            }
-            app.mouse_steer = (app.player.as_ref().map(|p| p.vehicle.physics.controls.steering).unwrap_or(0.0), 1.0);
-            app.mouse_pedals = app.player.as_ref().map(|p| (p.vehicle.physics.controls.throttle, p.vehicle.physics.controls.brake)).unwrap_or((0.0, 0.0));
+            // (as the O key does it: switched off from the menu, the brake the mouse held
+            // stayed behind and the bus rolled away - #517, #760)
+            app.set_mouse_drive(on);
             None
         }
         "blinker_cancel" => {
@@ -1347,7 +1464,9 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
         }
         "fullscreen" => {
             app.settings.fullscreen = on;
-            if let Some(w) = app.window.as_ref() {
+            if app.spanned {
+                log::info!("triple screen: the window spans three monitors, fullscreen is left alone");
+            } else if let Some(w) = app.window.as_ref() {
                 w.set_fullscreen(on.then_some(winit::window::Fullscreen::Borderless(None)));
             }
             Some(("fullscreen", bit))
@@ -1367,6 +1486,18 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
         "alt_view" => {
             app.settings.alt_view = on;
             Some(("alt_view", bit))
+        }
+        "triple_screen" => {
+            app.settings.triple.enabled = on;
+            Some(("triple_screen", bit))
+        }
+        "triple_hud_center" => {
+            app.settings.triple_hud_center = on;
+            Some(("triple_hud_center", bit))
+        }
+        "triple_span" => {
+            app.settings.triple_span = on;
+            Some(("triple_span", bit))
         }
         "vr" => {
             app.settings.vr = on;
@@ -1394,6 +1525,10 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
         }
         "momentary_gears" => {
             app.settings.momentary_gears = on;
+            // (the bus being driven read it when it was taken over)
+            if let Some(p) = app.player.as_mut() {
+                p.momentary_gears = on;
+            }
             Some(("momentary_gears", bit))
         }
         "auto_shift" => {
@@ -1713,6 +1848,7 @@ fn select_options(key: &str) -> Vec<(&'static str, &'static str)> {
         "mirror_size" => vec![("0", "Off"), ("128", "Low (128)"), ("256", "Normal (256)"), ("512", "High (512)"), ("1024", "Very high (1024)")],
         "texture_memory" => vec![("0", "Automatic"), ("500", "500 MB"), ("1000", "1 GB"), ("1500", "1.5 GB"), ("2000", "2 GB"), ("3000", "3 GB"), ("4000", "4 GB"), ("6000", "6 GB")],
         "drive_keys" => vec![("omsi", "Custom controls (Controls page)"), ("simple", "W A S D + arrows"), ("wasd", "W A S D only"), ("arrows", "Arrow keys only")],
+        "resolution" => crate::launcher::pages::RESOLUTIONS.to_vec(),
         "navigator_corner" => vec![("top-left", "Top left"), ("top-right", "Top right"), ("bottom-left", "Bottom left"), ("bottom-right", "Bottom right")],
         "boarding" => vec![("auto", "Pay and take the ticket"), ("pay", "The driver sells the ticket"), ("walk", "Just walk in")],
         "pax_voices" => vec![("all", "Greetings and tickets"), ("tickets", "Only the ticket asked for"), ("off", "Silent")],
@@ -1849,8 +1985,77 @@ fn options_pages(app: &App) -> Vec<Page> {
         .into_iter()
         .flatten()
         .collect();
-    let display: Vec<(String, String)> = vec![
+    let mut display = vec![
         switch_row(app, "fullscreen", "Fullscreen", "Switches the window between windowed and fullscreen"),
+        pick("resolution", "Window size", later),
+        switch_row(
+            app,
+            "triple_screen",
+            "Triple screen",
+            "Three physical screen projections; OpenXR takes priority",
+        ),
+    ];
+    // (the rig's own settings only while it is on)
+    let triple = vec![
+        switch_row(
+            app,
+            "triple_hud_center",
+            "HUD on centre screen",
+            "Keep the navigator, menus and information on the centre screen",
+        ),
+        switch_row(
+            app,
+            "triple_span",
+            "Span three monitors at startup",
+            "Borderless across three equal monitors in one horizontal row; restart required",
+        ),
+        slider_row(
+            app,
+            "triple_width_mm",
+            "Visible panel width",
+            "Width of one screen without its frame",
+            &|v| format!("{v:.0} mm"),
+        ),
+        slider_row(
+            app,
+            "triple_distance_mm",
+            "Eye distance",
+            "Eye to the centre screen",
+            &|v| format!("{v:.0} mm"),
+        ),
+        slider_row(
+            app,
+            "triple_bezel_mm",
+            "Frame width at each join",
+            "Combined width of both adjacent frames",
+            &|v| format!("{v:.0} mm"),
+        ),
+        slider_row(
+            app,
+            "triple_left_angle_deg",
+            "Left screen angle",
+            "Inward angle from a flat row",
+            &|v| format!("{v:.0}°"),
+        ),
+        slider_row(
+            app,
+            "triple_right_angle_deg",
+            "Right screen angle",
+            "Inward angle from a flat row",
+            &|v| format!("{v:.0}°"),
+        ),
+        slider_row(
+            app,
+            "triple_eye_height_mm",
+            "Eye above screen centre",
+            "Vertical eye offset",
+            &|v| format!("{v:.0} mm"),
+        ),
+    ];
+    if app.settings.triple.enabled {
+        display.extend(triple);
+    }
+    let display: Vec<(String, String)> = display.into_iter().chain([
         switch_row(app, "vsync", "V-sync", "Waits for the screen's refresh"),
         pick("max_fps", "Frame limit", "Frames a second at most"),
         switch_row(app, "fps", "Frame rate", "Show the frames per second in the top right corner"),
@@ -1861,8 +2066,7 @@ fn options_pages(app: &App) -> Vec<Page> {
         pick("texture_memory", "Texture memory", later),
         switch_row(app, "texture_compression", "Compress textures on loading", later),
         (!omsi_launcher_lib::graphics_profiles().is_empty()).then(|| opens("Load graphics profile", "Applies a graphics profile saved in the launcher", "gfxprofile")),
-    ]
-        .into_iter()
+    ])
         .flatten()
         .collect();
     let sound: Vec<(String, String)> = vec![
@@ -1887,7 +2091,7 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "headtrack", "Head tracking", &format!("Head tracking with opentrack (UDP port {})", s.head_tracking_port)),
         slider_row(app, "look_sens", "Mouse look sensitivity", "How fast the view turns when looking round with the mouse (100% is OMSI's)", &pct),
         switch_row(app, "alt_view", "Right mouse button turns the view", "Shift+right zooms; off: right zooms as in OMSI, the wheel button turns"),
-        slider_row(app, "fov", "Field of view", "The view angle of the views from the vehicle", &|v| if v < 20.0 { "Default".to_string() } else { format!("{v:.0}°") }),
+        slider_row(app, "fov", "Field of view", "Vertical field of view; in triple screen Default uses physical measurements, an override moves the virtual eye", &|v| if v < 20.0 { "Default".to_string() } else { format!("{v:.0}°") }),
         slider_row(app, "seat 1", "Seat forward and back", "Adjust the driver's seat position forward or backward", &cm),
         slider_row(app, "seat 2", "Seat height", "Adjust the driver's seat height", &cm),
         slider_row(app, "seat 0", "Seat left and right", "Adjust the driver's seat position from side to side", &cm),
@@ -2113,6 +2317,11 @@ fn pages_of(app: &App, kind: &ListKind) -> Option<(Vec<Page>, usize)> {
     let pages: Vec<Page> = pages.into_iter().filter(|p| !p.1.is_empty()).collect();
     let tab = tab.min(pages.len().saturating_sub(1));
     Some((pages, tab))
+}
+
+/// Which tab of the Options window is the one titled `title` (the first if none is).
+pub(crate) fn options_tab(app: &App, title: &str) -> usize {
+    pages_of(app, &ListKind::Options(0)).and_then(|(pages, _)| pages.iter().position(|p| p.0 == title)).unwrap_or(0)
 }
 
 type TitlesCache = Option<(ListKind, bool, std::time::Instant, (Vec<String>, usize))>;
@@ -2494,6 +2703,20 @@ mod tests {
     }
 
     #[test]
+    fn escape_fov_updates_the_active_projection_and_can_restore_geometry() {
+        let mut settings = crate::settings::Settings::default();
+        assert_eq!(super::set_camera_fov(&mut settings, 50.0).0, "fov");
+        settings.triple.enabled = true;
+        assert_eq!(
+            super::set_camera_fov(&mut settings, 75.0).0,
+            "triple_fov_deg"
+        );
+        assert_eq!(settings.fov, 50.0);
+        assert_eq!(settings.triple.fov_deg, 75.0);
+        super::set_camera_fov(&mut settings, 0.0);
+        assert_eq!(settings.triple.fov_deg, 0.0);
+    }
+    #[test]
     fn steps_wrap_round() {
         assert_eq!(super::next_step(&super::SPEEDS, 1.0), 2.0);
         assert_eq!(super::next_step(&super::SPEEDS, 15.0), 1.0);
@@ -2505,5 +2728,15 @@ mod tests {
         let mut v = vec!["13N", "5", "137", "N30", "92"];
         v.sort_by(|a, b| super::natural(a, b));
         assert_eq!(v, vec!["5", "13N", "92", "137", "N30"]);
+    }
+
+    #[test]
+    fn symbols_are_not_forced_through_numeric_ibis_lines() {
+        assert!(super::numeric_ibis_line("10"));
+        assert!(super::numeric_ibis_line("10E"));
+        assert!(super::numeric_ibis_line("X10"));
+        assert!(!super::numeric_ibis_line("-10"));
+        assert!(!super::numeric_ibis_line("10-"));
+        assert!(!super::numeric_ibis_line("EXP"));
     }
 }

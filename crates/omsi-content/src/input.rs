@@ -106,10 +106,27 @@ impl KeyboardCfg {
                 self.game.push(KeyBinding { action: action.into(), scan_code, modifier: 0 });
             }
         }
+        // a manual gearbox's gears up and down: Ctrl+Up / Ctrl+Down (DIK 200 / 208), keys the
+        // game used to hold for itself whatever the file said - an entry of their own, they
+        // can be put on other keys or cleared (#907, #930). An existing entry wins.
+        for (action, scan_code) in [("gear_up", 200), ("gear_down", 208)] {
+            if !self.game.iter().any(|b| b.action.eq_ignore_ascii_case(action)) {
+                self.game.push(KeyBinding { action: action.into(), scan_code, modifier: KEY_CTRL });
+            }
+        }
         for action in ["blinker_left_toggle", "blinker_right_toggle"] {
             if !self.vehicles.iter().any(|b| b.action.eq_ignore_ascii_case(action)) {
                 self.vehicles.push(KeyBinding { action: action.into(), scan_code: 0, modifier: 0 });
             }
+        }
+        // one key that goes between the cabin and the outside. OMSI's own
+        // `view_toggle_viewpoint` steps through all four modes, the map among them, so a player
+        // who drives on a controller spends two buttons on the two views they actually use (or
+        // presses one twice and passes through a view they did not want). On the list unbound,
+        // as the indicator toggles are: whoever wants it gives it a key, and nobody else loses
+        // one to it.
+        if !self.game.iter().any(|b| b.action.eq_ignore_ascii_case("view_toggle_interior")) {
+            self.game.push(KeyBinding { action: "view_toggle_interior".into(), scan_code: 0, modifier: 0 });
         }
         self
     }
@@ -232,6 +249,33 @@ mod tests {
         assert!(cfg.vehicles.contains(&custom));
         let right = cfg.vehicles.iter().find(|b| b.action == "blinker_right_toggle").unwrap();
         assert_eq!((right.scan_code, right.modifier), (0, 0));
+    }
+
+    /// The cabin-and-outside toggle is an entry of the list with no key, as the indicator
+    /// toggles are: a player who wants it gives it one, and nobody else loses a key to it.
+    #[test]
+    fn the_interior_toggle_is_unbound_and_a_players_own_key_wins() {
+        let cfg = KeyboardCfg::default().with_game_defaults().with_game_defaults();
+        let b = cfg.game.iter().find(|b| b.action == "view_toggle_interior").unwrap();
+        assert_eq!((b.scan_code, b.modifier), (0, 0));
+        assert_eq!(cfg.game.iter().filter(|b| b.action == "view_toggle_interior").count(), 1);
+        // (a key the player gave it stays where they put it)
+        let custom = KeyBinding { action: "View_Toggle_Interior".into(), scan_code: 44, modifier: 0 };
+        let cfg = KeyboardCfg { game: vec![custom.clone()], ..Default::default() }.with_game_defaults();
+        assert_eq!(cfg.game.iter().filter(|b| b.action.eq_ignore_ascii_case("view_toggle_interior")).count(), 1);
+        assert!(cfg.game.contains(&custom));
+    }
+
+    /// The manual gearbox's Ctrl+Up / Ctrl+Down are entries of the list, which stay as the
+    /// player moved or cleared them (#907).
+    #[test]
+    fn the_gear_keys_are_in_the_list_and_can_be_moved() {
+        let key = |c: &KeyboardCfg, a: &str| c.game.iter().filter(|b| b.action == a).map(|b| (b.scan_code, b.modifier)).collect::<Vec<_>>();
+        let cfg = KeyboardCfg::default().with_game_defaults().with_game_defaults();
+        assert_eq!(key(&cfg, "gear_up"), vec![(200, KEY_CTRL)]);
+        assert_eq!(key(&cfg, "gear_down"), vec![(208, KEY_CTRL)]);
+        let cleared = KeyboardCfg { game: vec![KeyBinding { action: "gear_up".into(), scan_code: 0, modifier: 0 }], ..Default::default() }.with_game_defaults();
+        assert_eq!(key(&cleared, "gear_up"), vec![(0, 0)]);
     }
 
     #[test]

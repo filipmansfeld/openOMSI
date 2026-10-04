@@ -34,49 +34,21 @@ pub struct SoundInfo<'a> {
     pub pitch_multiplier: f32,
 }
 
-// Keep the v1098 evaluator and native peak-hold behavior. Explicit API voices use
-// its curves, pitch and cabin attenuation without its automatic start/view tests.
-pub(super) struct Ctx {
-    master: f32,
-    muffled: bool,
-    exterior: bool,
-    doppler: bool,
-    listener: Vec3,
-}
-
 fn params(
     s: &mut RuntimeSound,
     var: &dyn Fn(&str) -> Option<f32>,
     transform: &Mat4,
     ctx: &Ctx,
 ) -> VoiceParams {
-    let position = s.def.pos.map(|p| transform.transform_point3(Vec3::from_array(p)));
-    let facing = match (position, s.def.dir) {
-        (Some(at), Some(direction)) => transform.transform_vector3(Vec3::from_array(direction))
-            .normalize_or_zero().dot((ctx.listener - at).normalize_or_zero()),
-        _ => 1.0,
-    };
-    let active = s.active_since.map_or(0.0, |t| t.elapsed().as_secs_f32());
-    let mut volume = s.def.volume;
-    for vc in &s.def.vol_curves {
-        if let Some(x) = SoundSet::curve_input(vc, var, active, facing) {
-            volume *= curve(&vc.points, x);
-        }
+    let evaluated = ctx.eval_controlled(s, var, transform);
+    let mut parameters = ctx.params(s, &evaluated, s.control == PlaybackControl::Loop, transform);
+    // Explicit starts, including a silent fade-in, own a mixer voice. They still
+    // silence a frequency or volume below DirectSound's playback threshold.
+    if !evaluated.audible {
+        parameters.gain = 0.0;
     }
-    let (pitch, fast_enough) = s.clip.as_ref()
-        .map(|clip| SoundSet::pitch_of(&s.def, var, clip)).unwrap_or((1.0, true));
-    s.last_gain = volume.clamp(0.0, 1.0);
-    s.last_pitch = pitch;
-    VoiceParams {
-        gain: if fast_enough { s.last_gain * ctx.master * SoundSet::outside_gain(ctx.muffled, ctx.exterior) } else { 0.0 },
-        pitch: (pitch * s.pitch_multiplier).clamp(0.001, 64.0),
-        looping: s.control == PlaybackControl::Loop,
-        position,
-        doppler: ctx.doppler && s.def.is_loop,
-        range: if s.def.range > 0.0 { s.def.range } else if ctx.exterior { 40.0 } else { 5.0 },
-        lowpass_hz: SoundSet::lowpass_of(ctx.muffled, ctx.exterior),
-        important: s.def.important,
-    }
+    parameters.pitch = parameters.pitch.clamp(0.001, 64.0);
+    parameters
 }
 
 pub(super) fn update_controlled(
@@ -108,11 +80,6 @@ pub(super) fn update_controlled(
 }
 
 impl SoundSet {
-    pub(super) fn ctx(&self, engine: &AudioEngine) -> Ctx {
-        Ctx { master: self.master, muffled: self.muffled, exterior: self.exterior,
-            doppler: !self.listener_vehicle, listener: engine.listener_position() }
-    }
-
     pub fn native_id(&self) -> u64 {
         self.api_id
     }
@@ -221,6 +188,8 @@ impl SoundSet {
                 engine.stop(id);
             }
             s.clip = clip;
+            s.last_gain = 1.0;
+            s.last_pitch = 1.0;
         }
         s.def = definition;
         s.pitch_multiplier = pitch_multiplier;
@@ -285,7 +254,6 @@ impl SoundSet {
         s.original = None;
         s.control = PlaybackControl::Native;
         s.held = false;
-        s.peak = 0.0;
         s.active_since = None;
         s.last_gain = 1.0;
         s.last_pitch = 1.0;
@@ -506,11 +474,11 @@ mod tests {
         }));
         engine.enabled = true; // Run the production state update; no stream is opened.
         sounds.update(&engine, &|_| None, &Mat4::IDENTITY, &["bell".into()]);
-        // In v1098 a native trigger has no elapsed active interval: its -1 curve
-        // starts at zero and this fade-in remains silent. Preserve that behavior.
+        // Native triggers keep the upstream GetTickCount-based -1 input, already
+        // beyond the curve's last point; explicit playback keeps a separate clock.
         let info = sounds.entry(0, &engine).unwrap();
         assert!(info.active_seconds.is_none());
-        assert!(info.voice.is_none());
+        assert_eq!(info.voice.unwrap().0.gain, 1.0);
         // Explicit API playback has its own start time, including a silent fade-in.
         sounds
             .play_entry(&engine, 0, false, &|_| None, &Mat4::IDENTITY)

@@ -19,9 +19,13 @@ pub fn puddle_coverage(x: f64, y: f64, wet_road: f32) -> f32 {
     }
     let (wx, wy) = (x as f32, y as f32);
     let pn = vnoise(wx * 0.22 + 17.3, wy * 0.22 - 9.1) * 0.65 + vnoise(wx * 0.9 - 4.0, wy * 0.9 + 8.0) * 0.35;
-    let t = 1.0 - wet_road * 1.15;
+    let t = 1.0 - wet_road * PUDDLE_SPREAD;
     smoothstep(t - 0.06, t + 0.06, pn)
 }
+
+/// How far the puddle threshold drops with the wetness (`PUDDLE_SPREAD` in `enhanced.wgsl`):
+/// a road wet through has standing water on about a third of it, the rest is wet asphalt.
+const PUDDLE_SPREAD: f32 = 0.45;
 
 fn hash2(x: f32, y: f32) -> f32 {
     let s = (x * 127.1 + y * 311.7).sin() * 43758.5453;
@@ -176,11 +180,12 @@ mod tests {
     }
 
     #[test]
-    fn a_road_wet_through_is_all_puddle() {
-        for i in 0..500 {
-            let (x, y) = (i as f64 * 0.77, i as f64 * 1.9);
-            assert!(puddle_coverage(x, y, 1.0) > 0.99, "dry island at ({x}, {y}) on a soaked road");
-        }
+    fn a_road_wet_through_has_puddles_in_patches() {
+        // water stands in the low spots; the road between them is wet asphalt, not a mirror
+        let covered = |wet: f32| (0..4000).map(|i| puddle_coverage(i as f64 * 0.77, i as f64 * 1.9, wet)).sum::<f32>() / 4000.0;
+        let (soaked, half) = (covered(1.0), covered(0.5));
+        assert!((0.15..0.5).contains(&soaked), "puddles cover {soaked} of a soaked road");
+        assert!(half < soaked * 0.5, "puddles cover {half} of a half wet road, {soaked} of a soaked one");
     }
 
     #[test]

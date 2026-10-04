@@ -200,6 +200,11 @@ fn version_parts(v: &str) -> Option<ChannelVersion> {
     Some(ChannelVersion { base, revision })
 }
 
+/// A pull request's test build: `release.yml` gives it the version `<release>-pr<number>`.
+pub fn is_test_build(version: &str) -> bool {
+    version.contains("-pr")
+}
+
 /// Whether `candidate` is a newer version than `current`.
 pub fn newer(candidate: &str, current: &str) -> bool {
     match (version_parts(candidate), version_parts(current)) {
@@ -283,6 +288,7 @@ fn select_releases(releases: &[serde_json::Value], current: &str, best: &mut Opt
 /// A release described as the GitHub API does, when newer than `current`.
 fn parse_release(v: &serde_json::Value, current: &str) -> anyhow::Result<Option<Release>> {
     let tag = v["tag_name"].as_str().ok_or_else(|| anyhow::anyhow!("the release has no tag"))?;
+    if is_test_build(current) { return Ok(None); }
     let Some(version) = tag.strip_prefix('v') else { return Ok(None) };
     if version.starts_with('v') || version_parts(version).is_none() { return Ok(None); }
     let version = version.to_string();

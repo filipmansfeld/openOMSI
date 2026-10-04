@@ -24,11 +24,28 @@ pub(crate) fn log_system(settings: &crate::settings::Settings) {
     if let Ok(d) = std::env::current_dir() {
         log::info!("working folder: {}", d.display());
     }
-    let env: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("OMSI_") || k == "RUST_LOG" || k == "WGPU_BACKEND").map(|(k, v)| format!("{k}={v}")).collect();
+    let env = logged_environment(std::env::vars());
     if !env.is_empty() {
         log::info!("environment: {}", env.join(" "));
     }
     log::info!("all settings: {settings:?}");
+}
+
+/// Only diagnostic configuration belongs in logs; handoff and credential values stay private.
+fn logged_environment(vars: impl IntoIterator<Item = (String, String)>) -> Vec<String> {
+    vars.into_iter()
+        .filter(|(key, _)| {
+            let key = key.to_ascii_uppercase();
+            if key == "RUST_LOG" || key == "WGPU_BACKEND" {
+                return true;
+            }
+            key.starts_with("OMSI_")
+                && key != "OMSI_UI_CAP"
+                && key != "OMSI_UI_PIPE"
+                && !["TOKEN", "SECRET", "PASSWORD", "CAPABILITY"].iter().any(|secret| key.contains(*secret))
+        })
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
 }
 
 fn os_version() -> String {
@@ -101,5 +118,33 @@ impl App {
             (time / 60.0) as i64 % 60,
             if self.paused { ", paused" } else { "" }
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logged_environment;
+
+    #[test]
+    fn environment_log_omits_private_handoff_and_credentials() {
+        let vars = [
+            ("OMSI_UI_CAP", "assertneverlog-ui-cap"),
+            ("oMsI_uI_pIpE", "assertneverlog-ui-pipe"),
+            ("OMSI_access_ToKeN", "assertneverlog-token"),
+            ("omsi_client_secret", "assertneverlog-secret"),
+            ("OmSi_Auth_Password", "assertneverlog-password"),
+            ("OMSI_bridge_cApAbIlItY", "assertneverlog-capability"),
+            ("UNRELATED_SETTING", "assertneverlog-unrelated"),
+            ("OMSI_CONTENT", "C:/OMSI"),
+            ("RUST_LOG", "info"),
+            ("WGPU_BACKEND", "dx12"),
+        ];
+        let logged = logged_environment(vars.into_iter().map(|(key, value)| (key.to_owned(), value.to_owned())));
+        assert!(!logged.iter().any(|entry| entry.contains("assertneverlog")));
+        assert_eq!(logged, vec![
+            "OMSI_CONTENT=C:/OMSI".to_owned(),
+            "RUST_LOG=info".to_owned(),
+            "WGPU_BACKEND=dx12".to_owned(),
+        ]);
     }
 }

@@ -306,6 +306,13 @@ pub(crate) fn mirror_view(v: &omsi_sim::VehicleInstance, c: &omsi_vehicle::Camer
     omsi_vehicle::Camera { yaw: r.x.atan2(r.y).to_degrees(), pitch: r.z.clamp(-1.0, 1.0).asin().to_degrees(), ..c.clone() }
 }
 
+/// A mirror camera as the player has set it: moved by a shift (bus frame, m) and with
+/// `dfov` degrees added to its field of view (a mirror that gives none draws with 50).
+pub(crate) fn adjusted(c: &omsi_vehicle::Camera, s: [f32; 3], dfov: f32) -> omsi_vehicle::Camera {
+    let fov = if dfov.abs() > 0.01 { (if c.fov > 1.0 { c.fov } else { 50.0 } + dfov).clamp(8.0, 110.0) } else { c.fov };
+    omsi_vehicle::Camera { pos: [c.pos[0] + s[0], c.pos[1] + s[1], c.pos[2] + s[2]], fov, ..c.clone() }
+}
+
 /// Where the driver's eye is (for a mirror drawn with no view to aim it by).
 pub(crate) fn driver_eye(p: &Player) -> DVec3 {
     if let Some((t, c)) = p.trailer_driver_camera() {
@@ -341,7 +348,7 @@ pub(crate) fn render_mirrors(
         .cameras_reflexion
         .iter()
         .enumerate()
-        .map(|(i, c)| mirror_view(&p.vehicle, c, eye, p.mirror_offsets.get(i).copied().unwrap_or([0.0; 2])))
+        .map(|(i, c)| mirror_view(&p.vehicle, &adjusted(c, p.mirror_shifts.get(i).copied().unwrap_or([0.0; 3]), p.mirror_fovs.get(i).copied().unwrap_or(0.0)), eye, p.mirror_offsets.get(i).copied().unwrap_or([0.0; 2])))
         .collect();
     if cams.is_empty() {
         return 0;

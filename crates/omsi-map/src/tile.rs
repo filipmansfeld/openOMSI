@@ -152,6 +152,13 @@ pub struct Tile {
     pub spline_attachments: Vec<SplineAttachment>,
     pub chrono_changes: Vec<ChronoChange>,
     pub unknown_keywords: Vec<(String, usize)>,
+    /// The chrono patch whose terrain the tile has, when an active one brings its own: a
+    /// chrono tile with `[terrain]` carries its `.terrain` beside it in the chrono folder,
+    /// and Omsi.exe, reading the patch with the same loader (0x77b39c -> 0x792188), loads
+    /// that terrain over the tile's own. None: the tile's own file.
+    pub terrain_from: Option<PathBuf>,
+    /// The same for the water (`[water]` and its `.water` beside the patch).
+    pub water_from: Option<PathBuf>,
 }
 
 impl Tile {

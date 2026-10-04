@@ -85,6 +85,9 @@ pub(crate) struct Player {
     /// OMSI's `change_give` / `change_take` keys: hand the passenger
     /// at the desk all the change owed at once / take back what lies on the change tray.
     pub(crate) give_change: bool,
+    /// The triggers a controller button's door action (`door_<n>`, `doors_all`) fired, by
+    /// action: let go, their `_off` is fired (see [`Player::door_key`]).
+    pub(crate) door_buttons: hashbrown::HashMap<String, Vec<String>>,
     /// Parts at the end of the train coupled by hand (they can be uncoupled; an articulated
     /// bus's own rear section cannot).
     pub(crate) hand_coupled: usize,
@@ -109,7 +112,11 @@ pub(crate) struct Player {
     pub(crate) seat: Vec3,
     /// The player's turn of each mirror (yaw, pitch degrees; Ctrl+Alt+arrows in the cab).
     pub(crate) mirror_offsets: Vec<[f32; 2]>,
-    /// A mirror was turned and is not saved yet.
+    /// The player's shift of each mirror (bus frame, m: across, along, up; the mirror editor).
+    pub(crate) mirror_shifts: Vec<[f32; 3]>,
+    /// Degrees added to each mirror camera's field of view (the mirror editor).
+    pub(crate) mirror_fovs: Vec<f32>,
+    /// A mirror was turned or shifted and is not saved yet.
     pub(crate) mirrors_dirty: bool,
     pub(crate) take_change: bool,
     /// Keys whose `_toggle` this bus does as `_up`/`_down` (see `action`): turned up last.
@@ -485,9 +492,39 @@ pub(crate) fn door_group_to_fire(v: &mut omsi_sim::VehicleInstance, group: &[Str
     }
 }
 
+/// Whether the leaf door trigger `name` works is open now: what the trigger does to the
+/// doors' targets when tried (a target it turns down was up), else the target its script
+/// names first. The first one named can be a branch not taken: the SD202's
+/// `bus_doorfront1` names the rear doors' target (`doorTarget_23`, for a bus whose rear
+/// door the front buttons work) before its own leaf's, so with both front leaves open
+/// the second Shift+1 shut only one of them.
+pub(crate) fn door_trigger_open(v: &mut omsi_sim::VehicleInstance, name: &str) -> Option<bool> {
+    let targets: Vec<usize> = v
+        .ty
+        .program
+        .var_names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| {
+            let n = n.to_ascii_lowercase();
+            n.contains("target") || n.contains("soll")
+        })
+        .map(|(k, _)| k)
+        .collect();
+    if !targets.is_empty() {
+        let tried = v.trial_triggers(&[name]);
+        let now = &v.state.vars;
+        let changed = targets.iter().find(|&&k| (tried.get(k).copied().unwrap_or(0.0) > 0.5) != (now.get(k).copied().unwrap_or(0.0) > 0.5));
+        if let Some(&k) = changed {
+            return Some(now.get(k).copied().unwrap_or(0.0) > 0.5);
+        }
+    }
+    door_trigger_target(&v.ty.program, name).and_then(|id| v.state.vars.get(id as usize).copied()).map(|x| x > 0.5)
+}
+
 /// Which triggers of a door key's group the doors' targets ask for (see
 /// `door_group_to_fire`).
-fn door_group_plan(v: &omsi_sim::VehicleInstance, group: &[String]) -> Vec<String> {
+fn door_group_plan(v: &mut omsi_sim::VehicleInstance, group: &[String]) -> Vec<String> {
     // an open and close pair (`open|close`): whichever fits the leaf now
     let group: Vec<String> = group
         .iter()
@@ -503,7 +540,7 @@ fn door_group_plan(v: &omsi_sim::VehicleInstance, group: &[String]) -> Vec<Strin
     let group = &group[..];
     let states: Vec<Option<bool>> = group
         .iter()
-        .map(|n| door_trigger_target(&v.ty.program, n).and_then(|id| v.state.vars.get(id as usize).copied()).map(|x| x > 0.5))
+        .map(|n| door_trigger_open(v, n))
         .collect();
     if group.len() < 2 || states.iter().any(|s| s.is_none()) {
         return group.to_vec();
@@ -529,7 +566,75 @@ pub(crate) fn digit_of(code: KeyCode) -> Option<usize> {
     })
 }
 
+/// The game's own door actions for a controller button (or a key of `keyboard.cfg`) that
+/// work on every bus: `door_<n>` is the n-th door front to back, as Shift+n on the
+/// keyboard, and `doors_all` every door at once (#916).
+pub(crate) fn door_action(name: &str) -> Option<usize> {
+    let n = name.to_ascii_lowercase();
+    if n == "doors_all" {
+        return Some(0);
+    }
+    n.strip_prefix("door_").and_then(|d| d.parse::<usize>().ok()).filter(|d| (1..=9).contains(d))
+}
+
 impl Player {
+    /// Door key `n` (1 = the front door; 0 = all of them): the triggers fired. All the doors
+    /// close the ones open when any is (leaving the others as they are) and else open them
+    /// all; the door release switch (`bus_dooraft` of the Berlin buses) is not a door then.
+    pub(crate) fn door_key(&mut self, n: usize) -> Vec<String> {
+        let groups = door_keys(&self.vehicle.ty);
+        let fire: Vec<String> = if n == 0 {
+            let doors: Vec<&Vec<String>> = groups.iter().filter(|g| !(g.len() == 1 && g[0] == "bus_dooraft")).collect();
+            let is_open = |v: &mut omsi_sim::VehicleInstance, g: &Vec<String>| {
+                g.iter().any(|t| match t.split_once('|') {
+                    Some((open, _)) => trigger_leaves(&v.ty.program, open).iter().any(|l| v.var(l).is_some_and(|x| x > 0.5)),
+                    None => door_trigger_open(v, t) == Some(true),
+                })
+            };
+            let open: Vec<bool> = doors.iter().map(|g| is_open(&mut self.vehicle, g)).collect();
+            let any_open = open.iter().any(|o| *o);
+            let mut fire = Vec::new();
+            for (g, o) in doors.iter().zip(&open) {
+                if !any_open || *o {
+                    fire.extend(door_group_to_fire(&mut self.vehicle, g));
+                }
+            }
+            fire
+        } else {
+            let Some(group) = groups.get(n - 1) else { return Vec::new() };
+            let fire = door_group_to_fire(&mut self.vehicle, group);
+            // the automatic rear doors of the stock Berlin buses (SD, NL): the key is their
+            // release, and switched off with the doors open it shuts them now rather than
+            // when the last request has lapsed ("why can I not close the rear doors at all?")
+            if group.len() == 1 && group[0] == "bus_dooraft" {
+                let v = &mut self.vehicle;
+                let release_on = v.var("bremse_halte_sw").is_some_and(|x| x > 0.5);
+                let open = v.var("doorTarget_23").is_some_and(|x| x > 0.5);
+                if release_on && open && v.var("doorAftLastOpen").is_some() {
+                    v.set_var("haltewunsch", 0.0);
+                    v.set_var("doorAftLastOpen", 1000.0);
+                }
+            }
+            fire
+        };
+        log::info!("door key {}: {}", if n == 0 { "all".to_string() } else { n.to_string() }, fire.join(" + "));
+        for name in &fire {
+            self.vehicle.trigger(name);
+        }
+        fire
+    }
+
+    /// A door key let go: the `_off` of the triggers it fired (the push buttons of the
+    /// automatic doors are held between the two).
+    pub(crate) fn door_key_off(&mut self, fired: &[String]) {
+        for name in fired {
+            let off = format!("{name}_off");
+            if self.vehicle.ty.program.trigger(&off).is_some() {
+                self.vehicle.trigger(&off);
+            }
+        }
+    }
+
     pub(crate) fn toggle_indicator(&mut self, want: u8) {
         let lever = if self.vehicle.var("lights_sw_warnblinker").is_some_and(|v| v > 0.5) {
             Some(3)
@@ -577,6 +682,15 @@ impl Player {
             && is_manual_gate_action(name);
         // the ticket key of Inputs/keyboard.cfg (T): sell the ticket the passenger at the
         // desk asked for, on buses whose script has no ticket printer
+        if let Some(n) = door_action(name) {
+            if pressed {
+                let fired = self.door_key(n);
+                self.door_buttons.insert(name.to_ascii_lowercase(), fired);
+            } else if let Some(fired) = self.door_buttons.remove(&name.to_ascii_lowercase()) {
+                self.door_key_off(&fired);
+            }
+            return true;
+        }
         if name.eq_ignore_ascii_case("ticket_give") {
             if pressed {
                 self.give_ticket = true;
@@ -1396,8 +1510,10 @@ impl Player {
             ss.set_muffled(inside);
             ss.set_listener_vehicle(listener_follows_bus);
             // how open the bus is to the outside (doors, driver's window) for every outside
-            // sound heard in it - this bus's own and the traffic's
-            omsi_audio::soundset::set_outside_open(if inside { v.var("Snd_OutsideVol") } else { None });
+            // sound heard in it - this bus's own and the traffic's: Omsi.exe reads the
+            // player's bus's `Snd_OutsideVol` whatever the camera does (0 when no script
+            // writes it)
+            omsi_audio::soundset::set_outside_open(Some(v.var("Snd_OutsideVol").unwrap_or(0.0)));
             // (the last time a trigger fired this frame: its sounds start with that moment)
             let at_fire = |t: &str, n: &str| -> Option<f32> {
                 let vals = &fired_vars.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(t))?.1;
@@ -1986,7 +2102,7 @@ impl Player {
         // picture (a check of the mirrors against OMSI's own `reflexion<n>.bmp`)
         if let Some(c) = view.strip_prefix("mirror").and_then(|n| n.parse::<usize>().ok()).and_then(|n| def.cameras_reflexion.get(n)) {
             let k = def.cameras_reflexion.iter().position(|x| std::ptr::eq(x, c)).unwrap_or(0);
-            let aimed = crate::camera_util::mirror_view(&self.vehicle, c, crate::camera_util::driver_eye(self), self.mirror_offsets.get(k).copied().unwrap_or([0.0; 2]));
+            let aimed = crate::camera_util::mirror_view(&self.vehicle, &crate::camera_util::adjusted(c, self.mirror_shifts.get(k).copied().unwrap_or([0.0; 3]), self.mirror_fovs.get(k).copied().unwrap_or(0.0)), crate::camera_util::driver_eye(self), self.mirror_offsets.get(k).copied().unwrap_or([0.0; 2]));
             let (eye, yaw, pitch, roll) = self.vehicle.camera_world_full(&aimed);
             return Camera { position: eye, yaw, pitch, roll, fov_deg: if c.fov > 1.0 { c.fov } else { 50.0 }, near: 0.1, far: 450.0 };
         }
@@ -2573,5 +2689,21 @@ mod auto_shift_tests {
         assert_eq!(g(3, 5, 1.2, 0.0, 0.5, 20.0), 2);
         assert_eq!(g(1, 5, 1.0, 0.0, 1.0, 2.0), 1);
         assert_eq!(g(4, 5, 1.0, 0.0, 1.0, 3.0), 1);
+    }
+}
+
+#[cfg(test)]
+mod door_action_tests {
+    use super::door_action;
+
+    /// The door actions that work on every bus (#916).
+    #[test]
+    fn door_actions_name_a_door_or_all_of_them() {
+        assert_eq!(door_action("door_1"), Some(1));
+        assert_eq!(door_action("Door_3"), Some(3));
+        assert_eq!(door_action("doors_all"), Some(0));
+        assert_eq!(door_action("door_0"), None);
+        assert_eq!(door_action("bus_doorfront0"), None);
+        assert_eq!(door_action("door_x"), None);
     }
 }

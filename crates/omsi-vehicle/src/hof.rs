@@ -223,6 +223,55 @@ pub fn depot_in(dir: &Path, name: &str) -> Option<Hof> {
         .find_map(|f| Hof::load(f).ok())
 }
 
+/// The words of a depot or map name that tell one place from another: four letters or
+/// more, not a year or a number, not a word every depot file has ("Linie 20", "Hof").
+fn place_words(s: &str) -> Vec<String> {
+    const COMMON: [&str; 14] = ["linie", "line", "lines", "depot", "omsi", "maps", "version", "final", "neue", "update", "addon", "fixed", "standard", "default"];
+    s.split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.chars().count() >= 4 && !w.chars().all(|c| c.is_ascii_digit()) && !COMMON.contains(&w.as_str()))
+        .collect()
+}
+
+/// Of `names` (the depot files a bus has), the one that belongs to the place `hints` name
+/// (the map's depot names, its title, its folder): the one sharing the most of their
+/// words, the longer words counting more; the first of equals. None when none shares one.
+///
+/// OMSI asks the driver which of the bus's depot files to use; taking the first of them
+/// when none is called exactly as the map wants put a bus on Hamburg's Linie 20 with the
+/// Grundorf depot of its folder - no line and no destination its IBIS knew (#896).
+pub fn closest_name(names: &[&str], hints: &[&str]) -> Option<usize> {
+    let wanted: Vec<String> = hints.iter().flat_map(|h| place_words(h)).collect();
+    let mut best: Option<(usize, usize)> = None;
+    for (i, n) in names.iter().enumerate() {
+        let mut words = place_words(n);
+        words.dedup();
+        let score: usize = words.iter().filter(|w| wanted.contains(w)).map(|w| w.chars().count()).sum();
+        if score > 0 && best.is_none_or(|(_, b)| score > b) {
+            best = Some((i, score));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// The depot file of `dir` that belongs to the place `hints` name (see [`closest_name`]),
+/// by its file name or its `[name]`.
+pub fn depot_like(dir: &Path, hints: &[&str]) -> Option<Hof> {
+    let files = depot_files(dir);
+    let names: Vec<String> = files
+        .iter()
+        .map(|f| {
+            let stem = f.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            match Hof::read_name(f) {
+                Some(n) => format!("{stem} {n}"),
+                None => stem,
+            }
+        })
+        .collect();
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    closest_name(&refs, hints).and_then(|i| Hof::load(&files[i]).ok())
+}
+
 /// The depot file called `name` in any vehicle folder of any content root (`Vehicles/*/`).
 ///
 /// A depot file belongs to a map, not to a bus model: it lists the map's termini, stops and
@@ -260,6 +309,18 @@ pub fn depot_anywhere(name: &str) -> Option<Hof> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #896: the bus's own depot of the map's place, not the first of its folder.
+    #[test]
+    fn closest_depot_name_is_the_maps_place() {
+        let names = ["Grundorf", "Hamburg Linie 20", "Spandau 2019"];
+        assert_eq!(closest_name(&names, &["Hamburg_Linie_20", "Linie 20"]), Some(1));
+        assert_eq!(closest_name(&names, &["Spandau 1986"]), Some(2));
+        assert_eq!(closest_name(&names, &["Berlin-Spandau"]), Some(2));
+        assert_eq!(closest_name(&names, &["Thüringer Wald"]), None);
+        assert_eq!(closest_name(&["Berlin X10", "Spandau"], &["Berlin-Spandau"]), Some(1));
+        assert_eq!(closest_name(&["Linie 20"], &["Linie 7"]), None);
+    }
 
     #[test]
     fn terminus_list_columns() {

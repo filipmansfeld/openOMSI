@@ -1534,3 +1534,106 @@ fn a_returning_player_is_known_by_its_nonce_not_its_name() {
     let back = hello_id(&raw(), &mut host, "alice", 0x1234).expect("welcomed");
     assert_eq!(back, first);
 }
+
+/// Ticks a client (a second at a time, so that the slow hello comes round) and a host until
+/// the client is connected.
+fn until_connected(c: &mut LanSession, host: &mut LanSession) -> bool {
+    let t0 = Instant::now();
+    while !c.connected && t0.elapsed() < Duration::from_secs(3) {
+        c.tick(1.0, &Pose::default());
+        host.tick(0.05, &pose(0.0));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    c.connected
+}
+
+#[test]
+fn a_client_that_gave_up_comes_back_when_the_host_does() {
+    let port = 27993;
+    // nobody hosts yet: the client gives up
+    let mut c = LanSession::join(&format!("127.0.0.1:{port}"), "c", world("m"), Duration::from_millis(10))
+        .unwrap();
+    c.join_timeout = Duration::from_millis(300);
+    let t0 = Instant::now();
+    while c.rejected.is_none() && t0.elapsed() < Duration::from_secs(3) {
+        c.tick(0.05, &Pose::default());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(c.rejected.is_some() && !c.connected);
+    // the host starts: the client's slow hello finds it and the give-up is taken back
+    let mut host = LanSession::host(port, "host", world("m"), false).unwrap();
+    assert!(until_connected(&mut c, &mut host));
+    assert!(c.rejected.is_none());
+    assert_eq!(c.welcomes, 1);
+}
+
+#[test]
+fn reconnect_tries_again_after_the_host_sent_us_away() {
+    let mut host = LanSession::host(27991, "host", world("m"), false).unwrap();
+    let mut c = LanSession::join("127.0.0.1:27991", "c", world("m"), Duration::from_millis(10)).unwrap();
+    assert!(until_connected(&mut c, &mut host));
+    // the host sends us away: we stay out, with its reason
+    host.kick(c.my_id, "test", false);
+    for _ in 0..10 {
+        c.tick(1.0, &Pose::default());
+        host.tick(0.05, &pose(0.0));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!c.connected);
+    assert!(c.rejected.as_deref().is_some_and(|r| r.contains("test")));
+    assert!(c.reconnect());
+    assert!(c.rejected.is_none());
+    assert!(until_connected(&mut c, &mut host));
+    // a host has nothing to reconnect to
+    assert!(!host.reconnect());
+}
+
+#[test]
+fn an_explicit_refusal_after_timeout_stops_slow_retry_until_manual_reconnect() {
+    for kicked in [false, true] {
+        let mut host = LanSession::host(0, "host", world("m"), false).unwrap();
+        let address = host.local_addr().unwrap();
+        let mut client = LanSession::join(&format!("127.0.0.1:{}", address.port()), "c", world("m"), Duration::from_millis(10)).unwrap();
+        assert!(until_connected(&mut client, &mut host));
+        let client_address = SocketAddr::from((Ipv4Addr::LOCALHOST, client.local_addr().unwrap().port()));
+        client.connected = false;
+        client.timed_out = true;
+        client.rejected = Some("temporary timeout".into());
+        if kicked {
+            host.kick(client.my_id, "fixture denial", false);
+        } else {
+            host.reject(client_address, "fixture denial");
+        }
+        client.tick(0.05, &Pose::default());
+        assert!(!client.timed_out);
+        assert!(client.rejected.as_deref().is_some_and(|r| r.contains("fixture denial")));
+        let sent = client.sent();
+        client.rehello();
+        for _ in 0..10 { client.tick(1.0, &Pose::default()); }
+        assert_eq!(client.sent(), sent, "an explicit refusal stops even the slow timeout retry");
+        host.send_welcome(client.my_id, client_address);
+        client.tick(0.05, &Pose::default());
+        assert!(!client.connected, "a delayed welcome cannot cancel a refusal");
+        assert!(client.reconnect());
+        assert!(until_connected(&mut client, &mut host));
+    }
+}
+
+#[test]
+fn transport_authentication_refusal_preserves_local_pose_and_stops_slow_retry() {
+    let mut client = LanSession::join("127.0.0.1:27994", "c", world("m"), Duration::from_millis(10)).unwrap();
+    let local = client.local_addr();
+    let nonce = client.nonce;
+    client.timed_out = true;
+    client.rejected = Some("temporary timeout".into());
+    client.stop_automatic_reconnect("sign in again");
+    let sent = client.sent();
+    for _ in 0..10 { client.tick(1.0, &pose(123.0)); }
+    assert_eq!(client.sent(), sent);
+    assert!(!client.connected && !client.timed_out);
+    assert_eq!(client.rejected.as_deref(), Some("sign in again"));
+    assert_eq!(client.local_addr(), local);
+    assert_eq!(client.nonce, nonce);
+    assert!(client.reconnect());
+    assert!(client.rejected.is_none());
+}

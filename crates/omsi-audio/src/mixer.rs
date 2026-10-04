@@ -1,5 +1,6 @@
 //! A small software mixer on top of cpal: voices with per-sample linear resampling (pitch),
-//! gain, looping and a simple 3D model (inverse-distance attenuation, stereo pan).
+//! gain, looping and Omsi.exe's 3D model (inverse-distance attenuation beyond a `[3d]`
+//! sound's range, a pan of a few dB - see [`pan_gains`]).
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use glam::Vec3;
@@ -146,15 +147,22 @@ impl Shared {
         let frames = out.len() / ch;
         let rate = self.sample_rate.load(Ordering::Relaxed).max(1);
         let dev_rate = rate as f64;
-        // More voices than OMSI's `[sound_maxcount]` (200 by default): keep `[important]`
-        // sounds first, then the ordinary voices that reach the listener loudest. Voices
-        // left out still advance in time, so a loop comes back at the right phase.
+        // More voices than OMSI's `[sound_maxcount]` (200 by default): as Omsi.exe, the
+        // nearest sounds are kept and the far ones cut - by distance, which does not change
+        // from one block to the next, not by loudness, which follows every volume curve and
+        // cut voices in and out at the edge of the list (sounds breaking off in traffic).
+        // `[important]` ones and the non-spatial ones (the driven bus heard from inside, the
+        // interface) are never cut. Voices left out still advance in time, so a loop comes
+        // back at the right phase.
         let mixed: Option<Vec<bool>> = if voices.iter().filter(|v| !v.finished && v.stream.is_none()).count() > MAX_VOICES {
             let mut ranked: Vec<(bool, f32, usize)> = voices
                 .iter()
                 .enumerate()
                 .filter(|(_, v)| !v.finished && v.stream.is_none())
-                .map(|(i, v)| (v.params.important, heard_gain(v, &listener), i))
+                .map(|(i, v)| {
+                    let near = v.params.position.map_or(0.0, |p| (p - listener.position).length());
+                    (v.params.important || v.params.position.is_none(), -near, i)
+                })
                 .collect();
             ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
             let mut keep = vec![false; voices.len()];
@@ -178,12 +186,8 @@ impl Shared {
             let mut spatial_gain = 1.0f32;
             if let Some(p) = v.params.position {
                 let d = p - listener.position;
-                let dist = d.length().max(0.1);
-                spatial_gain = distance_gain(v.params.range, dist);
-                let side = d.normalize_or_zero().dot(listener.right);
-                let pan = side.clamp(-1.0, 1.0);
-                left = ((1.0 - pan) * 0.5).sqrt() * 1.2;
-                right = ((1.0 + pan) * 0.5).sqrt() * 1.2;
+                spatial_gain = distance_gain(v.params.range, d.length());
+                (left, right) = pan_gains(&listener, d);
             }
             let target_gain = (v.params.gain * spatial_gain * listener.master).max(0.0);
             if let Some(sb) = v.stream.clone() {
@@ -338,10 +342,6 @@ fn apply_params(v: &mut Voice, params: VoiceParams, now: std::time::Instant, lis
 pub const MAX_VOICES: usize = 200;
 
 /// How loud voice `v` reaches the listener (its gain and distance), to rank voices by.
-fn heard_gain(v: &Voice, listener: &Listener) -> f32 {
-    let spatial = v.params.position.map(|p| distance_gain(v.params.range, (p - listener.position).length())).unwrap_or(1.0);
-    v.params.gain * spatial
-}
 
 /// Move a clip voice on by `frames` output frames without mixing it (looping or ending as
 /// it would have).
@@ -423,6 +423,32 @@ fn watch_default_device(first: String, reopen: std::sync::Weak<AtomicBool>) {
 }
 
 impl AudioEngine {
+    /// An engine without a device: clips load and voices are kept, nothing is mixed or
+    /// heard - for tools that look at sound configurations.
+    pub fn silent() -> AudioEngine {
+        AudioEngine {
+            stream: std::cell::RefCell::new(None),
+            device: std::cell::RefCell::new(String::new()),
+            reopen: Arc::new(AtomicBool::new(false)),
+            opened: std::cell::Cell::new(std::time::Instant::now()),
+            shared: Arc::new(Shared {
+                voices: Mutex::new(Vec::new()),
+                updates: Mutex::new(Vec::new()),
+                listener: Mutex::new(Listener::default()),
+                reverb: Mutex::new(Reverb::default()),
+                limiter: Mutex::new(1.0),
+                sample_rate: AtomicU32::new(48_000),
+                channels: AtomicUsize::new(2),
+                muted: true,
+            }),
+            next_id: AtomicU64::new(1),
+            clips: Default::default(),
+            last_trim: Mutex::new(std::time::Instant::now()),
+            loading: Default::default(),
+            enabled: true,
+        }
+    }
+
     /// Open the default output device. Returns a silent engine if none is available.
     pub fn new() -> AudioEngine {
         let engine = Self::new_silent();
@@ -639,13 +665,31 @@ impl AudioEngine {
     }
 
     pub fn play(&self, clip: Arc<Clip>, params: VoiceParams) -> VoiceId {
+        self.play_at(clip, params, 0.0)
+    }
+
+    /// Start a loop from a random place in its clip, as Omsi.exe starts a looping buffer
+    /// (`SetCurrentPosition(Random(size))`, 0x750c0c): two buses of a type standing side by
+    /// side do not drone in phase.
+    pub fn play_from_random_place(&self, clip: Arc<Clip>, params: VoiceParams) -> VoiceId {
+        static SEED: AtomicU64 = AtomicU64::new(0x2545_f491_4f6c_dd1d);
+        let mut x = SEED.load(Ordering::Relaxed);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        SEED.store(x, Ordering::Relaxed);
+        let start = (x % clip.frames().max(1) as u64) as f64;
+        self.play_at(clip, params, start)
+    }
+
+    fn play_at(&self, clip: Arc<Clip>, params: VoiceParams, start: f64) -> VoiceId {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.shared.voices.lock().push(Voice {
             id,
             clip,
             stream: None,
             params,
-            pos: 0.0,
+            pos: start,
             finished: false,
             cur_gain: 0.0,
             lp: [0.0, 0.0],
@@ -817,36 +861,47 @@ mod tests {
         assert!(!e.reopen.load(Ordering::Relaxed));
     }
 
+    /// A voice at `d` metres in front of the listener, heard at full gain whatever `d` is.
+    fn far_voice(clip: Arc<Clip>, d: f32) -> Voice {
+        let mut v = voice(clip, 1.0);
+        v.params.position = Some(Vec3::new(0.0, 0.0, -d));
+        v.params.range = 1.0e6;
+        v.params.doppler = false;
+        v
+    }
+
     #[test]
     fn important_voices_win_the_mixer_limit() {
         let clip = Arc::new(Clip { sample_rate: 48_000, channels: 1, samples: vec![64; 100] });
         let s = shared();
         for _ in 0..MAX_VOICES {
-            s.voices.lock().push(voice(clip.clone(), 1.0));
+            s.voices.lock().push(far_voice(clip.clone(), 10.0));
         }
-        let mut quiet_important = voice(clip, 0.001);
-        quiet_important.id = 9_999;
-        quiet_important.params.important = true;
-        s.voices.lock().push(quiet_important);
+        // the farthest of all, but [important]: it stays, one of the near ones goes
+        let mut far_important = far_voice(clip, 500.0);
+        far_important.id = 9_999;
+        far_important.params.important = true;
+        s.voices.lock().push(far_important);
         let mut out = vec![0.0f32; 16];
         s.render(&mut out);
-        let expect = ((MAX_VOICES - 1) as f32 + 0.001) * 64.0 / 32_768.0;
-        assert!((out[0] - expect).abs() < 1e-4, "{} vs {expect}", out[0]);
+        let expect = MAX_VOICES as f32 * 64.0 / 32_768.0;
+        assert!((out[0] - expect).abs() < 1e-3, "{} vs {expect}", out[0]);
     }
 
     #[test]
-    fn only_the_loudest_voices_are_mixed() {
+    fn the_nearest_voices_are_mixed_and_the_driven_bus_is_never_cut() {
         let clip = Arc::new(Clip { sample_rate: 48_000, channels: 1, samples: vec![64; 100] });
         let s = shared();
+        // 50 far voices, MAX_VOICES near ones, and the bus's own (non-spatial) at half gain
         for k in 0..MAX_VOICES + 50 {
-            s.voices.lock().push(voice(clip.clone(), if k < 50 { 0.001 } else { 1.0 }));
+            s.voices.lock().push(far_voice(clip.clone(), if k < 50 { 900.0 } else { 5.0 }));
         }
+        s.voices.lock().push(voice(clip, 0.5));
         let mut out = vec![0.0f32; 16];
         s.render(&mut out);
-        // the 50 quiet ones stayed out: exactly MAX_VOICES at full gain
-        let expect = MAX_VOICES as f32 * 64.0 / 32_768.0;
+        // the bus kept, then the nearest: MAX_VOICES - 1 near ones at full gain + 0.5
+        let expect = ((MAX_VOICES - 1) as f32 + 0.5) * 64.0 / 32_768.0;
         assert!((out[0] - expect).abs() < 1e-3, "{} vs {expect}", out[0]);
-        assert_eq!(s.voices.lock().len(), MAX_VOICES + 50);
     }
 }
 
@@ -900,12 +955,41 @@ impl Reverb {
 }
 
 /// How loud a sound `dist` metres away arrives, with `range` its `[3d]` reference distance:
-/// OMSI hands it to DirectSound 3D as the minimum distance with the default roll-off, so it
-/// is full up to that distance and then falls as 1/d (6 dB per doubling). Ours fell as
-/// (range/d)^1.6: at ten times the distance a sound was 4 % instead of 10 % - nearly
-/// everything was too quiet, a blinker relay half a metre from the head included.
+/// Omsi.exe multiplies the volume by `min(range / distance, 1)` itself (`TSound` update
+/// 0x7509fe) - full up to the range, then 1/d (6 dB per doubling); a range of 0 is silent
+/// anywhere but at the very spot.
 pub fn distance_gain(range: f32, dist: f32) -> f32 {
-    (range.max(0.01) / dist.max(0.01)).min(1.0)
+    if dist <= 0.0 {
+        return 1.0;
+    }
+    (range.max(0.0) / dist).min(1.0)
+}
+
+/// OMSI's `[sound_stereo]` (0 to 20, 10 when options.cfg has none): how far a `[3d]` sound
+/// is panned.
+pub static STEREO: AtomicU32 = AtomicU32::new(10);
+
+/// The channel gains of a sound in direction `d` from the listener, as Omsi.exe pans a
+/// `[3d]` sound (0x7508ef): `s` is the side component of the horizontal direction (1 =
+/// straight right), the buffer's pan `50 * [sound_stereo] * s^3` hundredths of a dB, and
+/// DirectSound lowers the far channel by that much and leaves the near one alone - at the
+/// default stereo setting a sound straight to the right is 5 dB down on the left. Ours gave
+/// the near channel 1.2 and the far one 0, a centred sound 0.85 on both.
+pub fn pan_gains(listener: &Listener, d: Vec3) -> (f32, f32) {
+    let stereo = STEREO.load(Ordering::Relaxed) as f32;
+    if stereo <= 0.0 {
+        return (1.0, 1.0);
+    }
+    let right = listener.right.normalize_or_zero();
+    let up = right.cross(listener.forward).normalize_or_zero();
+    let s = (d - up * d.dot(up)).normalize_or_zero().dot(right).clamp(-1.0, 1.0);
+    let pan = (50.0 * stereo * s * s * s).clamp(-10_000.0, 10_000.0);
+    let far = 10f32.powf(-pan.abs() / 2000.0);
+    if pan > 0.0 {
+        (far, 1.0)
+    } else {
+        (1.0, far)
+    }
 }
 
 #[cfg(test)]
@@ -915,6 +999,19 @@ mod distance_tests {
         assert_eq!(super::distance_gain(2.0, 1.0), 1.0);
         assert!((super::distance_gain(2.0, 4.0) - 0.5).abs() < 1e-6);
         assert!((super::distance_gain(1.0, 10.0) - 0.1).abs() < 1e-6);
+        assert_eq!(super::distance_gain(0.0, 3.0), 0.0, "a range of 0");
+    }
+
+    #[test]
+    fn a_sound_to_the_right_is_5_db_down_on_the_left() {
+        use glam::Vec3;
+        let l = super::Listener { forward: Vec3::Y, right: Vec3::X, ..Default::default() };
+        let (left, right) = super::pan_gains(&l, Vec3::new(3.0, 0.0, 1.0));
+        assert!((left - 10f32.powf(-0.25)).abs() < 1e-4 && right == 1.0, "{left} {right}");
+        let (left, right) = super::pan_gains(&l, Vec3::new(0.0, 5.0, 0.0));
+        assert_eq!((left, right), (1.0, 1.0), "ahead: both at full");
+        let (left, right) = super::pan_gains(&l, Vec3::new(-1.0, 1.0, 0.0));
+        assert!(left == 1.0 && right < 1.0 && right > 0.8, "{right}");
     }
 }
 

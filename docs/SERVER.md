@@ -15,7 +15,7 @@ graphics card: the renderer runs on wgpu's no-op device, so the world, the AI tr
 timetable buses and the people are simulated exactly as a hosting player's game does, and
 nothing is drawn. `server.cfg` is written with commented defaults on the first start (name,
 motd, map, date, time, weather, traffic, timetable, passengers, port, web_port,
-max_players, tunnel, radius); `server-icon.png` beside it (64x64, like Minecraft's) is the
+max_players, tunnel, radius, the voice chat); `server-icon.png` beside it (64x64, like Minecraft's) is the
 icon the players' list shows.
 
 Players reach it two ways:
@@ -23,6 +23,10 @@ Players reach it two ways:
 * UDP at `host:port` (a server with a public address, or on the LAN);
 * over a **WebSocket** at its web port (`omsi-net::ws`): every datagram is one binary
   message, the server's gateway gives each WebSocket a UDP socket of its own on 127.0.0.1.
+  The session sees such a player there (`joined from 127.0.0.1:<port>`); the log says who
+  that is (`gateway: player WebSocket from <address> on 127.0.0.1:<port>`), with the
+  address a reverse proxy or tunnel on the machine forwards (`X-Forwarded-For`,
+  `X-Real-IP`, `CF-Connecting-IP`).
   That is what a free Cloudflare quick tunnel carries (`tunnel = 1` starts `cloudflared
   tunnel --url http://127.0.0.1:<web_port>` and prints the `https://….trycloudflare.com`
   address). The same port answers `GET /status` (JSON: name, motd, map, players,
@@ -41,6 +45,27 @@ Players reach it two ways:
   map such as Berlin-Spandau, `null` elsewhere), refreshed every second - what a live map of
   the server on a website needs.
   It is off by default: the players' names and positions are then nobody's business.
+
+With `voice_channel` set, the players **talk** to each other through
+[GreenTeaSpeak](https://greenteaspeak.de) as SaltyChat lets FiveM players do: a player is
+heard from where they stand or sit, up to `voice_range` metres (20 by default), and through
+the bodywork - quieter - when one of the two is in a bus and the other is not. Each player
+runs GreenTeaSpeak 2 with the openOMSI plugin (`tools/greenteaspeak-plugin`, its README says
+how to install it) and is connected to the voice server whose unique id is
+`voice_server_uid` (the id in GreenTeaSpeak's server info panel; it is needed: without it
+there is no voice chat, so that a server cannot move its players about on whatever voice
+server they happen to be on). A
+joining game asks the server for these settings (the command `voice?`), the plugin moves
+the player into the channel `voice_channel` (its id or its name, with
+`voice_channel_password`) and renames them `<name> #<player id>` - the name every other
+game of the session gives them there - and the game tells it ten times a second where the
+camera is and where everybody else is. A player who is speaking has "speaking" under their
+name tag. A player hosting by code names the voice server in `~/.openomsi/voice.cfg` with
+the same keys. Settings → General → *Voice chat through GreenTeaSpeak* switches it off.
+`voice_channel_password` is sent to every player who joins (their game needs it to enter
+the channel): it keeps strangers on the voice server out of the channel, not the server's
+own players. The three settings together must fit a chat command (160 characters after
+encoding), or the server says so in its log and has no voice chat.
 
 The same gateway and tunnel open for a player hosting by **code** (Connect by Code): its
 address goes to the rendezvous topic, and a joining game that gets no answer from the

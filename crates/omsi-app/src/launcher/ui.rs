@@ -465,16 +465,25 @@ impl Ui {
 
     /// A button. `primary` is the accent-coloured one.
     pub fn button(&mut self, name: &str, r: Rect, label: &str, icon: Option<&str>, kind: ButtonKind) -> bool {
+        self.button_enabled(name, r, label, icon, kind, true)
+    }
+
+    /// A disabled button retains its shape and layout, without taking input.
+    pub fn button_enabled(&mut self, name: &str, r: Rect, label: &str, icon: Option<&str>, kind: ButtonKind, enabled: bool) -> bool {
         let id = id_of(name);
-        let (h, held, clicked) = self.interact(id, r);
+        let (h, held, clicked) = if enabled { self.interact(id, r) } else {
+            if self.active == Some(id) { self.active = None; }
+            (false, false, false)
+        };
         let t = self.anim(id, if h { 1.0 } else { 0.0 }, 0.06);
         let rr = if held { r.inset(0.5) } else { r };
-        let (fill, text_c, edge) = match kind {
+        let (fill, mut text_c, edge) = match kind {
             ButtonKind::Primary => (ACCENT.lighten(0.08 * t), Color::rgba(18, 14, 8, 1.0), Color::CLEAR),
             ButtonKind::Danger => (FIELD.mix(HOVER, t), DANGER, DANGER.alpha(0.35 + 0.3 * t)),
             ButtonKind::Normal => (FIELD.mix(HOVER, t), TEXT, EDGE),
             ButtonKind::Ghost => (Color::WHITE.alpha(0.05 * t), if h { TEXT } else { TEXT_DIM }, Color::CLEAR),
         };
+        if !enabled { text_c = TEXT_DIM; }
         let rad = 6.0;
         self.p().rounded(rr, rad, fill);
         if edge.0[3] > 0.0 {
@@ -943,6 +952,14 @@ impl Ui {
         self.push_clip(r, 6.0);
         let content = body(self, Rect::new(r.x, r.y - off, r.w, r.h));
         self.pop_clip();
+        self.scroll_keep(name, r, content);
+    }
+
+    /// The scrolling of such a view: the bar, the wheel, and its own easing towards where it
+    /// was sent. `content` is what the rows came to, all of them.
+    pub fn scroll_keep(&mut self, name: &str, r: Rect, content: f32) {
+        let id = id_of(name);
+        let off = self.scroll.get(&id).copied().unwrap_or(0.0);
         let max = (content - r.h).max(0.0);
         let mut target = self.scroll.get(&(id ^ 0xabc)).copied().unwrap_or(off);
         if self.hover(r) && self.input.wheel.y.abs() > 0.0 && !self.wheel_taken {
@@ -1319,6 +1336,28 @@ mod tests {
         assert!(ui.clipboard_out.is_none());
     }
     use super::*;
+
+    #[test]
+    fn disabled_buttons_keep_their_shape_without_taking_a_click() {
+        let mut ui = Ui::new();
+        let rect = Rect::new(20.0, 20.0, 240.0, 36.0);
+        ui.begin(Vec2::new(400.0, 200.0), 1.0, 1.0 / 60.0);
+        ui.button("download", rect, "", None, ButtonKind::Normal);
+        let enabled_vertices = ui.finish().1.len();
+        ui.begin(Vec2::new(400.0, 200.0), 1.0, 1.0 / 60.0);
+        ui.input.mouse = rect.center();
+        ui.input.down = true;
+        ui.input.pressed = true;
+        assert!(!ui.button_enabled("download", rect, "", None, ButtonKind::Normal, false));
+        assert!(ui.active.is_none());
+        let disabled_vertices = ui.finish().1.len();
+        assert!(disabled_vertices > 0);
+        assert_eq!(disabled_vertices, enabled_vertices);
+        ui.begin(Vec2::new(400.0, 200.0), 1.0, 1.0 / 60.0);
+        ui.input.down = false;
+        ui.input.released = true;
+        assert!(!ui.button_enabled("download", rect, "", None, ButtonKind::Normal, false));
+    }
 
     #[test]
     fn list_visibility_respects_nested_clips_and_partial_rows() {

@@ -112,6 +112,16 @@ impl Eye {
                 .cos(),
         }
     }
+
+    /// A wider picture than the camera's own (a triple screen's side panels): the tangents
+    /// of its half-angles, horizontal and vertical.
+    pub fn widened(mut self, extent: Option<(f64, f64)>) -> Eye {
+        if let Some((tan_x, tan_y)) = extent {
+            let half_diag = tan_x.hypot(tan_y).atan();
+            self.cos_half = self.cos_half.min((half_diag + 10f64.to_radians()).min(89f64.to_radians()).cos());
+        }
+        self
+    }
 }
 
 /// A bus as the passengers know it.
@@ -1327,6 +1337,18 @@ impl Want {
 }
 
 /// Velocity towards `to`, easing into the stop over the last metre.
+/// Somebody off the pavement's path by more than this beyond its corridor (just off a bus,
+/// at its door) walks onto it at their own pace before the corridor holds them; within it
+/// (a nudge of the crowd) the corridor takes them back.
+const OFF_PATH: f64 = 0.1;
+
+/// The corridor a walker at `pos` keeps to: none while they are still well off it. Eased
+/// into it at up to 0.6 m/s (twice a step) on top of walking there, the people getting off
+/// a bus slid sideways from its door to the pavement at twice their pace (#1033, #1079).
+fn path_corridor(pos: DVec2, corridor: Option<(DVec2, DVec2, f64)>) -> Option<(DVec2, DVec2, f64)> {
+    corridor.filter(|&(a, b, dev)| (crowd::clamp_to_corridor(pos, a, b, dev) - pos).length() <= OFF_PATH)
+}
+
 fn arrive(from: DVec2, to: DVec2, pace: f64) -> DVec2 {
     let d = to - from;
     let dist = d.length();
@@ -1389,8 +1411,9 @@ pub struct Humans {
     ai_visits: HashMap<u64, (i64, f64)>,
     /// When each bus last had a door open (the passengers' clock).
     last_door_open: HashMap<BusId, f64>,
-    /// Timetable buses to keep at their stop for a few seconds more (for the traffic).
-    holds: Vec<(u64, f32)>,
+    /// Timetable buses to keep at their stop for a few seconds more (for the traffic): the
+    /// bus, the stop it must be serving for it (none: any), the seconds.
+    holds: Vec<(u64, Option<i64>, f32)>,
     /// Door requests for the timetable buses' scripts: (bus, entries, exits).
     ai_requests: Vec<(u64, Vec<bool>, Vec<bool>)>,
     pub tickets: Option<Arc<omsi_content::tickets::TicketPack>>,
@@ -1469,6 +1492,12 @@ pub struct Humans {
     stamped: Vec<BusId>,
     /// Pedestrians to keep strolling near the player (scaled by `density`).
     pub pedestrians: usize,
+    /// Omsi.exe's people (`[AIMaxCountRandom]`'s second line, the `ai_max_humans` setting):
+    /// it makes that many at the start (0x709274) and draws everybody waiting at a stop,
+    /// walking the pavements or riding from them - never more; at most half of them walk
+    /// the pavements (0x62463c). Here people are made as they are wanted, so they are
+    /// counted against it instead.
+    pub max_people: usize,
     stroll_timer: f32,
     /// Passengers pay the exact fare: no change is ever due.
     pub exact_fare: bool,
@@ -1695,6 +1724,7 @@ impl Humans {
             stop_names: None,
             stamped: Vec::new(),
             pedestrians: 14,
+            max_people: crate::settings::Settings::load().ai_max_humans.max(1) as usize,
             stroll_timer: 0.0,
             exact_fare: true,
             boarding: "auto".into(),
@@ -1866,6 +1896,33 @@ impl Humans {
         }
     }
 
+    /// The people of OMSI's pool there are now (everybody but avatars and other players'
+    /// people mirrored here).
+    fn pool_used(&self) -> usize {
+        self.people.iter().filter(|p| p.puppet.is_none() && !p.remote).count()
+    }
+
+    /// Room in the pool for one more person; when it is full somebody walking the street out
+    /// of sight is taken for it, as Omsi.exe takes a task-8 person for a stop (0x61bd44).
+    fn pool_room(&mut self) -> bool {
+        if self.pool_used() < self.max_people {
+            return true;
+        }
+        let free = (0..self.people.len()).find(|&i| {
+            let p = &self.people[i];
+            p.puppet.is_none() && !p.remote && matches!(p.state, State::Strolling(_) | State::Standing) && !self.seen(p.position)
+        });
+        match free {
+            Some(i) => {
+                self.release(i);
+                let p = self.people.swap_remove(i);
+                self.retire(&p);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The cabin of a vehicle with the parts coupled behind it.
     fn cabin_for(&mut self, v: &VehicleInstance) -> Option<Arc<Cabin>> {
         let parts = train_parts(v);
@@ -1909,13 +1966,13 @@ impl Humans {
     /// for them.
     /// Everybody on foot on the ground, for the traffic to stop for: position, velocity
     /// and whether they wait at a stop (a bus pulls up right beside those).
-    pub fn on_foot(&self) -> Vec<(DVec2, DVec2, bool)> {
+    pub fn on_foot(&self) -> Vec<(DVec3, DVec2, bool)> {
         self.people
             .iter()
             .filter(|p| p.place == Place::Ground)
             .map(|p| {
                 let waiting = matches!(&p.state, State::Pax(x) if x.inside.is_none());
-                (p.position.truncate(), p.vel, waiting)
+                (p.position, p.vel, waiting)
             })
             .collect()
     }
@@ -2433,7 +2490,10 @@ impl Humans {
             let want = {
                 let s = &self.stops[&id];
                 let mean = (s.enter_max + s.enter_min) / 2.0;
-                let w = (self.density.max(0.0) * mean * s.factor).round().max(0.0) as usize;
+                // (0x61bf94: with a timetable, times the share of the trips due there - at a
+                // stop no trip leaves from, nobody)
+                let served = if self.stop_targets.is_some() && s.lines.is_empty() { 0.0 } else { 1.0 };
+                let w = (self.density.max(0.0) * mean * s.factor * served).round().max(0.0) as usize;
                 forced.unwrap_or(w).min(s.spots.len())
             };
             let s = self.stops.get_mut(&id).unwrap();
@@ -2483,6 +2543,9 @@ impl Humans {
     /// A person put at a free waiting place of stop `id` (sub_626044) with a destination
     /// drawn from the stop's (sub_61baa8); they settle there as task 6 does.
     fn spawn_waiting(&mut self, world: &World, renderer: &Renderer, scene: &mut Scene, id: i64) -> Option<usize> {
+        if self.stops.get(&id)?.taken.iter().all(|t| *t) || !self.pool_room() {
+            return None;
+        }
         let k = self.take_spot(id)?;
         let sp = self.stops[&id].spots[k].clone();
         let (dest, line) = self.draw_dest(id);
@@ -2546,6 +2609,9 @@ impl Humans {
         let crowd = (lanes.len() as f32 / 120.0).clamp(0.6, 3.0);
         let target =
             (self.pedestrians as f32 * crowd * self.density.clamp(0.0, 3.0)).round() as usize;
+        // (0x62463c: walking the pavements only while fewer than half the pool do, and never
+        // past the pool)
+        let target = target.min(self.max_people / 2).min((self.max_people + self.people.iter().filter(|p| matches!(p.state, State::Strolling(_))).count()).saturating_sub(self.pool_used()));
         let have = self
             .people
             .iter()
@@ -3510,7 +3576,7 @@ impl Humans {
     }
 
     /// Timetable buses to hold at their stop, for the traffic.
-    pub fn take_holds(&mut self) -> Vec<(u64, f32)> {
+    pub fn take_holds(&mut self) -> Vec<(u64, Option<i64>, f32)> {
         std::mem::take(&mut self.holds)
     }
 
@@ -4013,10 +4079,26 @@ impl Humans {
                         p.end_node(net, &leg)
                             .and_then(|n| p.next_leg(net, n, leg.lane, pick))
                     })
-                    .unwrap_or(Leg {
-                        lane: leg.lane,
-                        a: leg.b,
-                        b: leg.a,
+                    .unwrap_or_else(|| {
+                        // a leg that ends in the middle of its path (the point of a stop
+                        // somebody got off at) goes on to one of its ends: turned round
+                        // there, the people off a bus were sent back to the same point
+                        // every frame and milled round each other at the stop (#913)
+                        let lane_len = net.lanes[leg.lane].length();
+                        if leg.b > 0.05 && leg.b < lane_len - 0.05 {
+                            let fwd = if leg.len() > 0.05 { leg.b > leg.a } else { pick % 2 == 0 };
+                            Leg {
+                                lane: leg.lane,
+                                a: leg.b,
+                                b: if fwd { lane_len } else { 0.0 },
+                            }
+                        } else {
+                            Leg {
+                                lane: leg.lane,
+                                a: leg.b,
+                                b: leg.a,
+                            }
+                        }
                     });
                 walk.legs.push(next);
                 if walk.leg > 6 {
@@ -4141,6 +4223,7 @@ impl Humans {
                 (width * 0.5 - side).max(0.35) + bow,
             )
         });
+        let corridor = path_corridor(pos2, corridor);
         if self.people[i].why != "queueing behind somebody" {
             self.people[i].why = "";
         }
@@ -4638,6 +4721,24 @@ impl Humans {
                         p.vel.x,
                         p.vel.y
                     );
+                }
+            }
+        }
+        // OMSI_CHECK_TPOSE=1: everybody drawn with the arms out (the file's rest pose): the
+        // skinned mesh wider than 1.3 m from hand to hand
+        if omsi_cfg::env::var_os("OMSI_CHECK_TPOSE").is_some() {
+            for p in &self.people {
+                let Some((pos, _)) = p.skins.first() else {
+                    log::info!("t-pose? {} {}: never skinned", p.label(), p.state_name());
+                    continue;
+                };
+                let (lo, hi) = pos.iter().fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v.x), hi.max(v.x)));
+                if hi - lo > 1.3 {
+                    let pax = match &p.state {
+                        State::Pax(x) => format!("pax_state {} speed {:.2} seat_h {:.2} room {:.2} st {}", x.pax_state, x.speed, x.seat_h, x.room, x.st),
+                        _ => String::new(),
+                    };
+                    log::info!("t-pose: {} {} width {:.2} skinned {} {pax}", p.label(), p.state_name(), hi - lo, p.skinned);
                 }
             }
         }
@@ -5419,6 +5520,39 @@ impl Humans {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Off a bus 3 m from the pavement's path (along y), walking onto it at 1.1 m/s: hardly
+    /// faster over any quarter of a second (pulled by the corridor all the way, over 1.5
+    /// m/s), and on the path in the end.
+    #[test]
+    fn off_a_bus_people_walk_onto_the_pavement_at_their_pace() {
+        let walk = |held: bool| {
+            let pace = 1.1;
+            let mut w = Walker::new(DVec2::new(3.0, 0.0), 0.25, 0);
+            let params = CrowdParams::default();
+            let dt = 1.0 / 60.0;
+            let mut track = vec![w.pos];
+            for _ in 0..360 {
+                let s = w.pos.y.max(0.0);
+                let (a, b) = (DVec2::new(0.0, s - 2.0), DVec2::new(0.0, s + 2.5));
+                w.want = (DVec2::new(0.0, s + 1.3) - w.pos).normalize_or_zero() * pace;
+                let c = Some((a, b, 0.5));
+                w.corridor = if held { c } else { path_corridor(w.pos, c) };
+                crowd::step(std::slice::from_mut(&mut w), &[], &params, dt);
+                track.push(w.pos);
+            }
+            let fastest = track.windows(16).map(|k| (k[15] - k[0]).length() / (15.0 * dt)).fold(0.0, f64::max);
+            (fastest, w.pos)
+        };
+        let (fastest, end) = walk(false);
+        assert!(fastest < 1.3, "{fastest:.2} m/s");
+        assert!(end.x.abs() < 0.55, "{end:?}");
+        let held = walk(true).0;
+        assert!(held > 1.5, "{held:.2} m/s");
+        // on the path the corridor holds again
+        assert!(path_corridor(DVec2::new(0.55, 0.0), Some((DVec2::ZERO, DVec2::Y, 0.5))).is_some());
+        assert!(path_corridor(DVec2::new(3.0, 0.0), Some((DVec2::ZERO, DVec2::Y, 0.5))).is_none());
+    }
 
     #[test]
     fn map_humans_load_nested_paths_and_preserve_weights() {
