@@ -5,7 +5,13 @@
 //! releases API when it starts (setting `update_check`), and when a release is newer than this
 //! build it offers it - or, with `update_auto`, installs it at once:
 //!
-//! * **Windows, macOS, Linux**: the archive is downloaded (and checked against the SHA-256
+//! * **Integrated portable Windows client**: a verified `release-manifest.json`
+//!   binds this engine to its helper package. Only `PST-<revision>.zip` from the
+//!   fixed fork is offered. The bundled verified installer checks identities and
+//!   disk space before download, installs the complete client below its stable
+//!   anchor, and restarts through the bundled starter with the same shared roots.
+//!   A failed full-client update retains the previous engine and helpers together.
+//! * **Other Windows, macOS, Linux installations**: the archive is downloaded (and checked against the SHA-256
 //!   GitHub lists for it), unpacked into `.openomsi-update` beside the program, and every
 //!   program file it holds takes the place of the old one: the old one is renamed to
 //!   `*.old-update` first (Windows lets a running .exe be renamed, not overwritten) and put
@@ -25,6 +31,8 @@
 
 // (a phone installs through the system: the unpacking and swapping below are the computers')
 #![cfg_attr(target_os = "android", allow(dead_code))]
+
+mod integrated;
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -262,21 +270,29 @@ fn short_error(e: &ureq::Error) -> String {
 /// The latest release when it is newer than this build and has a file for this platform.
 pub fn latest() -> anyhow::Result<Option<Release>> {
     anyhow::ensure!(version_parts(current_version()).is_some(), "this build has no Tangenta channel version");
+    // A configured but invalid portable package is an error, never permission
+    // to fall back to replacing only the engine.
+    let portable = integrated::current()?.is_some();
     let mut best: Option<Release> = None;
     // Pagination also handles a fork with many upstream or unfinished releases.
     for page in 1..=10 {
         let url = format!("{RELEASES_API}?per_page=100&page={page}");
         let v: serde_json::Value = serde_json::from_str(&fetch_text(&url)?)?;
         let releases = v.as_array().ok_or_else(|| anyhow::anyhow!("GitHub did not return a release list"))?;
-        select_releases(releases, current_version(), &mut best)?;
+        select_releases_for_mode(releases, current_version(), &mut best, portable)?;
         if releases.len() < 100 { break; }
     }
     Ok(best)
 }
 
+#[cfg(test)]
 fn select_releases(releases: &[serde_json::Value], current: &str, best: &mut Option<Release>) -> anyhow::Result<()> {
+    select_releases_for_mode(releases, current, best, integrated::current()?.is_some())
+}
+
+fn select_releases_for_mode(releases: &[serde_json::Value], current: &str, best: &mut Option<Release>, portable: bool) -> anyhow::Result<()> {
     for v in releases {
-        if let Some(r) = parse_release(v, current)? {
+        if let Some(r) = parse_release_for_mode(v, current, portable)? {
             if best.as_ref().map(|b| newer(&r.version, &b.version)).unwrap_or(true) {
                 *best = Some(r);
             }
@@ -286,7 +302,12 @@ fn select_releases(releases: &[serde_json::Value], current: &str, best: &mut Opt
 }
 
 /// A release described as the GitHub API does, when newer than `current`.
+#[cfg(test)]
 fn parse_release(v: &serde_json::Value, current: &str) -> anyhow::Result<Option<Release>> {
+    parse_release_for_mode(v, current, integrated::current()?.is_some())
+}
+
+fn parse_release_for_mode(v: &serde_json::Value, current: &str, portable: bool) -> anyhow::Result<Option<Release>> {
     let tag = v["tag_name"].as_str().ok_or_else(|| anyhow::anyhow!("the release has no tag"))?;
     if is_test_build(current) { return Ok(None); }
     let Some(version) = tag.strip_prefix('v') else { return Ok(None) };
@@ -295,7 +316,7 @@ fn parse_release(v: &serde_json::Value, current: &str) -> anyhow::Result<Option<
     if v["draft"].as_bool() == Some(true) || v["prerelease"].as_bool() == Some(true) || !newer(&version, current) {
         return Ok(None);
     }
-    let Some(want) = asset_name(&version) else { return Ok(None) };
+    let Some(want) = (if portable { integrated::asset(&version) } else { asset_name(&version) }) else { return Ok(None) };
     let Some(a) = v["assets"].as_array().and_then(|a| a.iter().find(|a| a["name"].as_str() == Some(want.as_str()))) else {
         // (the release is still being built: its files come a few minutes after the tag)
         log::info!("update check: {version} has no {want} (yet)");
@@ -310,18 +331,19 @@ fn parse_release(v: &serde_json::Value, current: &str) -> anyhow::Result<Option<
         size: a["size"].as_u64().unwrap_or(0),
         sha256: a["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).map(|h| h.to_ascii_lowercase()),
     };
-    validate_release(&r)?;
+    validate_release_for_mode(&r, portable)?;
     Ok(Some(r))
 }
 
 /// Enforce the channel again before installation, including callers of `install`.
-fn validate_release(r: &Release) -> anyhow::Result<()> {
+fn validate_release_for_mode(r: &Release, portable: bool) -> anyhow::Result<()> {
     anyhow::ensure!(!r.version.starts_with('v') && version_parts(&r.version).is_some(), "the release is not a Tangenta version");
-    anyhow::ensure!(asset_name(&r.version).as_deref() == Some(r.asset_name.as_str()), "the release file is not this platform's Tangenta client");
+    let expected = if portable { integrated::asset(&r.version) } else { asset_name(&r.version) };
+    anyhow::ensure!(expected.as_deref() == Some(r.asset_name.as_str()), "the release file is not this platform's complete client");
     let tag = format!("v{}", r.version);
     anyhow::ensure!(r.page == format!("{REPO_URL}/releases/tag/{tag}"), "the release page is outside the Tangenta repository");
     anyhow::ensure!(r.asset_url == format!("{REPO_URL}/releases/download/{tag}/{}", r.asset_name), "the release download is outside the Tangenta repository");
-    anyhow::ensure!(r.size > 0, "the release file has no size");
+    anyhow::ensure!(r.size > 0 && (!portable || r.size <= 2 * 1024 * 1024 * 1024), "the release file has an invalid size");
     anyhow::ensure!(r.sha256.as_ref().map(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())).unwrap_or(false), "the release file has no valid GitHub SHA-256 digest");
     Ok(())
 }
@@ -350,6 +372,7 @@ fn download(r: &Release, to: &Path, status: &Mutex<Status>) -> anyhow::Result<()
         if n == 0 {
             break;
         }
+        ensure_download_chunk(done, n, r.size)?;
         out.write_all(&buf[..n])?;
         hasher.update(&buf[..n]);
         done += n as u64;
@@ -371,18 +394,30 @@ fn download(r: &Release, to: &Path, status: &Mutex<Status>) -> anyhow::Result<()
     Ok(())
 }
 
+fn ensure_download_chunk(done: u64, bytes: usize, expected: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(done.checked_add(bytes as u64).is_some_and(|total| total <= expected), "download exceeds the release's declared size");
+    Ok(())
+}
+
 fn download_and_install(r: &Release, status: &Mutex<Status>) -> anyhow::Result<()> {
-    validate_release(r)?;
+    let portable = integrated::current()?;
+    validate_release_for_mode(r, portable.is_some())?;
+    if let Some(client) = &portable {
+        anyhow::ensure!(writable(client.directory()), "the portable client folder cannot be written");
+    }
     // (on a computer: where it goes must be writable before 15 MB are fetched for nothing)
     #[cfg(not(target_os = "android"))]
     {
+        if portable.is_none() {
         let place = install_place()?;
         if !writable(&place.dir) {
             let admin = if cfg!(windows) { " (or start it once as administrator)" } else { "" };
             anyhow::bail!("the folder {} cannot be written. Put openOMSI in a folder of yours{admin} and update again", short_path(&place.dir));
         }
+        }
     }
-    let file = download_dir().join(&r.asset_name);
+    if let Some(client) = &portable { integrated::preflight(client, r)?; }
+    let file = if let Some(client) = &portable { client.download_path(&r.asset_name)? } else { download_dir().join(&r.asset_name) };
     download(r, &file, status)?;
     log::info!("update {}: downloaded {}", r.version, file.display());
     *lock(status) = Status::Installing(r.clone());
@@ -396,8 +431,12 @@ fn download_and_install(r: &Release, status: &Mutex<Status>) -> anyhow::Result<(
     }
     #[cfg(not(target_os = "android"))]
     {
-        let place = install_place()?;
-        install_archive(&file, &place)?;
+        if let Some(client) = &portable {
+            integrated::install(client, r, &file)?;
+        } else {
+            let place = install_place()?;
+            install_archive(&file, &place)?;
+        }
         let _ = std::fs::write(download_dir().join("updating-to"), &r.version);
         let _ = std::fs::remove_file(&file);
         *lock(status) = Status::Restarting(r.clone());
@@ -632,6 +671,7 @@ fn remove_any(p: &Path) {
 /// environment. (A script driving this launcher - `OMSI_LAUNCHER_INPUT` - is not handed on:
 /// it was meant for this one.)
 pub fn relaunch(place: &Place) -> anyhow::Result<()> {
+    if let Some(client) = integrated::current()? { return integrated::relaunch(&client); }
     let mut cmd = std::process::Command::new(&place.exe);
     cmd.current_dir(&place.dir).env_remove("OMSI_LAUNCHER_INPUT");
     cmd.spawn()?;

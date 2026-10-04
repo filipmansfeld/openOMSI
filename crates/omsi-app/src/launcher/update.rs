@@ -29,13 +29,13 @@ impl Launcher {
         self.update.poll();
         match self.update.status() {
             // "install updates without asking"
-            Status::Available(r) if self.setting("update_auto", false) && !self.update.dismissed && !self.update.auto_started => {
+            Status::Available(r) if !self.state.in_game() && self.setting("update_auto", false) && !self.update.dismissed && !self.update.auto_started => {
                 self.update.auto_started = true;
                 log::info!("update: installing {} by itself (update_auto)", r.version);
                 self.update.install(r);
             }
             Status::Restarting(r) => {
-                if !self.update.relaunched {
+                if !self.state.in_game() && !self.update.relaunched {
                     self.update.relaunched = true;
                     match updater::install_place().and_then(|p| updater::relaunch(&p)) {
                         Ok(()) => {
@@ -80,7 +80,9 @@ impl Launcher {
             Status::Available(rel) => {
                 self.ui.icon("system_update", icon_at, 26.0, ACCENT);
                 self.ui.text_in(&format!("{} {} is available", updater::PRODUCT, rel.version), title_r, 18.0, Weight::Bold, TEXT, Align::Left);
-                let text = if cfg!(target_os = "android") {
+                let text = if self.state.in_game() {
+                    format!("You have {current}. The update will be available after all running or loading games have ended. Your game and its connected helpers keep running.")
+                } else if cfg!(target_os = "android") {
                     format!("You have {current}. Update now? The launcher downloads the Tangenta version ({}) from github.com/{} and Android installs it; Tangenta then starts again - your mods and settings stay as they are.", mb(rel.size), updater::REPO)
                 } else {
                     format!("You have {current}. Update now? The launcher downloads the Tangenta version ({}) from github.com/{}, puts it in place of this one and starts again - your mods and settings stay as they are.", mb(rel.size), updater::REPO)
@@ -91,7 +93,7 @@ impl Launcher {
                     self.state.settings["update_auto"] = serde_json::json!(auto);
                     self.state.settings_dirty = 0.3;
                 }
-                if self.ui.button("upd-now", Rect::new(inner.right() - 150.0, buttons_y, 150.0, 38.0), "Update now", Some("download"), ButtonKind::Primary) {
+                if self.ui.button_enabled("upd-now", Rect::new(inner.right() - 150.0, buttons_y, 150.0, 38.0), "Update now", Some("download"), ButtonKind::Primary, !self.state.in_game()) {
                     self.update.install(rel.clone());
                 }
                 if self.ui.button("upd-later", Rect::new(inner.right() - 270.0, buttons_y, 110.0, 38.0), "Not now", None, ButtonKind::Normal) {
@@ -111,7 +113,9 @@ impl Launcher {
             Status::Installing(release) | Status::Restarting(release) => {
                 self.ui.icon("install_desktop", icon_at, 26.0, ACCENT);
                 self.ui.text_in(&format!("Installing {} {}", updater::PRODUCT, release.version), title_r, 18.0, Weight::Bold, TEXT, Align::Left);
-                self.ui.paragraph("The new version is put in place; the launcher starts again in a moment.", body_at, inner.w, 13.0, Weight::Regular, TEXT_DIM);
+                let text = if self.state.in_game() { "The update is ready. The launcher and connected helpers will restart after all running or loading games have ended." }
+                    else { "The new version is put in place; the launcher starts again in a moment." };
+                self.ui.paragraph(text, body_at, inner.w, 13.0, Weight::Regular, TEXT_DIM);
                 self.ui.progress(Rect::new(inner.x, body_at.y + 40.0, inner.w, 10.0), 1.0, true);
             }
             Status::WaitingForInstaller(release) => {

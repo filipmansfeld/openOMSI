@@ -23,6 +23,8 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 const MAX_FRAME: usize = 256 * 1024;
 const POLL: Duration = Duration::from_millis(500);
 const DEADLINE: Duration = Duration::from_secs(20);
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+const MAX_RECONNECTS: u8 = 4;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Context { Launcher, Game }
@@ -190,6 +192,7 @@ fn verify_pin(path: &Path, expected: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone)]
 enum Origin { Child(PathBuf), Pipe(Handoff) }
 struct Transport {
     tx: mpsc::SyncSender<Request>, rx: mpsc::Receiver<Event>,
@@ -284,6 +287,8 @@ pub(crate) struct Module {
     next: Instant, pending: Option<Instant>, sequence: u64, error: Option<String>,
     pending_action: bool, queued_action: Option<Request>,
     request_prefix: String,
+    reconnect_origin: Option<Origin>, reconnect_at: Option<Instant>, reconnects: u8,
+    action_unknown: bool,
 }
 impl Module {
     pub(crate) fn from_env(context: Context) -> Option<Self> {
@@ -296,10 +301,13 @@ impl Module {
                 }
             }
         } else { Origin::Child(std::env::var_os("OMSI_UI_MODULE")?.into()) };
+        let reconnect_origin = matches!(context, Context::Game).then(|| match &origin {
+            Origin::Pipe(_) => Some(origin.clone()), _ => None,
+        }).flatten();
         Some(Self { transport: Transport::start(origin), context, page: "downloads".into(), state: None,
             values: BTreeMap::new(), ready: false, failed: false, next: Instant::now(),
             pending: Some(Instant::now()), sequence: 0, error: None,
-            pending_action: false, queued_action: None,
+            pending_action: false, queued_action: None, reconnect_origin, reconnect_at: None, reconnects: 0, action_unknown: false,
             request_prefix: format!("{}-{:016x}", std::process::id(), rand::random::<u64>()) })
     }
     pub(crate) fn title(&self) -> &str { self.state.as_ref().map(|s| s.title.as_str()).unwrap_or("Extensions") }
@@ -313,13 +321,23 @@ impl Module {
         if let Some(state) = &self.state { for item in &state.items { if item.secret { self.values.remove(&item.id); } } }
     }
     pub(crate) fn tick(&mut self, visible: bool) {
+        if self.reconnect_at.is_some_and(|at| at <= Instant::now()) {
+            if let Some(origin) = &self.reconnect_origin {
+                self.replace_read_transport(Transport::start(origin.clone()));
+            }
+            self.reconnect_at = None;
+        }
         while let Ok(event) = self.transport.rx.try_recv() {
             match event {
                 Event::Ready => { self.ready = true; self.pending = None; self.pending_action = false; }
                 Event::Reply(reply) => {
+                    let valid_state_reply = reply.ok && reply.state.is_some();
                     self.pending = None;
                     self.pending_action = false;
                     self.error = reply.error.filter(|e| !e.is_empty()).map(|e| e.chars().take(2048).collect());
+                    if self.action_unknown && self.error.is_none() {
+                        self.error = Some("The previous action was not confirmed. Review its status before submitting again.".into());
+                    }
                     if let Some(state) = reply.state {
                         if self.state.as_ref().is_some_and(|s| s.auth.state != state.auth.state || s.auth.display_name != state.auth.display_name) {
                             self.clear_secrets();
@@ -335,8 +353,9 @@ impl Module {
                         }
                     }
                     if !reply.ok && self.error.is_none() { self.error = Some("The local UI action was rejected.".into()); }
+                    if valid_state_reply { self.reconnects = 0; }
                 }
-                Event::Failed(error) => { self.fail(); self.error = Some(error); }
+                Event::Failed(error) => { self.fail(); if !self.action_unknown { self.error = Some(error); } }
             }
         }
         if self.pending.is_some_and(|t| t.elapsed() >= DEADLINE) { self.fail(); }
@@ -350,16 +369,34 @@ impl Module {
         }
     }
     fn fail(&mut self) {
+        self.action_unknown |= self.pending_action;
         self.failed = true; self.ready = false; self.pending = None; self.pending_action = false;
         self.queued_action = None; self.clear_secrets();
         self.error = Some("The local UI module stopped responding. No action will be retried automatically.".into());
         self.transport.stop();
+        if self.reconnect_origin.is_some() && self.reconnects < MAX_RECONNECTS && self.reconnect_at.is_none() {
+            self.reconnects += 1;
+            self.reconnect_at = Some(Instant::now() + RECONNECT_DELAY);
+        }
+    }
+    fn replace_read_transport(&mut self, transport: Transport) {
+        self.transport = transport;
+        self.failed = false; self.ready = false; self.pending_action = false;
+        self.queued_action = None; self.clear_secrets();
+        self.pending = Some(Instant::now()); self.next = Instant::now();
+    }
+    fn retry_read_connection(&mut self) {
+        if self.failed && self.reconnect_origin.is_some() && self.reconnect_at.is_none() {
+            self.reconnects = 0;
+            self.reconnect_at = Some(Instant::now());
+        }
     }
     fn send(&mut self, action_id: Option<String>) {
         if !self.ready || self.failed || self.queued_action.is_some()
             || self.pending.is_some() && (action_id.is_none() || self.pending_action) { return; }
         self.sequence += 1;
         let action = action_id.is_some();
+        if action { self.action_unknown = false; }
         let request = Request { v: 1, id: format!("{}-{}", self.request_prefix, self.sequence), op: if action { "ui.action" } else { "ui.get" }, capability: None,
             params: Params { context: self.context.name(), page: self.page.clone(), action_id,
                 engine_pid: matches!(self.context, Context::Game).then(std::process::id),
@@ -487,7 +524,7 @@ impl GamePanel {
     }
     pub(crate) fn toggle(&mut self) {
         self.open = !self.open;
-        if self.open { self.module.next = Instant::now(); }
+        if self.open { self.module.next = Instant::now(); self.module.retry_read_connection(); }
         else { self.ui.focus = None; self.module.clear_secrets(); self.ui.discard_input(); }
     }
     pub(crate) fn drop_gpu(&mut self) { self.gpu = None; self.target = None; }
@@ -581,6 +618,7 @@ mod tests {
             values: BTreeMap::from([("product".into(), "fixture".into())]), ready: true, failed: false,
             next: Instant::now() + POLL, pending: None, sequence: 0, error: None,
             pending_action: false, queued_action: None, request_prefix: "fixture".into(),
+            reconnect_origin: None, reconnect_at: None, reconnects: 0, action_unknown: false,
         };
         (module, requests, events)
     }
@@ -646,6 +684,42 @@ mod tests {
         let mut frame = (bytes.len() as u32).to_le_bytes().to_vec(); frame.extend(bytes);
         let reply = read_json::<Reply>(&mut std::io::Cursor::new(frame)).unwrap();
         assert_eq!(reply.id, "7"); assert!(reply.ok);
+    }
+    #[test]
+    fn game_read_reconnect_never_replays_an_unconfirmed_action_or_stale_form() {
+        let (mut module, requests, events) = module_fixture();
+        module.context = Context::Game;
+        module.send(Some("downloads.install".into()));
+        let action = requests.try_recv().unwrap();
+        events.send(Event::Failed("Connection ended".into())).unwrap();
+        module.tick(false);
+        assert!(module.action_unknown && module.failed);
+        assert!(module.queued_action.is_none());
+        let (tx, fresh_requests) = mpsc::sync_channel(1);
+        let (fresh_events, rx) = mpsc::sync_channel(1);
+        module.replace_read_transport(Transport { tx, rx, stopped: Arc::new(AtomicBool::new(false)), child: Arc::new(Mutex::new(None)) });
+        fresh_events.send(Event::Ready).unwrap();
+        module.tick(false);
+        let poll = fresh_requests.try_recv().unwrap();
+        assert_eq!(poll.op, "ui.get");
+        assert_ne!(poll.id, action.id);
+        assert!(poll.params.action_id.is_none() && poll.params.values.is_empty());
+        let mut stale = module.state.clone().unwrap();
+        stale.page = "profile".into(); stale.revision = "stale".into();
+        fresh_events.send(Event::Reply(Reply { v: 1, id: poll.id, ok: true, state: Some(stale), error: None })).unwrap();
+        module.reconnects = 3;
+        module.tick(false);
+        assert_eq!(module.state.as_ref().unwrap().revision, "1");
+        assert!(module.action_unknown && module.error.as_ref().unwrap().contains("not confirmed"));
+        assert!(fresh_requests.try_recv().is_err());
+        assert_eq!(module.reconnects, 0);
+        module.reconnect_origin = Some(Origin::Pipe(Handoff { pipe_name: "fixture".into(), capability: "a".repeat(64) }));
+        module.reconnects = MAX_RECONNECTS;
+        module.fail();
+        assert!(module.reconnect_at.is_none());
+        module.retry_read_connection();
+        assert!(module.reconnect_at.is_some() && module.action_unknown);
+        assert!(module.queued_action.is_none());
     }
     #[test]
     fn native_control_state_rejects_duplicate_ids_and_returned_passwords() {
