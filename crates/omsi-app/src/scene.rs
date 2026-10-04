@@ -9426,7 +9426,6 @@ impl World {
         // threads (a city's hundreds of scripted objects took a core's worth of a frame),
         // then what they did, in order again.
         let mut inputs: Vec<Option<omsi_sim::scenery::SceneryVars>> = Vec::with_capacity(scripted.len());
-        let controllers = self.controller_of_object.lock();
         for o in scripted.iter_mut() {
             let dist = (o.pos - center).length();
             if dist > 800.0 {
@@ -9496,7 +9495,6 @@ impl World {
             }
             inputs.push(Some(vars));
         }
-        drop(controllers);
         {
             use rayon::prelude::*;
             scripted.par_iter_mut().zip(inputs.par_iter()).for_each(|(o, vars)| {
