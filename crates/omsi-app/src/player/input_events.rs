@@ -54,7 +54,7 @@ mod tests {
             ty.mesh_boxes.push((Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 0.0)));
             ty.meshes.push(omsi_sim::vehicle::VehicleMesh { def_index: 0, data: mesh,
                 file: self.0.join("panel.o3d"), materials: vec![], overrides: vec![],
-                pivot: Mat4::IDENTITY, viewpoint: 0, skin: vec![] });
+                pivot: Mat4::IDENTITY, viewpoint: 0, skin: vec![], keep_winding: false });
             let ty = Arc::new(ty);
             let mut vehicle = omsi_sim::VehicleInstance::new(ty.clone(), Default::default());
             vehicle.rigid = None;

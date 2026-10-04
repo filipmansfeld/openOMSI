@@ -160,6 +160,7 @@ fn patch(
                     .map(|c| {
                         exact_object(c, &["variable", "relation", "value"])?;
                         Ok(Condition {
+                            kind: Default::default(),
                             variable: variable(&c["variable"])?,
                             relation: c["relation"]
                                 .as_u64()
