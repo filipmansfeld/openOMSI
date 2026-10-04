@@ -46,8 +46,10 @@ fn declared_scenery_variables_survive_loading_and_native_api_updates_without_scr
     let declarations = "[varnamelist]\n1\nvars.txt\n[stringvarnamelist]\n1\nstrings.txt\n";
     let mesh = "[mesh]\nindicator.x\n";
     fixture.write("plain.sco", mesh);
+    // A standalone signal runs its own program. A crossing without any placed
+    // signals intentionally has no controller, so it would not exercise the tick.
     fixture.write("state.sco", &format!(
-        "{mesh}{declarations}[traffic_lights_group]\n40\n[traffic_light]\nOutbound\n[phase]\n0\n20\n[phase]\n6\n20\n[traffic_light]\nReturn\n[phase]\n6\n20\n[phase]\n0\n20\n",
+        "{mesh}{declarations}[trafficlight]\n[traffic_lights_group]\n40\n[traffic_light]\nOutbound\n[phase]\n0\n20\n[phase]\n6\n20\n[traffic_light]\nReturn\n[phase]\n6\n20\n[phase]\n0\n20\n",
     ));
     fixture.write(
         "indicator.sco",
