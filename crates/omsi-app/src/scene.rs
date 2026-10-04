@@ -10784,6 +10784,10 @@ pub struct VariantSlot {
     pub entries: Vec<(MaterialId, MaterialId)>,
     /// `[texchanges]` variable: its integer value picks the entry.
     pub tex_var: String,
+    /// Authored master key, retained even if an entry's file did not exist at load.
+    pub tex_key: String,
+    /// File textures attached by an external refresh, held by this render alone.
+    pub bridge_textures: Vec<PathBuf>,
     /// Free textures for the plain material and, independently, its switched item.
     pub free: Vec<FreeTex>,
     /// How to build a material of this slot for a texture loaded later.
@@ -11555,6 +11559,16 @@ impl World {
                 .collect();
             let mut own_materials = render.own_materials;
             for v in &render.variants {
+                let mut shared = self.vehicle_textures.lock();
+                for path in &v.bridge_textures {
+                    let Some(entry) = shared.get_mut(path) else { continue };
+                    entry.1 = entry.1.saturating_sub(1);
+                    if entry.1 == 0 {
+                        own_textures.push(entry.0);
+                        shared.remove(path);
+                    }
+                }
+                drop(shared);
                 if let Some(l) = &v.lights {
                     for (b, it) in l.cache.values() {
                         own_materials.push(*b);
@@ -12643,9 +12657,9 @@ impl World {
                     };
                     if spec.item.is_some() || !entries.is_empty() || !free.is_empty() {
                         let tex_var = master.map(|m| m.variable.clone()).unwrap_or_default();
-                        variants.push(VariantSlot { mesh: instances.len(), slot, base, item, more, var: change_var.unwrap_or_default(), more_vars: change_vars.iter().skip(1).cloned().collect(), entries, tex_var, free, spec, base_tex, entry_tex, lights: multi_light(base, item) });
+                        variants.push(VariantSlot { mesh: instances.len(), slot, base, item, more, var: change_var.unwrap_or_default(), more_vars: change_vars.iter().skip(1).cloned().collect(), entries, tex_var, tex_key: master.map(|m| m.texture.clone()).unwrap_or_default(), bridge_textures: Vec::new(), free, spec, base_tex, entry_tex, lights: multi_light(base, item) });
                     } else if let Some(lights) = multi_light(base, item) {
-                        variants.push(VariantSlot { mesh: instances.len(), slot, base, item, more: Vec::new(), var: String::new(), more_vars: Vec::new(), entries, tex_var: String::new(), free: Vec::new(), spec, base_tex, entry_tex, lights: Some(lights) });
+                        variants.push(VariantSlot { mesh: instances.len(), slot, base, item, more: Vec::new(), var: String::new(), more_vars: Vec::new(), entries, tex_var: String::new(), tex_key: String::new(), bridge_textures: Vec::new(), free: Vec::new(), spec, base_tex, entry_tex, lights: Some(lights) });
                     } else if base_dyn.any() {
                         dyn_slots.push(DynSlot { mesh: instances.len(), slot, text: text_slot, script: script_slot, script_trans, tex, alpha, transmap, night, lightmap, envmap, address, extra, color, emissive });
                     }

@@ -124,63 +124,93 @@ impl World {
         Ok(())
     }
 
-    /// Reload an already resident file after a card/display producer replaces its bytes.
-    /// The path is resolved inside the active vehicle sections' texture directories.
+    /// Reload a resident vehicle picture, or attach a file explicitly declared by an
+    /// active `[texchanges]` master. Parent paths are authorized by that declaration
+    /// alone; their canonical target must still be inside this OMSI installation.
     pub(crate) fn bridge_refresh_texture(
         &self,
         renderer: &Renderer,
         scene: &mut Scene,
-        player: &crate::Player,
+        player: &mut crate::Player,
         relative_path: &str,
     ) -> Result<usize, String> {
-        let relative = PathBuf::from(relative_path.replace('\\', "/"));
-        if relative_path.len() > 1024
-            || relative.as_os_str().is_empty()
-            || relative
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
-            return Err("texture path must be relative without parent components".into());
+        let mut sections: Vec<(&omsi_sim::VehicleType, &mut VehicleRender)> =
+            vec![(&player.vehicle.ty, &mut player.render)];
+        sections.extend(player.vehicle.trailers.iter().zip(&mut player.trailer_renders)
+            .map(|(part, render)| (part.ty.as_ref(), render)));
+        let updated = self.bridge_refresh_texture_sections(renderer, scene, &mut sections, relative_path)?;
+        // Select the rebuilt entry through the ordinary variable/material path. A
+        // successful refresh must change the live instance, not only a cache record.
+        for (_, render) in sections {
+            sync_materials(renderer, scene, &player.vehicle, render);
         }
-        let dirs: Vec<PathBuf> = std::iter::once(&player.vehicle.ty)
-            .chain(player.vehicle.trailers.iter().map(|t| &t.ty))
-            .flat_map(|ty| ty.texture_dirs(&self.root).into_iter().take(3))
-            .collect();
-        let canonical_dirs: Vec<PathBuf> =
-            dirs.iter().filter_map(|d| d.canonicalize().ok()).collect();
-        let path = dirs
-            .iter()
-            .find_map(|d| {
-                let p = omsi_cfg::resolve_path(d, &relative.to_string_lossy());
-                let canonical = p.canonicalize().ok()?;
-                (canonical.is_file() && canonical_dirs.iter().any(|d| canonical.starts_with(d)))
-                    .then_some(canonical)
-            })
-            .ok_or_else(|| {
-                "texture is not a file inside the active vehicle texture directories".to_string()
-            })?;
-        let canonical_key = path_key(&path);
-        let same_file = |p: &Path| {
-            p.canonicalize()
-                .ok()
-                .is_some_and(|p| path_key(&p) == canonical_key)
+        Ok(updated)
+    }
+
+    fn bridge_refresh_texture_sections(
+        &self,
+        renderer: &Renderer,
+        scene: &mut Scene,
+        sections: &mut [(&omsi_sim::VehicleType, &mut VehicleRender)],
+        relative_path: &str,
+    ) -> Result<usize, String> {
+        let requested = relative_path.trim().replace('\\', "/");
+        let relative = PathBuf::from(&requested);
+        if requested.is_empty() || requested.len() > 1024 || relative.is_absolute()
+            || requested.contains(':')
+            || relative.components().any(|c| matches!(c,
+                std::path::Component::RootDir | std::path::Component::Prefix(_)))
+        {
+            return Err("texture path must be an authored relative path".into());
+        }
+        let root = self.root.canonicalize().map_err(|e| e.to_string())?;
+        let mut bindings = Vec::new();
+        let mut declared_path: Option<PathBuf> = None;
+        for (section, (ty, render)) in sections.iter().enumerate() {
+            for (variant, slot) in render.variants.iter().enumerate() {
+                let Some(master) = ty.texchange(&slot.tex_key) else { continue };
+                for (entry, authored) in master.entries.iter().enumerate() {
+                    if path_key(Path::new(authored.trim())) != path_key(&relative)
+                        || entry >= slot.entries.len() || entry >= slot.entry_tex.len()
+                    { continue; }
+                    if render.instances.get(slot.mesh).and_then(|id| scene.instances.get(*id))
+                        .and_then(|instance| instance.materials.get(slot.slot)).is_none()
+                    {
+                        return Err("declared texture has no live material slot".into());
+                    }
+                    let dirs = std::iter::once(master.dir.clone())
+                        .chain(ty.texture_dirs(&self.root).into_iter().take(3));
+                    let path = dirs.filter_map(|d| omsi_cfg::resolve_path(&d, &requested).canonicalize().ok())
+                        .find(|p| p.is_file() && p.starts_with(&root))
+                        .ok_or("declared texture is not a file inside the OMSI root")?;
+                    if declared_path.as_ref().is_some_and(|previous| path_key(previous) != path_key(&path)) {
+                        return Err("texture declaration is ambiguous between vehicle sections".into());
+                    }
+                    declared_path = Some(path);
+                    bindings.push((section, variant, entry));
+                }
+            }
+        }
+        let declared = declared_path.is_some();
+        let path = if let Some(path) = declared_path { path } else {
+            if relative.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+                return Err("parent texture path is not declared by the active vehicle".into());
+            }
+            let dirs: Vec<PathBuf> = sections.iter()
+                .flat_map(|(ty, _)| ty.texture_dirs(&self.root).into_iter().take(3)).collect();
+            let canonical_dirs: Vec<PathBuf> = dirs.iter().filter_map(|d| d.canonicalize().ok()).collect();
+            dirs.iter().find_map(|d| {
+                let p = omsi_cfg::resolve_path(d, &requested).canonicalize().ok()?;
+                (p.is_file() && canonical_dirs.iter().any(|d| p.starts_with(d))).then_some(p)
+            }).ok_or("texture is not a file inside the active vehicle texture directories")?
         };
-        let mut resident: Vec<(PathBuf, TextureId)> = self
-            .vehicle_textures
-            .lock()
-            .iter()
-            .filter(|(p, _)| same_file(p))
-            .map(|(p, (id, _))| (p.clone(), *id))
-            .collect();
-        resident.extend(
-            self.gpu
-                .lock()
-                .textures
-                .iter()
-                .filter(|(p, _)| same_file(p))
-                .map(|(p, entry)| (p.clone(), entry.id)),
-        );
-        if resident.is_empty() {
+        let canonical_key = path_key(&path);
+        let same_file = |p: &Path| p.canonicalize().ok().is_some_and(|p| path_key(&p) == canonical_key);
+        let mut resident: Vec<(PathBuf, TextureId)> = self.vehicle_textures.lock().iter()
+            .filter(|(p, _)| same_file(p)).map(|(p, (id, _))| (p.clone(), *id)).collect();
+        resident.extend(self.gpu.lock().textures.iter().filter(|(p, _)| same_file(p))
+            .map(|(p, entry)| (p.clone(), entry.id)));
+        if resident.is_empty() && !declared {
             return Err("texture is not currently resident in the scene".into());
         }
         let image = omsi_texture::decode_file(&path).map_err(|e| e.to_string())?;
@@ -189,30 +219,63 @@ impl World {
         }
         {
             let mut pinned = self.bridge_texture_paths.lock();
-            let new = resident.iter().filter(|(p, _)| !pinned.contains(p)).count();
-            if pinned.len() + new > 64 {
+            let mut required: hashbrown::HashSet<PathBuf> = resident.iter().map(|(p, _)| p.clone()).collect();
+            if declared { required.insert(path.clone()); }
+            if pinned.len() + required.iter().filter(|p| !pinned.contains(*p)).count() > 64 {
                 return Err("external file texture limit reached".into());
             }
-            pinned.extend(resident.iter().map(|(p, _)| p.clone()));
+            pinned.extend(required);
         }
         let data = TextureData::from_image(image);
         let mut ids: Vec<TextureId> = resident.iter().map(|(_, id)| *id).collect();
         ids.sort_unstable();
         ids.dedup();
-        for id in &ids {
-            renderer.replace_texture(scene, *id, &data);
-        }
-        for (path, id) in resident {
-            self.textures.release(&path);
-            if let Some(entry) = self.gpu.lock().textures.get_mut(&path) {
-                entry.bytes = scene.texture_bytes_of(id);
+        for id in &ids { renderer.replace_texture(scene, *id, &data); }
+        for (alias, id) in &resident {
+            self.textures.release(alias);
+            if let Some(entry) = self.gpu.lock().textures.get_mut(alias) {
+                entry.bytes = scene.texture_bytes_of(*id);
                 entry.format = data.format;
                 entry.dropped = 0;
             }
         }
+        if declared {
+            let mut shared = self.vehicle_textures.lock();
+            // A scenery texture can own the same file. Give newly attached vehicle
+            // slots a counted vehicle resource, so release_vehicle cannot free scenery.
+            let held_path = shared.keys().find(|p| same_file(p)).cloned().unwrap_or_else(|| path.clone());
+            let id = if let Some((id, _)) = shared.get(&held_path) { *id } else {
+                let id = renderer.add_texture_data(scene, &data);
+                attach_pbr(renderer, scene, &held_path, id);
+                shared.insert(held_path.clone(), (id, 0));
+                ids.push(id);
+                id
+            };
+            for (section, variant, entry) in bindings {
+                let render = &mut sections[section].1;
+                let slot = &mut render.variants[variant];
+                if slot.entry_tex[entry] == Some(id) { continue; }
+                let pair = slot.spec.build(renderer, scene, Some(id));
+                render.own_materials.extend([pair.0, pair.1]);
+                slot.entries[entry] = pair;
+                slot.entry_tex[entry] = Some(id);
+                if entry == 0 {
+                    slot.base_tex = Some(id);
+                    slot.base = pair.0;
+                    slot.item = pair.1;
+                }
+                if !slot.bridge_textures.contains(&held_path) {
+                    shared.get_mut(&held_path).unwrap().1 += 1;
+                    slot.bridge_textures.push(held_path.clone());
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
         renderer.rebind_textures(scene, &ids);
         Ok(ids.len())
     }
+
 }
 
 fn validate_frame(index: usize, width: u32, height: u32, bytes: usize) -> Result<(), String> {
@@ -446,3 +509,7 @@ mod tests {
         assert!(valid_values(&[]).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "bridge_texture_refresh.rs"]
+mod texture_refresh;
