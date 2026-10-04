@@ -46,10 +46,8 @@ fn declared_scenery_variables_survive_loading_and_native_api_updates_without_scr
     let declarations = "[varnamelist]\n1\nvars.txt\n[stringvarnamelist]\n1\nstrings.txt\n";
     let mesh = "[mesh]\nindicator.x\n";
     fixture.write("plain.sco", mesh);
-    // A standalone signal runs its own program. A crossing without any placed
-    // signals intentionally has no controller, so it would not exercise the tick.
     fixture.write("state.sco", &format!(
-        "{mesh}{declarations}[trafficlight]\n[traffic_lights_group]\n40\n[traffic_light]\nOutbound\n[phase]\n0\n20\n[phase]\n6\n20\n[traffic_light]\nReturn\n[phase]\n6\n20\n[phase]\n0\n20\n",
+        "{mesh}{declarations}[traffic_lights_group]\n40\n[traffic_light]\nOutbound\n[phase]\n0\n20\n[phase]\n6\n20\n[traffic_light]\nReturn\n[phase]\n6\n20\n[phase]\n0\n20\n",
     ));
     fixture.write(
         "indicator.sco",
@@ -124,8 +122,9 @@ fn declared_scenery_variables_survive_loading_and_native_api_updates_without_scr
         "retain visible and invisible variable-only objects"
     );
     let controllers = world.traffic_lights.lock();
-    assert_eq!(controllers.len(), 1);
-    assert_eq!(controllers[0].names, ["Outbound", "Return"]);
+    // A crossing without placed signals has no active controller. Its declared
+    // variables still create scenery state and must enter the normal frame tick.
+    assert_eq!(controllers.len(), 0);
     drop(controllers);
 
     let mut app = crate::new_app(
