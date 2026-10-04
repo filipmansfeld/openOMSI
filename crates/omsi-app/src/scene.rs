@@ -222,6 +222,9 @@ pub struct ScriptedObject {
     /// Traffic light program of this object (crossings) or of its parent (lamps).
     pub controller: Option<usize>,
     pub light_index: usize,
+    /// The crossing and light named by an ordinary scripted child's `[varparent]`.
+    /// Resolve its controller when read, including a parent tile loaded later.
+    pub light_parent: Option<(i64, usize)>,
     pub map_id: i64,
     /// `[matl_change]` variants: (instance, slot, base, item, variable).
     pub variants: Vec<(usize, usize, MaterialId, MaterialId, String)>,
@@ -4780,6 +4783,7 @@ impl World {
                         inst,
                         controller,
                         light_index: 0,
+                        light_parent: None,
                         map_id: o.id,
                         variants: Vec::new(),
                         sounds: None,
@@ -7413,6 +7417,11 @@ impl World {
                                 inst,
                                 controller,
                                 light_index: 0,
+                                light_parent: if controller.is_none() && lamp.is_none() {
+                                    light_child_of(&self.index().traffic_light_parents, var_parent, &strings)
+                                } else {
+                                    None
+                                },
                                 map_id,
                                 variants: object_variants,
                                 sounds: None,
@@ -9081,17 +9090,12 @@ impl World {
             // daylight under its own threshold (0.6, or 0.3-0.75 with a [NightMapMode])
             let use_ = InUse::new(o.ty.sco.night_map_mode, o.map_id as u64);
             let in_use = use_.in_use(now.time, day);
+            let (controller, light_index) = self.bridge_light_binding(o);
             let vars = omsi_sim::scenery::SceneryVars {
                 nightlight: use_.lit(now.time, day, brightness) as i32 as f32,
                 in_use: in_use as i32 as f32,
-                traffic_light_phase: o
-                    .controller
-                    .map(|c| phase_of(c, o.light_index).0)
-                    .unwrap_or(-1.0),
-                traffic_light_approach: o
-                    .controller
-                    .map(|c| phase_of(c, o.light_index).1)
-                    .unwrap_or(0.0),
+                traffic_light_phase: controller.map(|c| phase_of(c, light_index).0).unwrap_or(-1.0),
+                traffic_light_approach: controller.map(|c| phase_of(c, light_index).1).unwrap_or(0.0),
                 switch: None,
             };
             // the scripts read the simulation's time of day (clocks, the display's blinking)
@@ -12378,6 +12382,15 @@ fn spline_lanes(
         }
     }
     out
+}
+
+fn light_child_of(crossings: &hashbrown::HashSet<i64>, var_parent: Option<i64>, strings: &[String]) -> Option<(i64, usize)> {
+    let parent = var_parent.filter(|p| crossings.contains(p))?;
+    if !crate::tiles::names_traffic_light(strings) {
+        return None;
+    }
+    let index = strings.first()?.trim().parse::<usize>().ok()?;
+    Some((parent, index))
 }
 
 fn traffic_light_program_enabled(sco: &SceneryObject, has_signals: bool) -> bool {

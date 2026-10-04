@@ -740,7 +740,7 @@ fn service_apply(
         if bus.phase != crate::bus_service::Phase::Boarding {
             return Err("bus is not currently boarding".into());
         }
-        bus.hold(None, seconds);
+        bus.hold(seconds);
     } else if op == "traffic.service.set_departure" {
         keys(args, &["session_id", "id", "departure_seconds"])?;
         let departure = args

@@ -1,6 +1,7 @@
 //! Observations of accepted clicks; picking, occlusion and script behavior stay owned
 //! by Player. Forgiving picks without an exact central ray hit have no coordinates.
 use super::*;
+use glam::Mat4;
 
 fn coordinates(mesh: &omsi_geometry::MeshData, transform: Mat4, position: DVec3,
     origin: DVec3, dir: Vec3) -> Option<([f32; 2], [f32; 3])> {

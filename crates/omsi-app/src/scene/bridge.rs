@@ -387,6 +387,12 @@ mod tests {
 
     #[test]
     fn plugin_api_light_binding_resolves_late_parents_without_overriding_own_controller() {
+        let crossings = [42].into_iter().collect();
+        assert_eq!(light_child_of(&crossings, Some(42), &["3".into()]), Some((42, 3)));
+        assert_eq!(light_child_of(&crossings, Some(42), &["-1".into()]), None);
+        assert_eq!(light_child_of(&crossings, Some(99), &["3".into()]), None);
+        assert_eq!(light_child_of(&crossings, None, &["3".into()]), None);
+        assert_eq!(light_child_of(&crossings, Some(42), &["stop name".into()]), None);
         let mut controllers = HashMap::new();
         assert_eq!(
             light_binding(None, 0, Some((42, 3)), &controllers),
