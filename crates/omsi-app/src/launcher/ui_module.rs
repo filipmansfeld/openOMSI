@@ -151,6 +151,8 @@ struct Request {
 struct Params {
     context: &'static str, page: String,
     #[serde(skip_serializing_if = "Option::is_none")] engine_pid: Option<u32>,
+    // Private server ticket for the headless module, never a UI control value.
+    #[serde(skip_serializing_if = "Option::is_none")] mp_authorization: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] action_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] revision: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")] values: BTreeMap<String, String>,
@@ -361,6 +363,9 @@ impl Module {
         let request = Request { v: 1, id: format!("{}-{}", self.request_prefix, self.sequence), op: if action { "ui.action" } else { "ui.get" }, capability: None,
             params: Params { context: self.context.name(), page: self.page.clone(), action_id,
                 engine_pid: matches!(self.context, Context::Game).then(std::process::id),
+                mp_authorization: if matches!(self.context, Context::Game) {
+                    omsi_net::access::token_for(super::core::TANGENTA_ACCESS_ORIGIN).ok().flatten()
+                } else { None },
                 revision: self.state.as_ref().filter(|s| s.page == self.page).map(|s| s.revision.clone()),
                 values: if action { self.values.clone() } else { BTreeMap::new() } } };
         if serde_json::to_vec(&request).map_or(true, |bytes| bytes.len() > MAX_FRAME) {
@@ -654,5 +659,22 @@ mod tests {
         assert!(Ready { v: 1, pipe_name: "../file".into(), capability: "a".repeat(64) }.handoff().is_err());
         assert!(Ready { v: 1, pipe_name: "OpenOmsiUi-test".into(), capability: "a".repeat(64) }.handoff().is_ok());
         assert!(Ready { v: 1, pipe_name: "OpenOmsiUi-test".into(), capability: "a".repeat(63) }.handoff().is_err());
+    }
+
+    #[test]
+    fn multiplayer_authorization_is_private_and_absent_from_launcher_requests() {
+        let (mut module, requests, _) = module_fixture();
+        module.send(None);
+        let mut request = requests.try_recv().unwrap();
+        let launcher = serde_json::to_value(&request).unwrap();
+        assert!(launcher["params"].get("mp_authorization").is_none());
+        assert!(launcher["params"]["values"].get("mp_authorization").is_none());
+        request.params.context = "game";
+        request.params.engine_pid = Some(1);
+        request.params.mp_authorization = Some("synthetic-test-ticket".into());
+        let game = serde_json::to_value(&request).unwrap();
+        assert_eq!(game["params"]["mp_authorization"], "synthetic-test-ticket");
+        assert!(game["params"]["values"].get("mp_authorization").is_none());
+        assert!(game.get("mp_authorization").is_none());
     }
 }
